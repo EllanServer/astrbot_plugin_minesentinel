@@ -65,21 +65,12 @@ class MCPlatformAdapter(Platform):
         if not content:
             return
 
-        # 解析会话格式: minecraft_serverid:MessageType:identifier
-        # 示例:
-        #   - minecraft_survival:FriendMessage:550e8400-e29b-41d4-a716-446655440000
-        #   - minecraft_survival:GroupMessage:Server
-        session_parts = session.session_id.split(":", 2)
+        # session.session_id 仅存会话标识（如 uuid / Server），
+        # 消息类型由 session.message_type 提供。
+        identifier = session.session_id
+        msg_type = session.message_type
 
-        if len(session_parts) < 3:
-            logger.warning(
-                f"[MC-{self.server_config.server_id}] 无效的会话格式: {session.session_id}"
-            )
-            return
-
-        _, msg_type, identifier = session_parts
-
-        if msg_type == "FriendMessage":
+        if getattr(msg_type, "value", str(msg_type)) == "FriendMessage":
             # 私聊给特定玩家
             await self.server_connection.ws_client.send_chat_response(
                 reply_to="",
@@ -140,11 +131,11 @@ class MCPlatformAdapter(Platform):
         # 根据聊天模式设置消息类型
         if chat_mode == ChatMode.PRIVATE:
             abm.type = MessageType.FRIEND_MESSAGE
-            abm.session_id = f"{self._platform_name}:FriendMessage:{player_uuid}"
+            abm.session_id = player_uuid
         else:
             abm.type = MessageType.GROUP_MESSAGE
             abm.group_id = "Server"
-            abm.session_id = f"{self._platform_name}:GroupMessage:Server"
+            abm.session_id = "Server"
 
         abm.self_id = self.server_config.server_id
         abm.message_id = msg.id
