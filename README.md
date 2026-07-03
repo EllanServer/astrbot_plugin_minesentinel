@@ -88,6 +88,93 @@
   - `mine_sentinel.alert.enabled` / `min_severity` / `cooldown_seconds` 控制告警发送；即时告警默认只看最近 `30` 分钟，并且同服务器最短 `60` 秒分析一次
 
 MineSentinel 不会向 MC 端下发处罚、RCON、远程指令或配置修改；它只在 AstrBot 侧聚合、去重、总结和通知。
+
+## AI 总结部署
+
+AI 总结链路由两部分组成：MC 端 Java 插件负责只读采集聊天、玩家事件和服务器指标；本 AstrBot 插件负责保存 JSONL、聚合事件、调用 AstrBot 模型生成总结，并把图片报告/附件发送到 QQ。
+
+### 前置条件
+- AstrBot 已配置可用的模型 Provider；`mine_sentinel.report.provider_id` 留空时使用当前或目标会话模型，填写时使用指定 Provider。
+- MC 端 Java 插件已开启 `mine_sentinel.enabled`、`observation.enabled`、`chat.enabled` 和 `metrics.enabled`。
+- 目标 QQ 群已拿到 UMO，例如 `aiocqhttp:GroupMessage:123456789`；也可以在 `delivery_targets` 中使用简写 `group:123456789`。
+
+### 单服实现
+1. MC 后端服安装 `AstrbotAdaptor-版本-Backend.jar`，Java 端保持 `proxyMode.enabled: false`。
+2. 启动后从 Java 插件配置或 `/astrbot token show` 获取 token。
+3. 在本插件配置的 `mc_servers` 中添加该服务器，填写 `server.host`、`server.port`、`server.token`；建议开启 `auto_server_id`，也可手动设置稳定的 `server.server_id`。
+4. 在该服务器的 `message.target_sessions` 中填入要接收报告的 QQ 群 UMO。`mine_sentinel.report.send_to_target_sessions: true` 时，定时/手动报告会发到这些群。
+5. 确认 `mine_sentinel.enabled: true`、`mine_sentinel.storage.enabled: true`、`mine_sentinel.report.enabled: true`。
+6. 用 `mc monitor status` 查看是否收到 observation；用 `mc report now <服务器ID> 8h` 立即生成一次报告。
+
+单服最小配置思路：
+
+```yaml
+mc_servers:
+  - enabled: true
+    server:
+      server_id: survival
+      host: 127.0.0.1
+      port: 8765
+      token: "从 Java 插件获取"
+    auto_server_id: true
+    message:
+      target_sessions:
+        - aiocqhttp:GroupMessage:123456789
+
+mine_sentinel:
+  enabled: true
+  storage:
+    enabled: true
+  report:
+    enabled: true
+    interval_hours: 8
+    default_window_minutes: 480
+    send_to_target_sessions: true
+    send_as_image: true
+    send_full_log_file: true
+```
+
+### Velocity 群组服实现
+1. Velocity 代理端安装 Java 插件 Velocity jar；所有需要纳入总结的后端服安装 Backend jar。
+2. Java 后端服开启 `proxyMode.enabled: true` 并填写 Velocity 端 secret。后端服的 MineSentinel observation 会通过代理端统一转发到本 AstrBot 插件。
+3. 每个后端服建议配置稳定的 `mine_sentinel.server_id` / `server_name`，例如 `lobby`、`survival`、`resource`。报告会使用这些字段区分问题来源。
+4. 本插件 `mc_servers` 中通常只添加 Velocity 端连接，填写 Velocity 的 `server.host`、`server.port`、`server.token`。
+5. 在 Velocity 服务器配置的 `message.target_sessions` 中填入接收总报告的 QQ 群；如果希望报告额外发送到其他群或私聊，使用 `mine_sentinel.report.delivery_targets`。
+6. 用 `mc monitor status` 确认 observation 持续进入；用 `mc report now <服务器ID> 8h` 测试群组服报告。
+
+群组服最小配置思路：
+
+```yaml
+mc_servers:
+  - enabled: true
+    server:
+      server_id: velocity
+      host: 127.0.0.1
+      port: 8765
+      token: "从 Velocity 端 Java 插件获取"
+    auto_server_id: true
+    message:
+      target_sessions:
+        - aiocqhttp:GroupMessage:123456789
+
+mine_sentinel:
+  enabled: true
+  storage:
+    enabled: true
+  report:
+    enabled: true
+    interval_hours: 8
+    default_window_minutes: 480
+    send_to_target_sessions: true
+    delivery_targets:
+      - group:987654321
+```
+
+### 报告发送与排查
+- `send_as_image` 默认开启，报告会优先以 PNG 图片发送；渲染失败会回退为文本。
+- `send_full_log_file` 默认开启，会尝试附带完整窗口 JSONL，便于管理员复核原始上下文。
+- 如果 QQ 没收到报告，先检查服务器 `message.target_sessions` 或 `mine_sentinel.report.delivery_targets`，再看 `mc monitor status` 是否有 observation。
+- 如果报告为空，确认 Java 端 `mine_sentinel.chat.enabled` 和 `metrics.enabled` 已开启，并且 `retention_minutes` 不小于 `default_window_minutes`。
   
 ## 更新日志
 ### v2.0.2 (2026-2-23)
