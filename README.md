@@ -175,6 +175,57 @@ mine_sentinel:
 - `send_full_log_file` 默认开启，会尝试附带完整窗口 JSONL，便于管理员复核原始上下文。
 - 如果 QQ 没收到报告，先检查服务器 `message.target_sessions` 或 `mine_sentinel.report.delivery_targets`，再看 `mc monitor status` 是否有 observation。
 - 如果报告为空，确认 Java 端 `mine_sentinel.chat.enabled` 和 `metrics.enabled` 已开启，并且 `retention_minutes` 不小于 `default_window_minutes`。
+
+### AI 一键部署 Prompt
+
+把下面这段发给具备本机文件读写和联网能力的 AI 助手，让它代为下载、安装和配置：
+
+```text
+你是 Minecraft + AstrBot 部署助手。请按下面要求帮我部署 MineSentinel AI 总结，不要跳过备份和验证。
+
+项目链接：
+- MC Java 插件仓库：https://github.com/EllanServer/AstrBotAdapter
+- MC Java 插件 Actions：https://github.com/EllanServer/AstrBotAdapter/actions
+- AstrBot 插件仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
+- AstrBot 插件 Actions：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/actions
+
+开始前先向我索取这些信息，不要自行猜路径：
+1. 部署模式：单服 / Velocity 群组服。
+2. Minecraft 服务器根目录。单服给一个根目录；Velocity 群组服请给 Velocity 根目录和每个后端服根目录。
+3. AstrBot 根目录。
+4. 要接收 AI 总结的 QQ 群或 UMO，例如 group:123456789 或 aiocqhttp:GroupMessage:123456789。
+5. 是否现在重启 MC 服务端和 AstrBot。
+
+拿到路径后执行：
+1. 检查所有目录是否存在，识别 plugins 目录、AstrBot 插件目录和现有配置文件。
+2. 从 GitHub Actions 下载两个仓库最新 successful workflow 的构建产物和源码。优先使用 gh：
+   - gh run list -R EllanServer/AstrBotAdapter --branch main --status success --limit 1
+   - gh run download -R EllanServer/AstrBotAdapter <run-id> --dir ./downloads/AstrBotAdapter
+   - gh run list -R EllanServer/astrbot_plugin_minecraft_adapter --branch master --status success --limit 1
+   - gh run download -R EllanServer/astrbot_plugin_minecraft_adapter <run-id> --dir ./downloads/astrbot_plugin_minecraft_adapter
+   如果没有 gh，就打开上面的 Actions 链接下载最新成功运行的 artifacts。若 Actions 没有源码 artifact，则同时下载源码 ZIP：
+   - https://github.com/EllanServer/AstrBotAdapter/archive/refs/heads/main.zip
+   - https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/archive/refs/heads/master.zip
+3. 安装 Java 插件：
+   - 单服：把最新 Backend jar 放进该服务器根目录的 plugins/。
+   - Velocity 群组服：把 Velocity jar 放进 Velocity 的 plugins/，把 Backend jar 放进每个后端服的 plugins/；如果产物包含 libs/，按 README 保持 libs/ 与 Velocity jar 同级。
+4. 安装 AstrBot 插件：把 astrbot_plugin_minecraft_adapter 最新源码放进 AstrBot 的插件目录，目录名保持 astrbot_plugin_minecraft_adapter；如已有旧目录，先备份再覆盖。
+5. 配置 Java 插件：
+   - 单服保持 proxyMode.enabled=false。
+   - Velocity 群组服先启动/读取 Velocity 端 secret，再给每个后端服写入 proxyMode.enabled=true 和 proxyMode.secret。
+   - 确认 mine_sentinel.enabled、observation.enabled、chat.enabled、metrics.enabled 为 true。
+6. 配置 AstrBot 插件：
+   - 单服在 mc_servers 中添加后端服 host/port/token。
+   - 群组服只添加 Velocity 端 host/port/token。
+   - 把 QQ 群写入 message.target_sessions，必要时写入 mine_sentinel.report.delivery_targets。
+   - 开启 mine_sentinel.enabled、storage.enabled、report.enabled、send_as_image、send_full_log_file。
+7. 做备份：覆盖任何 jar、插件目录或配置文件前，先复制到带时间戳的 backup 目录。
+8. 验证：
+   - 启动或重启服务后检查 Java 插件和 AstrBot 日志。
+   - 在 QQ/AstrBot 会话执行 mc monitor status，确认收到 observation。
+   - 执行 mc report now <服务器ID> 30m 测试图片报告和 JSONL 附件发送。
+9. 最后给我汇总：安装了哪些文件、备份位置、配置了哪些服务器 ID、测试命令结果、还需要我手动确认的事项。
+```
   
 ## 更新日志
 ### v2.0.2 (2026-2-23)
