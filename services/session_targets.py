@@ -20,8 +20,19 @@ QQ_TARGET_TYPES = {
     "qq_user": FRIEND_MESSAGE,
 }
 
-_QQ_PLATFORM_NAME_PRIORITY = ("aiocqhttp",)
-_QQ_PLATFORM_ID_HINTS = ("napcat", "aiocqhttp", "onebot")
+_QQ_PLATFORM_NAME_PRIORITY = (
+    "aiocqhttp",
+    "qq_official",
+    "qq_official_webhook",
+)
+_QQ_PLATFORM_ID_HINTS = (
+    "napcat",
+    "aiocqhttp",
+    "onebot",
+    "qq_official",
+    "qqofficial",
+    "qq-official",
+)
 
 
 def normalize_session_target(target: Any) -> str:

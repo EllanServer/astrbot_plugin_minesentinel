@@ -90,7 +90,7 @@
               "target_sessions": {
                 "type": "list",
                 "description": "目标会话",
-                "hint": "MC message bridge target sessions. Prefer AstrBot /sid output, e.g. napcat:GroupMessage:123456789. Shorthand is also supported: group:QQ group id, qq:QQ user id. Old adapter-name UMO such as aiocqhttp:GroupMessage:123456789 is resolved to the active AstrBot platform id at runtime.",
+                "hint": "MC message bridge target sessions. Prefer AstrBot /sid output, e.g. napcat:GroupMessage:123456789 or qq_official:GroupMessage:group_openid. Shorthand is also supported: group:QQ group id/openid, qq:QQ user id/openid. Old adapter-name UMO such as aiocqhttp:GroupMessage:123456789 or qq_official:GroupMessage:group_openid is resolved to the active AstrBot platform id at runtime.",
                 "default": []
               },
               "auto_forward_prefix": {
@@ -292,7 +292,7 @@
           "delivery_targets": {
             "type": "list",
             "description": "报告额外发送目标",
-            "hint": "AstrBot UMO or shorthand. Prefer /sid output, e.g. napcat:GroupMessage:123456. Shorthand: group:QQ group id, qq/private:QQ user id. Pure numbers default to QQ groups. Old aiocqhttp UMO is resolved to the active AstrBot platform id at runtime.",
+            "hint": "AstrBot UMO or shorthand. Prefer /sid output, e.g. napcat:GroupMessage:123456 or qq_official:GroupMessage:group_openid. Shorthand: group:QQ group id/openid, qq/private:QQ user id/openid. Pure numbers default to QQ groups. Old aiocqhttp/qq_official UMO is resolved to the active AstrBot platform id at runtime.",
             "default": []
           },
           "include_evidence_samples": {

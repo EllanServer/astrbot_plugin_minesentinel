@@ -1965,6 +1965,22 @@ class MineSentinelRoutingTests(unittest.TestCase):
             session_matches(context, "group:123456", "napcat:GroupMessage:123456")
         )
 
+    def test_delivery_target_resolves_to_official_qq_platform(self):
+        context = _context_with_platform("default", "qq_official")
+
+        self.assertEqual(
+            resolve_astrbot_session(context, "group:123456"),
+            "default:GroupMessage:123456",
+        )
+        self.assertEqual(
+            resolve_astrbot_session(context, "qq:654321"),
+            "default:FriendMessage:654321",
+        )
+        self.assertEqual(
+            resolve_astrbot_session(context, "qq_official:GroupMessage:999"),
+            "default:GroupMessage:999",
+        )
+
     def test_target_router_adds_direct_report_targets(self):
         records = [
             ObservationRecord(event_id="a", server_id="survival", player_name="Alice"),
