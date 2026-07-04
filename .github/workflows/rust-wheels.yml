@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - pyo3-mine-sentinel
     tags:
       - "v*"
   pull_request:
