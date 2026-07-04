@@ -54,9 +54,9 @@ class PlayerDialogueAnalyzer:
         )
         for record in chat_records:
             text = normalize_text(record.content)
-            # Single-pass scan: one regex finds every keyword/urgent hit per rule.
+            # Single-pass scan: one regex finds every keyword hit per rule.
             direct_matches: list[tuple[DialogueRule, list[str]]] = []
-            for rule, (keywords, _urgent) in self._matcher.scan(text).items():
+            for rule, keywords in self._matcher.matched_keywords(text).items():
                 if keywords:
                     direct_matches.append((rule, keywords))
             if direct_matches:

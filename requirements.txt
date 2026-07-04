@@ -1,9 +1,5 @@
 aiohttp>=3.14.1
 Pillow>=12.2.0
-# Optional Rust core (mine_sentinel_rs) for ~10-20x throughput on the
-# per-chat / per-record hot paths. Not declared as a hard dependency because
-# pre-built wheels are only published on GitHub releases — installing the
-# platform-appropriate wheel from
-# https://github.com/railgun19457/astrbot_plugin_minecraft_adapter/releases
-# enables the Rust path; otherwise the plugin transparently falls back to
-# the bundled pure-Python implementation (compatible with old configs).
+# Required native Rust core (mine_sentinel_rs). Install the platform wheel
+# produced by the "Build Rust wheels" GitHub Actions workflow before loading
+# this branch; the pure-Python fallback has intentionally been removed.

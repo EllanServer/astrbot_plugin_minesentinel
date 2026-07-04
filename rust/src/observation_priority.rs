@@ -6,7 +6,8 @@
 //! Python interpreter is high-value.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::PyDict;
+use pyo3::PyRef;
 
 /// Score records that should survive bounded-memory report sampling.
 /// Mirrors `observation_priority.observation_priority_score`.
@@ -18,70 +19,45 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 #[pyfunction]
 #[pyo3(signature = (record, matcher=None))]
 pub fn observation_priority_score(
-    py: Python,
+    _py: Python,
     record: &Bound<PyAny>,
     matcher: Option<Bound<PyAny>>,
 ) -> PyResult<f64> {
     let kind: String = record.getattr("kind")?.extract()?;
-    let content: String = record.getattr("content")?.extract()?;
-    let tags: Vec<String> = record.getattr("tags")?.extract()?;
-
-    // text = normalize_text(f"{content} {' '.join(tags)}")
-    let mut combined = content;
-    combined.push(' ');
-    let mut first_tag = true;
-    for t in &tags {
-        if !first_tag {
-            combined.push(' ');
-        }
-        combined.push_str(t);
-        first_tag = false;
-    }
-    let text = crate::dialogue_terms::normalize_text(&combined);
-
-    let mut score: f64 = 0.0;
 
     match kind.as_str() {
         "CHAT" => {
-            score += 1.0;
+            let mut score = 1.0_f64;
             if let Some(m) = matcher.as_ref() {
-                // scan returns dict[rule, (kw_list, ug_list)]
-                let hits = m.call_method1("scan", (text.as_str(),))?;
-                let hits_dict: Bound<PyDict> = hits.extract()?;
-                for (rule_obj, lists_bound) in hits_dict.iter() {
-                    let lists: Bound<PyTuple> = lists_bound.extract()?;
-                    let kw_list: Bound<PyList> = lists.get_item(0)?.extract()?;
-                    let ug_list: Bound<PyList> = lists.get_item(1)?.extract()?;
-                    let kw_count = kw_list.len();
-                    if kw_count == 0 {
-                        continue;
+                let content: String = record.getattr("content")?.extract()?;
+                let tags: Vec<String> = record.getattr("tags")?.extract()?;
+                let text = if tags.is_empty() {
+                    crate::dialogue_terms::normalize_text(&content)
+                } else {
+                    let tags_len: usize = tags.iter().map(String::len).sum();
+                    let mut combined =
+                        String::with_capacity(content.len() + tags_len + tags.len() + 1);
+                    combined.push_str(&content);
+                    combined.push(' ');
+                    for (idx, tag) in tags.iter().enumerate() {
+                        if idx > 0 {
+                            combined.push(' ');
+                        }
+                        combined.push_str(tag);
                     }
-                    score += 4.0 + (kw_count.min(3)) as f64;
-                    if ug_list.len() > 0 {
-                        score += 2.0;
-                    }
-                    let base_severity: String = rule_obj
-                        .getattr("base_severity")?
-                        .extract()
-                        .unwrap_or_default();
-                    if base_severity == "high" || base_severity == "critical" {
-                        score += 1.0;
-                    }
-                }
+                    crate::dialogue_terms::normalize_text(&combined)
+                };
+                let matcher_ref =
+                    m.extract::<PyRef<'_, crate::dialogue_terms::RuleTermMatcher>>()?;
+                score += matcher_ref.chat_priority_score(text.as_str());
             }
+            Ok(score)
         }
-        "PLUGIN_ERROR" => score += 5.0,
-        "SERVER_SWITCH" => score += 2.0,
-        "SERVER_METRICS" => {
-            score += metrics_priority(record)?;
-        }
-        _ => {}
+        "PLUGIN_ERROR" => Ok(5.0),
+        "SERVER_SWITCH" => Ok(2.0),
+        "SERVER_METRICS" => metrics_priority(record),
+        _ => Ok(0.0),
     }
-
-    // Silence unused-warn if py ever unused (it isn't, but be safe).
-    let _ = py;
-
-    Ok(score)
 }
 
 /// Mirror `_metrics_priority`: tps/memory based scoring.

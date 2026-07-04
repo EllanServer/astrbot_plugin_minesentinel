@@ -7,7 +7,6 @@
 //! with a single Rust pass cuts per-record cost by ~10-20x.
 
 use ahash::AHashMap;
-use once_cell::sync::Lazy;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use regex::Regex;
@@ -18,12 +17,6 @@ type PyObject = Py<PyAny>;
 /// A term hit whose 4-character prefix window ends with any of these is
 /// treated as negated and ignored (matches `matched_terms` semantics).
 const NEGATION_PREFIXES: &[&str] = &["不", "没", "没有", "不是", "并不", "不太"];
-
-/// `(?:(.)\1{2,})` → collapse 3+ repeated chars to 2.
-/// `Lazy` because `Regex` construction is non-trivial and this is hit per
-/// CHAT record via `message_fingerprint`.
-static REPEATED_CHAR_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(.)\1{2,}").expect("invalid repeated-char regex"));
 
 /// Mirrors `normalize_text`: collapse whitespace + lowercase.
 /// `text.lower().split().join(" ")` in Python.
@@ -52,31 +45,23 @@ pub fn normalize_text(text: &str) -> String {
 /// normalize → keep alnum only → collapse 3+ repeats to 2.
 pub fn message_fingerprint(text: &str) -> String {
     let normalized = normalize_text(text);
-    let mut compact = String::with_capacity(normalized.len());
+    let mut result = String::with_capacity(normalized.len());
+    let mut last: Option<char> = None;
+    let mut run_len: usize = 0;
     for ch in normalized.chars() {
-        if ch.is_alphanumeric() {
-            compact.push(ch);
+        if !ch.is_alphanumeric() {
+            continue;
         }
-    }
-    let mut result = String::with_capacity(compact.len());
-    let chars: Vec<char> = compact.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let mut j = i + 1;
-        while j < chars.len() && chars[j] == c {
-            j += 1;
-        }
-        let run = j - i;
-        if run >= 3 {
-            result.push(c);
-            result.push(c);
-        } else {
-            for _ in 0..run {
-                result.push(c);
+        if Some(ch) == last {
+            run_len += 1;
+            if run_len <= 2 {
+                result.push(ch);
             }
+        } else {
+            last = Some(ch);
+            run_len = 1;
+            result.push(ch);
         }
-        i = j;
     }
     result
 }
@@ -96,6 +81,12 @@ fn char_window_start(s: &str, pos: usize, count: usize) -> usize {
         taken += 1;
     }
     idx
+}
+
+fn hit_is_negated_at(text: &str, abs: usize) -> bool {
+    let prefix_start = char_window_start(text, abs, 4);
+    let prefix = &text[prefix_start..abs];
+    NEGATION_PREFIXES.iter().any(|p| prefix.ends_with(p))
 }
 
 /// Mirrors `term_is_negated`. A term is negated if every occurrence is
@@ -159,19 +150,19 @@ impl CompiledTerms {
     /// Collect non-negated hits keyed by the lowered matched term.
     /// Mirrors `_collect_non_negated_hits`. Deduplicates by lowered term
     /// (one entry per term, regardless of how many times it appears).
-    fn collect_hits(&self, text: &str) -> Vec<String> {
-        let mut hits: Vec<String> = Vec::new();
+    fn collect_hits<'text>(&self, text: &'text str) -> Vec<&'text str> {
+        let mut hits: Vec<&'text str> = Vec::new();
         let Some(pattern) = &self.pattern else {
             return hits;
         };
-        let mut seen: AHashMap<String, ()> = AHashMap::new();
+        let mut seen: AHashMap<&'text str, ()> = AHashMap::new();
         for cap in pattern.find_iter(text) {
             let term = cap.as_str();
-            if term_is_negated(text, term) {
+            if hit_is_negated_at(text, cap.start()) {
                 continue;
             }
-            if seen.insert(term.to_string(), ()).is_none() {
-                hits.push(term.to_string());
+            if seen.insert(term, ()).is_none() {
+                hits.push(term);
             }
         }
         hits
@@ -189,6 +180,7 @@ pub struct RuleTermMatcher {
     urgent_compiled: CompiledTerms,
     /// The Python rule objects, kept alive so we can return them as dict keys.
     rules: Vec<PyObject>,
+    severity_bonus: Vec<bool>,
     keyword_display: AHashMap<String, String>,
     urgent_display: AHashMap<String, String>,
 }
@@ -205,6 +197,7 @@ impl RuleTermMatcher {
         let mut urgent_display: AHashMap<String, String> = AHashMap::new();
         let mut keyword_terms: AHashMap<String, String> = AHashMap::new();
         let mut urgent_terms: AHashMap<String, String> = AHashMap::new();
+        let mut severity_bonus: Vec<bool> = Vec::new();
 
         for entry in rules.try_iter()? {
             let entry = entry?;
@@ -219,6 +212,11 @@ impl RuleTermMatcher {
             let urgent = tup.get_item(2)?;
 
             let idx = rules_vec.len();
+            let base_severity: String = rule
+                .getattr("base_severity")
+                .and_then(|value| value.extract())
+                .unwrap_or_default();
+            severity_bonus.push(base_severity == "high" || base_severity == "critical");
             rules_vec.push(rule.into());
 
             for ko in keywords.try_iter()? {
@@ -245,6 +243,7 @@ impl RuleTermMatcher {
             keyword_compiled: CompiledTerms::new(keyword_terms),
             urgent_compiled: CompiledTerms::new(urgent_terms),
             rules: rules_vec,
+            severity_bonus,
             keyword_display,
             urgent_display,
         })
@@ -264,14 +263,14 @@ impl RuleTermMatcher {
         for lowered in kw_hits {
             let display = self
                 .keyword_display
-                .get(&lowered)
-                .cloned()
-                .unwrap_or_else(|| lowered.clone());
-            if let Some(owners) = self.keyword_owners.get(&lowered) {
+                .get(lowered)
+                .map(String::as_str)
+                .unwrap_or(lowered);
+            if let Some(owners) = self.keyword_owners.get(lowered) {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
                     let (kw_list, _ug_list) = ensure_entry(&out, rule_obj, py)?;
-                    kw_list.append(display.clone())?;
+                    kw_list.append(display)?;
                 }
             }
         }
@@ -279,14 +278,14 @@ impl RuleTermMatcher {
         for lowered in ug_hits {
             let display = self
                 .urgent_display
-                .get(&lowered)
-                .cloned()
-                .unwrap_or_else(|| lowered.clone());
-            if let Some(owners) = self.urgent_owners.get(&lowered) {
+                .get(lowered)
+                .map(String::as_str)
+                .unwrap_or(lowered);
+            if let Some(owners) = self.urgent_owners.get(lowered) {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
                     let (_kw_list, ug_list) = ensure_entry(&out, rule_obj, py)?;
-                    ug_list.append(display.clone())?;
+                    ug_list.append(display)?;
                 }
             }
         }
@@ -309,10 +308,10 @@ impl RuleTermMatcher {
         for lowered in hits {
             let display = self
                 .keyword_display
-                .get(&lowered)
-                .cloned()
-                .unwrap_or_else(|| lowered.clone());
-            if let Some(owners) = self.keyword_owners.get(&lowered) {
+                .get(lowered)
+                .map(String::as_str)
+                .unwrap_or(lowered);
+            if let Some(owners) = self.keyword_owners.get(lowered) {
                 for &rule_idx in owners {
                     let rule_obj = self.rules[rule_idx].clone_ref(py);
                     let list: Bound<PyList> = match out.get_item(&rule_obj)? {
@@ -323,11 +322,63 @@ impl RuleTermMatcher {
                             l
                         }
                     };
-                    list.append(display.clone())?;
+                    list.append(display)?;
                 }
             }
         }
         Ok(out)
+    }
+}
+
+impl RuleTermMatcher {
+    pub fn chat_priority_score(&self, text: &str) -> f64 {
+        let rule_count = self.rules.len();
+        let mut keyword_counts = vec![0_u8; rule_count];
+        let mut urgent_hits = vec![false; rule_count];
+        let mut touched = Vec::with_capacity(rule_count.min(8));
+        let mut touched_flags = vec![false; rule_count];
+
+        for lowered in self.keyword_compiled.collect_hits(text) {
+            if let Some(owners) = self.keyword_owners.get(lowered) {
+                for &rule_idx in owners {
+                    if keyword_counts[rule_idx] < u8::MAX {
+                        keyword_counts[rule_idx] += 1;
+                    }
+                    if !touched_flags[rule_idx] {
+                        touched_flags[rule_idx] = true;
+                        touched.push(rule_idx);
+                    }
+                }
+            }
+        }
+
+        for lowered in self.urgent_compiled.collect_hits(text) {
+            if let Some(owners) = self.urgent_owners.get(lowered) {
+                for &rule_idx in owners {
+                    urgent_hits[rule_idx] = true;
+                    if !touched_flags[rule_idx] {
+                        touched_flags[rule_idx] = true;
+                        touched.push(rule_idx);
+                    }
+                }
+            }
+        }
+
+        let mut score = 0.0_f64;
+        for rule_idx in touched {
+            let keyword_count = keyword_counts[rule_idx];
+            if keyword_count == 0 {
+                continue;
+            }
+            score += 4.0 + f64::from(keyword_count.min(3));
+            if urgent_hits[rule_idx] {
+                score += 2.0;
+            }
+            if self.severity_bonus[rule_idx] {
+                score += 1.0;
+            }
+        }
+        score
     }
 }
 

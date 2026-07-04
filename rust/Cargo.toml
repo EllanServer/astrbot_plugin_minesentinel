@@ -15,7 +15,6 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.29", features = ["extension-module"] }
 blake2 = "0.10"
 regex = "1"
-once_cell = "1"
 ahash = "0.8"
 # In-Rust JSON serialization: removes the per-record PyO3 → json.dumps callback
 # (was the dominant cost in json_line / compact_value's fallback path).
