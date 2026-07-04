@@ -1,0 +1,1757 @@
+diff --git a/handlers/binding_commands.py b/handlers/binding_commands.py
+index 1e7d69f..26d30ec 100644
+--- a/handlers/binding_commands.py
++++ b/handlers/binding_commands.py
+@@ -46,7 +46,7 @@ class BindingCommandHandler:
+             yield event.plain_result("❌ 绑定功能未启用")
+             return
+ 
+-        success, message = self.binding_service.bind(
++        success, message = await self.binding_service.bind(
+             platform=event.get_platform_name(),
+             user_id=event.get_sender_id(),
+             mc_player_name=player_id,
+@@ -58,7 +58,7 @@ class BindingCommandHandler:
+ 
+     async def handle_unbind(self, event: "AstrMessageEvent"):
+         """Remove the current chat account's Minecraft binding."""
+-        success, message = self.binding_service.unbind(
++        success, message = await self.binding_service.unbind(
+             platform=event.get_platform_name(),
+             user_id=event.get_sender_id(),
+         )
+diff --git a/handlers/custom_commands.py b/handlers/custom_commands.py
+index ae00134..5d0576e 100644
+--- a/handlers/custom_commands.py
++++ b/handlers/custom_commands.py
+@@ -33,10 +33,15 @@ class CustomCommandParser:
+             trigger_regex = trigger_regex.replace(f"<&{param}&>", f"(?P<{param}>\\S+)")
+ 
+         trigger_name = trigger_part.split()[0] if trigger_part else ""
++        # Pre-compile the trigger regex so per-message matching doesn't pay the
++        # compilation cost on every call. match() is invoked for every incoming
++        # non-command message × every mapping.
++        compiled = re.compile(f"^{trigger_regex}$", re.IGNORECASE)
+         return {
+             "trigger_part": trigger_part,
+             "trigger_name": trigger_name,
+             "trigger_regex": trigger_regex,
++            "compiled_regex": compiled,
+             "param_names": param_names,
+             "command_template": command_part,
+         }
+@@ -45,9 +50,8 @@ class CustomCommandParser:
+         self, text: str, sender_mc_name: str | None = None
+     ) -> tuple[str, dict] | None:
+         for mapping in self.mappings:
+-            trigger_regex = mapping["trigger_regex"]
+             command_template = mapping["command_template"]
+-            match = re.match(f"^{trigger_regex}$", text, re.IGNORECASE)
++            match = mapping["compiled_regex"].match(text)
+             if not match:
+                 continue
+ 
+diff --git a/handlers/server_query_commands.py b/handlers/server_query_commands.py
+index dacdc25..3c278d6 100644
+--- a/handlers/server_query_commands.py
++++ b/handlers/server_query_commands.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ from types import SimpleNamespace
+ from typing import TYPE_CHECKING
+ 
+@@ -38,8 +39,12 @@ class ServerQueryCommandHandler:
+ 
+         cards: list[tuple[str, object, object]] = []
+         errors: list[str] = []
+-        for server in online_servers:
+-            server_cards, err = await self.collect_status_cards(server)
++        # Fetch each server's status concurrently; previously this was a serial
++        # await loop so N servers took sum(latency) instead of max(latency).
++        results = await asyncio.gather(
++            *(self.collect_status_cards(server) for server in online_servers)
++        )
++        for server_cards, err in results:
+             if err:
+                 errors.append(err)
+                 continue
+@@ -125,8 +130,10 @@ class ServerQueryCommandHandler:
+ 
+         cards: list[tuple[str, list, int, str]] = []
+         errors: list[str] = []
+-        for server in online_servers:
+-            server_cards, err = await self.collect_list_cards(server)
++        results = await asyncio.gather(
++            *(self.collect_list_cards(server) for server in online_servers)
++        )
++        for server_cards, err in results:
+             if err:
+                 errors.append(err)
+                 continue
+@@ -208,15 +215,26 @@ class ServerQueryCommandHandler:
+             return
+ 
+         cards: list[tuple[str, object]] = []
+-        for server in online_servers:
++
++        async def _resolve_one(server):
+             player, _ = await server.rest_client.get_player_by_name(player_id)
+             if not player:
+-                continue
++                return None
+             player_server_name = await self.resolve_player_card_server_name(
+                 server,
+                 player,
+             )
+-            cards.append((player_server_name, player))
++            return (player_server_name, player)
++
++        # Query each server concurrently; per server the player lookup and the
++        # server-name resolution stay sequential (latter depends on former),
++        # but different servers no longer wait for each other.
++        resolved = await asyncio.gather(
++            *(_resolve_one(server) for server in online_servers)
++        )
++        for item in resolved:
++            if item is not None:
++                cards.append(item)
+ 
+         if not cards:
+             yield event.plain_result("❌ 玩家在所有在线服务器中均无数据")
+diff --git a/services/binding.py b/services/binding.py
+index 100c9ce..d5cf045 100644
+--- a/services/binding.py
++++ b/services/binding.py
+@@ -1,5 +1,6 @@
+ """用户绑定服务，用于将外部平台用户与 MC 玩家关联"""
+ 
++import asyncio
+ import json
+ from dataclasses import dataclass, field
+ from pathlib import Path
+@@ -114,7 +115,7 @@ class BindingService:
+         """创建用户的唯一键"""
+         return f"{platform}:{user_id}"
+ 
+-    def bind(
++    async def bind(
+         self,
+         platform: str,
+         user_id: str,
+@@ -158,11 +159,11 @@ class BindingService:
+             self._storage.mc_name_index[mc_name_lower] = []
+         self._storage.mc_name_index[mc_name_lower].append(key)
+ 
+-        self._save()
++        await asyncio.to_thread(self._save)
+         logger.info(f"[BindingService] 已绑定 {platform}:{user_id} -> {mc_player_name}")
+         return True, f"成功绑定玩家 {mc_player_name}"
+ 
+-    def unbind(self, platform: str, user_id: str) -> tuple[bool, str]:
++    async def unbind(self, platform: str, user_id: str) -> tuple[bool, str]:
+         """解绑外部用户
+ 
+         返回:
+@@ -187,7 +188,7 @@ class BindingService:
+         # 移除绑定
+         del self._storage.bindings[key]
+ 
+-        self._save()
++        await asyncio.to_thread(self._save)
+         logger.info(
+             f"[BindingService] 已解绑 {platform}:{user_id} (原绑定玩家: {binding.mc_player_name})"
+         )
+diff --git a/services/message_bridge.py b/services/message_bridge.py
+index 9313c91..de9b860 100644
+--- a/services/message_bridge.py
++++ b/services/message_bridge.py
+@@ -1,5 +1,6 @@
+ """MC 与其他平台之间转发消息的消息桥接服务"""
+ 
++import asyncio
+ import re
+ import time
+ from typing import TYPE_CHECKING
+@@ -56,11 +57,16 @@ class MessageBridge:
+             # 从反向映射中移除
+             for session in config.target_sessions:
+                 if session in self._session_to_servers:
+-                    self._session_to_servers[session] = [
++                    remaining = [
+                         (sid, cfg)
+                         for sid, cfg in self._session_to_servers[session]
+                         if sid != server_id
+                     ]
++                    if remaining:
++                        self._session_to_servers[session] = remaining
++                    else:
++                        # 清理空列表，避免内存泄漏与 get_servers_for_session 返回空列表
++                        del self._session_to_servers[session]
+ 
+     def rename_server(self, old_id: str, new_id: str, config: ServerConfig):
+         """Keep forwarding maps in sync when discovery changes the runtime id."""
+@@ -129,8 +135,9 @@ class MessageBridge:
+             return False
+ 
+         # 发送到每个目标会话
+-        for target_umo in targets:
+-            await self._send_to_session(target_umo, content)
++        await asyncio.gather(
++            *(self._send_to_session(target_umo, content) for target_umo in targets)
++        )
+ 
+         return True
+ 
+@@ -209,13 +216,19 @@ class MessageBridge:
+         message_str = event.message_str
+         umo = event.unified_msg_origin
+ 
+-        # 检查每个服务器配置
+-        any_forwarded = False
+-        for server_id, config in self._server_configs.items():
+-            # 检查此会话是否在目标会话列表中
+-            if not config.target_sessions or umo not in config.target_sessions:
+-                continue
++        # 通过反向索引直接拿到绑定了该会话的服务器，避免 O(N×M) 线性扫描。
++        matched_servers = self._session_to_servers.get(umo)
++        if not matched_servers:
++            return False
+ 
++        # 这些值不随服务器变化，提前取一次即可。
++        sender_name = event.get_sender_name()
++        sender_id = event.get_sender_id()
++        platform_name = event.get_platform_name()
++
++        # 检查每个匹配的服务器配置
++        any_forwarded = False
++        for server_id, config in matched_servers:
+             # 前缀为空时转发全部消息，否则检查前缀
+             if config.auto_forward_prefix:
+                 if not message_str.startswith(config.auto_forward_prefix):
+@@ -228,11 +241,6 @@ class MessageBridge:
+             if not content:
+                 continue
+ 
+-            # 获取发送者信息
+-            sender_name = event.get_sender_name()
+-            sender_id = event.get_sender_id()
+-            platform_name = event.get_platform_name()
+-
+             # 发送到 MC 服务器
+             server = self.server_manager.get_server(server_id)
+             if server and server.connected:
+@@ -345,11 +353,10 @@ class MessageBridge:
+ 
+     def get_servers_for_session(self, umo: str) -> list[str]:
+         """获取目标会话包含该 UMO 的服务器 ID 列表"""
+-        result = []
+-        for server_id, config in self._server_configs.items():
+-            if config.target_sessions and umo in config.target_sessions:
+-                result.append(server_id)
+-        return result
++        matched = self._session_to_servers.get(umo)
++        if not matched:
++            return []
++        return [server_id for server_id, _ in matched]
+ 
+     def strip_color_codes(self, text: str) -> str:
+         """从文本中移除 Minecraft 颜色代码"""
+diff --git a/services/mine_sentinel/observation_priority.py b/services/mine_sentinel/observation_priority.py
+index 7f9c5f0..bec6246 100644
+--- a/services/mine_sentinel/observation_priority.py
++++ b/services/mine_sentinel/observation_priority.py
+@@ -4,10 +4,26 @@ from __future__ import annotations
+ 
+ from .models import ObservationRecord
+ from .reporting.dialogue_rules import DialogueRule, dialogue_rules_from_config
+-from .reporting.dialogue_terms import matched_terms, normalize_text
++from .reporting.dialogue_terms import RuleTermMatcher, normalize_text
+ from .reporting.metrics_context import memory_usage_percent
+ 
+ 
++# Matcher built once for the default rule set; observation_priority_score is
++# called per record (up to 50k records per report), so recompiling the keyword
++# regex each time would be wasteful. Custom rules fall back to a per-call build.
++_DEFAULT_MATCHER: RuleTermMatcher | None = None
++
++
++def _default_matcher() -> RuleTermMatcher:
++    global _DEFAULT_MATCHER
++    if _DEFAULT_MATCHER is None:
++        rules = dialogue_rules_from_config(None)
++        _DEFAULT_MATCHER = RuleTermMatcher(
++            (rule, rule.keywords, rule.urgent_terms) for rule in rules
++        )
++    return _DEFAULT_MATCHER
++
++
+ def observation_priority_score(
+     record: ObservationRecord,
+     rules: tuple[DialogueRule, ...] | None = None,
+@@ -16,16 +32,20 @@ def observation_priority_score(
+ 
+     score = 0.0
+     text = normalize_text(f"{record.content} {' '.join(record.tags)}")
+-    dialogue_rules = rules or dialogue_rules_from_config(None)
+ 
+     if record.kind == "CHAT":
+         score += 1.0
+-        for rule in dialogue_rules:
+-            terms = matched_terms(text, rule.keywords)
+-            if not terms:
++        # Build the matcher once for the (possibly custom) rule set. When rules
++        # is None we reuse a process-wide cached matcher for the default rules.
++        matcher = _default_matcher() if rules is None else RuleTermMatcher(
++            (rule, rule.keywords, rule.urgent_terms) for rule in rules
++        )
++        hits = matcher.scan(text)
++        for rule, (keywords, urgent) in hits.items():
++            if not keywords:
+                 continue
+-            score += 4.0 + min(3, len(terms))
+-            if matched_terms(text, rule.urgent_terms):
++            score += 4.0 + min(3, len(keywords))
++            if urgent:
+                 score += 2.0
+             if rule.base_severity in ("high", "critical"):
+                 score += 1.0
+diff --git a/services/mine_sentinel/reporting/dialogue.py b/services/mine_sentinel/reporting/dialogue.py
+index 77d72f6..c2cd98d 100644
+--- a/services/mine_sentinel/reporting/dialogue.py
++++ b/services/mine_sentinel/reporting/dialogue.py
+@@ -14,7 +14,7 @@ from .dialogue_signals import (
+     replaceable_sample_index,
+     signal_fingerprint,
+ )
+-from .dialogue_terms import matched_terms, normalize_text
++from .dialogue_terms import RuleTermMatcher, normalize_text
+ 
+ 
+ MODERATION_CATEGORY = "moderation"
+@@ -26,6 +26,11 @@ class PlayerDialogueAnalyzer:
+     def __init__(self, config: MineSentinelConfig):
+         self.config = config
+         self.rules = dialogue_rules_from_config(config.dialogue.custom_rules)
++        # Pre-compile all rule keywords into one alternation regex so each chat
++        # record is scanned once instead of rules × keywords str.find passes.
++        self._matcher = RuleTermMatcher(
++            (rule, rule.keywords, rule.urgent_terms) for rule in self.rules
++        )
+         self.output = DialogueIssueBuilder(config)
+ 
+     def analyze(self, records: list[ObservationRecord]) -> dict[str, Any]:
+@@ -49,12 +54,11 @@ class PlayerDialogueAnalyzer:
+         )
+         for record in chat_records:
+             text = normalize_text(record.content)
+-            direct_matches = []
+-            for rule in self.rules:
+-                terms = matched_terms(text, rule.keywords)
+-                if not terms:
+-                    continue
+-                direct_matches.append((rule, terms))
++            # Single-pass scan: one regex finds every keyword/urgent hit per rule.
++            direct_matches: list[tuple[DialogueRule, list[str]]] = []
++            for rule, (keywords, _urgent) in self._matcher.scan(text).items():
++                if keywords:
++                    direct_matches.append((rule, keywords))
+             if direct_matches:
+                 for rule, terms in self._prioritized_direct_matches(direct_matches):
+                     collector.add(record, rule, terms, text)
+@@ -81,8 +85,8 @@ class PlayerDialogueAnalyzer:
+         text = normalize_text(record.content)
+         best_rule = None
+         best_count = 0
+-        for rule in self.rules:
+-            count = len(matched_terms(text, rule.keywords))
++        for rule, terms in self._matcher.matched_keywords(text).items():
++            count = len(terms)
+             if count > best_count or (
+                 count
+                 and count == best_count
+diff --git a/services/mine_sentinel/reporting/dialogue_terms.py b/services/mine_sentinel/reporting/dialogue_terms.py
+index 5565ba3..e17f5a8 100644
+--- a/services/mine_sentinel/reporting/dialogue_terms.py
++++ b/services/mine_sentinel/reporting/dialogue_terms.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import re
++from typing import Iterable
+ 
+ 
+ NEGATION_PREFIXES = (
+@@ -49,3 +50,100 @@ def term_is_negated(text: str, term: str) -> bool:
+             start = index + len(term)
+             continue
+         return False
++
++
++class RuleTermMatcher:
++    """Match many keyword rules against a text in a single pass.
++
++    Each rule's keywords are compiled into one alternation regex so that a
++    single ``re.finditer`` scan reports every hit and its position, instead of
++    looping over rules × keywords with repeated ``str.find`` calls. Negation
++    is still applied per hit via :func:`term_is_negated`.
++    """
++
++    def __init__(self, rules: Iterable[tuple[object, tuple[str, ...], tuple[str, ...]]]):
++        # rules: iterable of (rule_obj, keywords, urgent_terms)
++        self._rules: list[tuple[object, tuple[str, ...], tuple[str, ...]]] = []
++        # lowered term -> owning rule objects (a term may belong to several rules).
++        self._keyword_owners: dict[str, list[object]] = {}
++        self._urgent_owners: dict[str, list[object]] = {}
++        # lowered term -> original (display) term, so hits map back to the form
++        # the rule author wrote (matched_terms preserves original casing).
++        self._keyword_display: dict[str, str] = {}
++        self._urgent_display: dict[str, str] = {}
++        keyword_terms: set[str] = set()
++        urgent_terms: set[str] = set()
++        for rule, keywords, urgent in rules:
++            self._rules.append((rule, keywords, urgent))
++            for term in keywords:
++                lowered = term.lower()
++                keyword_terms.add(lowered)
++                self._keyword_owners.setdefault(lowered, []).append(rule)
++                self._keyword_display.setdefault(lowered, term)
++            for term in urgent:
++                lowered = term.lower()
++                urgent_terms.add(lowered)
++                self._urgent_owners.setdefault(lowered, []).append(rule)
++                self._urgent_display.setdefault(lowered, term)
++        self._keyword_re = _compile_term_pattern(keyword_terms)
++        self._urgent_re = _compile_term_pattern(urgent_terms)
++
++    def scan(
++        self, text: str
++    ) -> dict[object, tuple[list[str], list[str]]]:
++        """Return {rule: (matched_keywords, matched_urgent_terms)} for the text."""
++        result: dict[object, tuple[list[str], list[str]]] = {}
++        if not text:
++            return result
++
++        keyword_hits = _collect_non_negated_hits(text, self._keyword_re)
++        for lowered in keyword_hits:
++            display = self._keyword_display.get(lowered, lowered)
++            for rule in self._keyword_owners.get(lowered, ()):
++                kw, ug = result.setdefault(rule, ([], []))
++                kw.append(display)
++
++        urgent_hits = _collect_non_negated_hits(text, self._urgent_re)
++        for lowered in urgent_hits:
++            display = self._urgent_display.get(lowered, lowered)
++            for rule in self._urgent_owners.get(lowered, ()):
++                kw, ug = result.setdefault(rule, ([], []))
++                ug.append(display)
++        return result
++
++    def matched_keywords(self, text: str) -> dict[object, list[str]]:
++        """Return {rule: matched_keywords} ignoring urgent terms."""
++        hits = _collect_non_negated_hits(text, self._keyword_re)
++        out: dict[object, list[str]] = {}
++        for lowered in hits:
++            display = self._keyword_display.get(lowered, lowered)
++            for rule in self._keyword_owners.get(lowered, ()):
++                out.setdefault(rule, []).append(display)
++        return out
++
++
++def _compile_term_pattern(terms: set[str]) -> re.Pattern[str]:
++    if not terms:
++        return re.compile(r"(?!)")
++    # Sort by length desc so longer terms match first at a given position;
++    # escape each term for regex safety.
++    alternation = "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
++    return re.compile(alternation)
++
++
++def _collect_non_negated_hits(
++    text: str, pattern: re.Pattern[str]
++) -> dict[str, list[object]]:
++    """Collect non-negated term hits keyed by the matched (lowered) term string.
++
++    A term may appear multiple times; we keep one entry but remember it matched.
++    Negated occurrences are ignored, matching :func:`matched_terms` semantics
++    (a non-negated occurrence anywhere makes the term count).
++    """
++    hits: dict[str, list[object]] = {}
++    for match in pattern.finditer(text):
++        term = match.group(0)
++        if term_is_negated(text, term):
++            continue
++        hits.setdefault(term, [])
++    return hits
+diff --git a/services/mine_sentinel/reporting/image_renderer.py b/services/mine_sentinel/reporting/image_renderer.py
+index 262d785..d85a476 100644
+--- a/services/mine_sentinel/reporting/image_renderer.py
++++ b/services/mine_sentinel/reporting/image_renderer.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import re
+ import time
+ from io import BytesIO
+@@ -13,6 +14,19 @@ from PIL import Image, ImageDraw
+ from ...rendering.fonts import FontProvider
+ from ...rendering.image import save_png
+ from ..issue_formatting import format_millis
++from .incident_format import (
++    as_millis as _as_millis,
++    clean_sentence as _clean_sentence,
++    dedupe_key as _dedupe_key,
++    evidence_line as _evidence_line,
++    format_duration as _format_duration,
++    format_time_window as _format_time_window,
++    incident_time_text as _incident_time_text,
++    incident_title as _incident_title,
++    is_attachment_note as _is_attachment_note,
++    quiet_window_text as _quiet_window_text,
++    resolve_attachment_name,
++)
+ from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
+ from .labels import DEFAULT_LABELS
+ from .presentation import ReportPresentationBuilder
+@@ -55,6 +69,24 @@ class MineSentinelReportImageRenderer:
+         unique_players: int,
+     ) -> BytesIO:
+         await self._ensure_assets()
++        # The actual drawing is pure CPU-bound PIL work on a large canvas;
++        # run it off the event loop so heartbeats/message dispatch are not
++        # blocked while a report image (often 20000+px tall) is rendered.
++        return await asyncio.to_thread(
++            self._draw_report,
++            report,
++            total_count,
++            dedupe_count,
++            unique_players,
++        )
++
++    def _draw_report(
++        self,
++        report: dict,
++        total_count: int,
++        dedupe_count: int,
++        unique_players: int,
++    ) -> BytesIO:
+         presentation = self._presentation_builder.build(
+             report,
+             total_count,
+@@ -434,38 +466,6 @@ def _wrap_tokens(text: str) -> list[str]:
+ _CLOSING_PUNCTUATION = set("，。；：！？、）】》」』”’")
+ 
+ 
+-def _format_time_window(report: dict) -> str:
+-    start = _as_millis(report.get("window_start_ts"))
+-    end = _as_millis(report.get("window_end_ts"))
+-    if start and end:
+-        start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
+-        end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
+-        start_hm = time.strftime("%H:%M", time.localtime(start / 1000))
+-        end_hm = time.strftime("%H:%M", time.localtime(end / 1000))
+-        if start_day == end_day:
+-            return f"{start_day} {start_hm} - {end_hm}"
+-        return f"{start_day} {start_hm} - {end_day} {end_hm}"
+-    return str(report.get("time_window") or "未知")
+-
+-
+-def _format_duration(report: dict) -> str:
+-    start = _as_millis(report.get("window_start_ts"))
+-    end = _as_millis(report.get("window_end_ts"))
+-    minutes = 0
+-    if start and end and end > start:
+-        minutes = max(1, round((end - start) / 60000))
+-    else:
+-        try:
+-            minutes = int(report.get("_window_minutes") or 0)
+-        except (TypeError, ValueError):
+-            minutes = 0
+-    if minutes and minutes % 60 == 0:
+-        return f"{minutes // 60} 小时"
+-    if minutes:
+-        return f"{minutes} 分钟"
+-    return "本窗口"
+-
+-
+ def _format_servers(report: dict) -> str:
+     values: list[str] = []
+     server_names = report.get("server_names") or []
+@@ -482,10 +482,7 @@ def _format_servers(report: dict) -> str:
+ 
+ 
+ def _format_attachment_name(report: dict) -> str:
+-    name = str(report.get("_export_file_name") or "").strip()
+-    if not name and report.get("_export_file_path"):
+-        name = Path(str(report["_export_file_path"])).name
+-    return name or "未生成"
++    return resolve_attachment_name(report) or "未生成"
+ 
+ 
+ def _overall_line(
+@@ -505,26 +502,6 @@ def _overall_line(
+     return f"{status}共有 {unique_players} 名玩家出现记录，活跃玩家主要是：{players}。"
+ 
+ 
+-def _incident_title(group: IncidentGroup, labels: list[str]) -> str:
+-    if group.family == "moderation":
+-        return "疑似作弊/破坏或利用漏洞反馈"
+-    if group.family == "suggestion":
+-        return labels[0] if labels else "玩家建议/体验请求"
+-    if len(labels) > 1:
+-        return "服务器集中出现多类异常反馈"
+-    return labels[0] if labels else "玩家异常反馈"
+-
+-
+-def _incident_time_text(group: IncidentGroup) -> str:
+-    start = _as_millis(group.start_ts)
+-    end = _as_millis(group.end_ts)
+-    if start and end and start != end:
+-        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
+-    if start or end:
+-        return f"{format_millis(start or end)} 左右"
+-    return "本窗口内"
+-
+-
+ def _incident_labels(
+     renderer: MineSentinelReportImageRenderer,
+     issues: list[dict[str, Any]],
+@@ -729,21 +706,6 @@ def _action_lines(issues: list[dict[str, Any]]) -> list[str]:
+     ]
+ 
+ 
+-def _quiet_window_text(report: dict, groups: list[IncidentGroup]) -> str:
+-    if not groups or int(report.get("chat_count") or 0) <= 0:
+-        return ""
+-    if len(groups) == 1:
+-        time_text = _incident_time_text(groups[0]).replace(" 左右", "")
+-        return f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
+-    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
+-
+-
+-def _evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
+-    if dedupe_count:
+-        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
+-    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
+-
+-
+ def _incident_colors(family: str) -> tuple[str, str]:
+     if family == "moderation":
+         return "#fef2f2", "#dc2626"
+@@ -762,25 +724,3 @@ def _unique_text(values: list[str]) -> list[str]:
+         seen.add(key)
+         result.append(value)
+     return result
+-
+-
+-def _clean_sentence(value: str) -> str:
+-    text = value.strip()
+-    text = re.sub(r"^-+\s*", "", text)
+-    if not text:
+-        return ""
+-    if text[-1] not in "。！？.!?":
+-        text += "。"
+-    return text
+-
+-
+-def _dedupe_key(value: str) -> str:
+-    return re.sub(r"\s+", "", value).lower()[:120]
+-
+-
+-def _as_millis(value: Any) -> int:
+-    try:
+-        number = int(value)
+-    except (TypeError, ValueError):
+-        return 0
+-    return number if number > 0 else 0
+diff --git a/services/mine_sentinel/reporting/incident_format.py b/services/mine_sentinel/reporting/incident_format.py
+new file mode 100644
+index 0000000..b0f14a2
+--- /dev/null
++++ b/services/mine_sentinel/reporting/incident_format.py
+@@ -0,0 +1,141 @@
++"""Shared formatting helpers for MineSentinel report renderers.
++
++These functions are extracted from ``text_renderer`` and ``image_renderer``
++where they previously existed as byte-for-byte identical (or trivially
++differing) copies. Renderers should import from here instead of redefining
++them, so bug fixes land in one place.
++"""
++
++from __future__ import annotations
++
++import re
++import time
++from pathlib import Path
++from typing import Any
++
++from ..issue_formatting import format_millis
++from .incidents import IncidentGroup, issue_sort_key
++
++
++def incident_title(group: IncidentGroup, labels: list[str]) -> str:
++    if group.family == "moderation":
++        return "疑似作弊/破坏或利用漏洞反馈"
++    if group.family == "suggestion":
++        return labels[0] if labels else "玩家建议/体验请求"
++    if len(labels) > 1:
++        return "服务器集中出现多类异常反馈"
++    return labels[0] if labels else "玩家异常反馈"
++
++
++def incident_time_text(group: IncidentGroup) -> str:
++    start = as_millis(group.start_ts)
++    end = as_millis(group.end_ts)
++    if start and end and start != end:
++        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
++    if start or end:
++        return f"{format_millis(start or end)} 左右"
++    return "本窗口内"
++
++
++def format_time_window(report: dict) -> str:
++    start = as_millis(report.get("window_start_ts"))
++    end = as_millis(report.get("window_end_ts"))
++    if start and end:
++        start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
++        end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
++        start_hm = time.strftime("%H:%M", time.localtime(start / 1000))
++        end_hm = time.strftime("%H:%M", time.localtime(end / 1000))
++        if start_day == end_day:
++            return f"{start_day} {start_hm} - {end_hm}"
++        return f"{start_day} {start_hm} - {end_day} {end_hm}"
++    return str(report.get("time_window") or "未知")
++
++
++def format_duration(report: dict) -> str:
++    start = as_millis(report.get("window_start_ts"))
++    end = as_millis(report.get("window_end_ts"))
++    minutes = 0
++    if start and end and end > start:
++        minutes = max(1, round((end - start) / 60000))
++    else:
++        try:
++            minutes = int(report.get("_window_minutes") or 0)
++        except (TypeError, ValueError):
++            minutes = 0
++    if not minutes:
++        match = re.search(r"最近\s*(\d+)\s*分钟", str(report.get("time_window") or ""))
++        if match:
++            minutes = int(match.group(1))
++    if minutes and minutes % 60 == 0:
++        return f"{minutes // 60} 小时"
++    if minutes:
++        return f"{minutes} 分钟"
++    return "本窗口"
++
++
++def evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
++    if dedupe_count:
++        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
++    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
++
++
++def clean_sentence(value: str) -> str:
++    text = value.strip()
++    text = re.sub(r"^-+\s*", "", text)
++    if not text:
++        return ""
++    if text[-1] not in "。！？.!?":
++        text += "。"
++    return text
++
++
++_DEDUPE_RE = re.compile(r"\s+")
++
++
++def dedupe_key(value: str) -> str:
++    return _DEDUPE_RE.sub("", value).lower()[:120]
++
++
++def as_millis(value: Any) -> int:
++    try:
++        number = int(value)
++    except (TypeError, ValueError):
++        return 0
++    return number if number > 0 else 0
++
++
++def quiet_window_text(report: dict, groups: list[IncidentGroup]) -> str:
++    """Shared quiet-window caption used by both renderers.
++
++    Returns an empty string when there is nothing to say (no incidents or no
++    chat), matching the original ``_quiet_window_line`` / ``_quiet_window_text``
++    behavior that both renderers relied on.
++    """
++    if not groups:
++        return ""
++    chat_count = int(report.get("chat_count") or 0)
++    if chat_count <= 0:
++        return ""
++    if len(groups) == 1:
++        time_text = incident_time_text(groups[0]).replace(" 左右", "")
++        return (
++            f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的"
++            "大规模聊天冲突、刷屏、广告或持续性争吵。"
++        )
++    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
++
++
++def resolve_attachment_name(report: dict) -> str:
++    """Return the bare attachment file name, or "" when none was produced.
++
++    Both renderers need this; ``text_renderer`` wrapped it in a sentence while
++    ``image_renderer`` used the bare name. The shared core lives here.
++    """
++    name = str(report.get("_export_file_name") or "").strip()
++    if not name and report.get("_export_file_path"):
++        name = Path(str(report["_export_file_path"])).name
++    return name
++
++
++def is_attachment_note(note: str) -> bool:
++    return "完整 observation 文件" in note or "完整聊天记录附件" in note
+diff --git a/services/mine_sentinel/reporting/incidents.py b/services/mine_sentinel/reporting/incidents.py
+index 9573985..aa50940 100644
+--- a/services/mine_sentinel/reporting/incidents.py
++++ b/services/mine_sentinel/reporting/incidents.py
+@@ -96,17 +96,39 @@ class IncidentGrouper:
+ 
+     def group(self, issues: list[dict[str, Any]]) -> list[IncidentGroup]:
+         groups: list[IncidentGroup] = []
++        # Inverted index: (family, scope) -> list of groups that share that
++        # scope. Lets each new issue probe only candidate groups sharing at
++        # least one scope, instead of scanning every existing group (O(N×M) ->
++        # roughly O(N×candidates_per_scope)).
++        index: dict[tuple[str, str], list[IncidentGroup]] = {}
+         for issue in sorted(issues, key=issue_sort_key):
+             if is_metric_issue(issue):
+                 continue
++            family = issue_family(issue)
++            scopes = set(issue_scopes(issue))
++            # Gather candidate groups that share at least one scope.
++            seen_ids: set[int] = set()
++            candidates: list[IncidentGroup] = []
++            for scope in scopes:
++                for group in index.get((family, scope), ()):
++                    if id(group) not in seen_ids:
++                        seen_ids.add(id(group))
++                        candidates.append(group)
+             placed = False
+-            for group in groups:
++            for group in candidates:
+                 if self.can_merge(group, issue):
+                     group.add(issue)
++                    # New scopes from the issue may expand the group's index
++                    # footprint so future issues with those scopes find it.
++                    for new_scope in group.scopes - scopes:
++                        index.setdefault((family, new_scope), []).append(group)
+                     placed = True
+                     break
+             if not placed:
+-                groups.append(IncidentGroup.from_issue(issue))
++                new_group = IncidentGroup.from_issue(issue)
++                groups.append(new_group)
++                for scope in new_group.scopes:
++                    index.setdefault((family, scope), []).append(new_group)
+         groups.sort(key=incident_sort_key)
+         return groups
+ 
+diff --git a/services/mine_sentinel/reporting/text_renderer.py b/services/mine_sentinel/reporting/text_renderer.py
+index 29ba354..8cf5e20 100644
+--- a/services/mine_sentinel/reporting/text_renderer.py
++++ b/services/mine_sentinel/reporting/text_renderer.py
+@@ -9,6 +9,19 @@ from typing import Any
+ 
+ from ..issue_formatting import format_millis
+ from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
++from .incident_format import (
++    as_millis as _as_millis,
++    clean_sentence as _clean_sentence,
++    dedupe_key as _dedupe_key,
++    evidence_line as _evidence_line,
++    format_duration as _format_duration,
++    format_time_window as _format_time_window,
++    incident_time_text as _incident_time_text,
++    incident_title as _incident_title,
++    is_attachment_note as _is_attachment_note,
++    quiet_window_text as _quiet_window_line,
++    resolve_attachment_name,
++)
+ from .labels import DEFAULT_LABELS
+ from .presentation import ReportPresentationBuilder
+ 
+@@ -181,26 +194,6 @@ def _incident_event_summary(index: int, group: IncidentGroup) -> str:
+     return lead
+ 
+ 
+-def _incident_title(group: IncidentGroup, labels: list[str]) -> str:
+-    if group.family == "moderation":
+-        return "疑似作弊/破坏或利用漏洞反馈"
+-    if group.family == "suggestion":
+-        return labels[0] if labels else "玩家建议/体验请求"
+-    if len(labels) > 1:
+-        return "服务器集中出现多类异常反馈"
+-    return labels[0] if labels else "玩家异常反馈"
+-
+-
+-def _incident_time_text(group: IncidentGroup) -> str:
+-    start = _as_millis(group.start_ts)
+-    end = _as_millis(group.end_ts)
+-    if start and end and start != end:
+-        return f"{format_millis(start)} ~ {format_millis(end)} 左右"
+-    if start or end:
+-        return f"{format_millis(start or end)} 左右"
+-    return "本窗口内"
+-
+-
+ def _incident_labels(issues: list[dict[str, Any]]) -> list[str]:
+     labels: list[str] = []
+     seen: set[str] = set()
+@@ -327,21 +320,6 @@ def _incident_action(issues: list[dict[str, Any]]) -> str:
+     return "；".join(actions) + suffix
+ 
+ 
+-def _quiet_window_line(report: dict, groups: list[IncidentGroup]) -> str:
+-    if not groups:
+-        return ""
+-    chat_count = int(report.get("chat_count") or 0)
+-    if chat_count <= 0:
+-        return ""
+-    if len(groups) == 1:
+-        time_text = _incident_time_text(groups[0]).replace(" 左右", "")
+-        return (
+-            f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的"
+-            "大规模聊天冲突、刷屏、广告或持续性争吵。"
+-        )
+-    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
+-
+-
+ def _category_event_summary(item: str) -> str:
+     raw = item.strip()
+     if raw.startswith("[") or raw.startswith("dialogue:"):
+@@ -457,42 +435,6 @@ def _append_unique(items: list[str], seen: set[str], item: str):
+     items.append(item)
+ 
+ 
+-def _format_time_window(report: dict) -> str:
+-    start = _as_millis(report.get("window_start_ts"))
+-    end = _as_millis(report.get("window_end_ts"))
+-    if start and end:
+-        start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
+-        end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
+-        start_hm = time.strftime("%H:%M", time.localtime(start / 1000))
+-        end_hm = time.strftime("%H:%M", time.localtime(end / 1000))
+-        if start_day == end_day:
+-            return f"{start_day} {start_hm} - {end_hm}"
+-        return f"{start_day} {start_hm} - {end_day} {end_hm}"
+-    return str(report.get("time_window") or "未知")
+-
+-
+-def _format_duration(report: dict) -> str:
+-    start = _as_millis(report.get("window_start_ts"))
+-    end = _as_millis(report.get("window_end_ts"))
+-    minutes = 0
+-    if start and end and end > start:
+-        minutes = max(1, round((end - start) / 60000))
+-    else:
+-        try:
+-            minutes = int(report.get("_window_minutes") or 0)
+-        except (TypeError, ValueError):
+-            minutes = 0
+-    if not minutes:
+-        match = re.search(r"最近\s*(\d+)\s*分钟", str(report.get("time_window") or ""))
+-        if match:
+-            minutes = int(match.group(1))
+-    if minutes and minutes % 60 == 0:
+-        return f"{minutes // 60} 小时"
+-    if minutes:
+-        return f"{minutes} 分钟"
+-    return "本窗口"
+-
+-
+ def _format_servers(report: dict) -> str:
+     values: list[str] = []
+     server_names = report.get("server_names") or []
+@@ -509,9 +451,7 @@ def _format_servers(report: dict) -> str:
+ 
+ 
+ def _format_attachment(report: dict) -> str:
+-    name = str(report.get("_export_file_name") or "").strip()
+-    if not name and report.get("_export_file_path"):
+-        name = Path(str(report["_export_file_path"])).name
++    name = resolve_attachment_name(report)
+     if name:
+         return f"已保存为附件 {name}"
+     return "未生成附件"
+@@ -538,39 +478,7 @@ def _issue_title(issue: dict[str, Any]) -> str:
+     return _LABELS.issue_title(issue)
+ 
+ 
+-def _evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
+-    if dedupe_count:
+-        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
+-    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
+-
+-
+-def _clean_sentence(value: str) -> str:
+-    text = value.strip()
+-    text = re.sub(r"^-+\s*", "", text)
+-    if not text:
+-        return ""
+-    if text[-1] not in "。！？.!?":
+-        text += "。"
+-    return text
+-
+-
+-def _dedupe_key(value: str) -> str:
+-    return re.sub(r"\s+", "", value).lower()[:120]
+-
+-
+-def _is_attachment_note(note: str) -> bool:
+-    return "完整 observation 文件" in note or "完整聊天记录附件" in note
+-
+-
+ def _truncate(value: str, max_length: int) -> str:
+     if len(value) <= max_length:
+         return value
+     return value[: max(0, max_length - 3)].rstrip() + "..."
+-
+-
+-def _as_millis(value: Any) -> int:
+-    try:
+-        number = int(value)
+-    except (TypeError, ValueError):
+-        return 0
+-    return number if number > 0 else 0
+diff --git a/services/mine_sentinel/storage/codec.py b/services/mine_sentinel/storage/codec.py
+index ac299f6..62d04f9 100644
+--- a/services/mine_sentinel/storage/codec.py
++++ b/services/mine_sentinel/storage/codec.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ from pathlib import Path
+ from typing import Any
+@@ -77,12 +78,49 @@ class ObservationRecordCodec:
+         except FileNotFoundError:
+             return
+ 
++    def read_jsonl_window(
++        self,
++        path: Path,
++        cutoff_ms: int,
++        end_ms: int | None = None,
++    ):
++        """Yield JSONL rows whose timestamp falls in [cutoff_ms, end_ms).
++
++        JSONL files are append-only and written in timestamp order, so once a
++        record's timestamp exceeds ``end_ms`` we can stop scanning the rest of
++        the file. Records older than ``cutoff_ms`` are skipped but scanning
++        continues because earlier files may still contain in-window rows.
++        """
++        try:
++            with path.open("r", encoding="utf-8") as handle:
++                for line in handle:
++                    line = line.strip()
++                    if not line:
++                        continue
++                    try:
++                        data = json.loads(line)
++                    except json.JSONDecodeError:
++                        continue
++                    if not isinstance(data, dict):
++                        continue
++                    ts = data.get("timestamp")
++                    if not isinstance(ts, (int, float)):
++                        yield data
++                        continue
++                    if ts < cutoff_ms:
++                        continue
++                    if end_ms is not None and ts > end_ms:
++                        break
++                    yield data
++        except FileNotFoundError:
++            return
++
+     def dedupe_key(self, record: ObservationRecord) -> str:
+         if record.event_id:
+             return record.event_id
+         bucket = record.timestamp // max(1, self.config.dedupe_window_seconds * 1000)
+         content = " ".join(record.content.lower().split())
+-        return "|".join(
++        raw = "|".join(
+             [
+                 record.kind,
+                 record.server_id,
+@@ -91,6 +129,11 @@ class ObservationRecordCodec:
+                 str(bucket),
+             ]
+         )
++        # blake2b digest keeps keys fixed-length (32 hex chars) regardless of
++        # content length. With 100k+ keys in DedupeTracker's set or SQLite,
++        # shorter keys mean less memory and faster comparisons. 128-bit digest
++        # makes collisions practically impossible for this scale.
++        return "h:" + hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest()
+ 
+     def compact_dict(self, data: dict[str, Any], max_fields: int) -> dict[str, Any]:
+         compact: dict[str, Any] = {}
+diff --git a/services/mine_sentinel/storage/dedupe.py b/services/mine_sentinel/storage/dedupe.py
+index e69ec75..d58e951 100644
+--- a/services/mine_sentinel/storage/dedupe.py
++++ b/services/mine_sentinel/storage/dedupe.py
+@@ -11,12 +11,17 @@ from pathlib import Path
+ class DedupeTracker:
+     """Exact seen-key tracker that spills to a temp SQLite file when needed."""
+ 
++    # Number of inserts to buffer before committing to SQLite. Each implicit
++    # commit forces a disk sync; batching amortizes that across many keys.
++    _BATCH_SIZE = 2000
++
+     def __init__(self, max_memory_keys: int = 100000, temp_dir: Path | None = None):
+         self.max_memory_keys = max(1, int(max_memory_keys))
+         self.temp_dir = temp_dir
+         self._keys: set[str] = set()
+         self._conn: sqlite3.Connection | None = None
+         self._path: Path | None = None
++        self._pending = 0
+ 
+     def __enter__(self) -> "DedupeTracker":
+         return self
+@@ -42,14 +47,22 @@ class DedupeTracker:
+             self._spill_to_sqlite()
+ 
+         assert self._conn is not None
+-        try:
+-            self._conn.execute("INSERT INTO seen(key) VALUES (?)", (key,))
+-            return False
+-        except sqlite3.IntegrityError:
+-            return True
++        # INSERT OR IGNORE is faster than try/except IntegrityError and lets us
++        # use rowcount to detect duplicates without exception overhead.
++        cursor = self._conn.execute("INSERT OR IGNORE INTO seen(key) VALUES (?)", (key,))
++        if cursor.rowcount == 0:
++            return True  # key already existed
++        self._pending += 1
++        if self._pending >= self._BATCH_SIZE:
++            self._conn.commit()
++            self._pending = 0
++        return False
+ 
+     def close(self):
+         if self._conn is not None:
++            if self._pending:
++                self._conn.commit()
++                self._pending = 0
+             self._conn.close()
+             self._conn = None
+         if self._path is not None:
+diff --git a/services/mine_sentinel/storage/jsonl_store.py b/services/mine_sentinel/storage/jsonl_store.py
+index 0b45ad2..c647869 100644
+--- a/services/mine_sentinel/storage/jsonl_store.py
++++ b/services/mine_sentinel/storage/jsonl_store.py
+@@ -34,6 +34,13 @@ class DiskObservationStore:
+         self.observation_dir.mkdir(parents=True, exist_ok=True)
+         self.export_dir.mkdir(parents=True, exist_ok=True)
+         self._last_cleanup_at: float | None = None
++        # Short-lived cache for the most recent window read, so that an alert
++        # triggered right after a periodic report (or vice versa) does not scan
++        # disk twice for the same window. Key: (window_minutes, server_id).
++        self._window_cache_key: tuple[int, str | None] | None = None
++        self._window_cache_value: RecentObservationWindow | None = None
++        self._window_cache_at: float = 0.0
++        self._window_cache_ttl: float = 30.0
+ 
+     def add_batch(self, server_id: str, payload: dict[str, Any]) -> int:
+         if not self.config.enabled or not self.config.storage.enabled:
+@@ -75,6 +82,9 @@ class DiskObservationStore:
+                 written += 1
+ 
+         self.cleanup_if_due(now)
++        # New observations invalidate the cached window read.
++        self._window_cache_key = None
++        self._window_cache_value = None
+         return written
+ 
+     def recent(
+@@ -93,7 +103,20 @@ class DiskObservationStore:
+         if not self.config.enabled or not self.config.storage.enabled:
+             return RecentObservationWindow([], 0, 0, False, 0)
+ 
+-        cutoff_ms = int((time.time() - window_minutes * 60) * 1000)
++        cache_key = (window_minutes, server_id)
++        now = time.time()
++        if (
++            self._window_cache_key == cache_key
++            and self._window_cache_value is not None
++            and now - self._window_cache_at < self._window_cache_ttl
++            and max_records is None
++        ):
++            return self._window_cache_value
++
++        cutoff_ms = int((now - window_minutes * 60) * 1000)
++        # window end bound = now; lets read_jsonl_window stop scanning a file
++        # once it encounters records beyond the window upper bound.
++        end_ms = int(now * 1000)
+         limit = max(1, max_records or self.config.report.max_records_in_memory)
+         builder = RecentWindowBuilder(
+             limit,
+@@ -101,15 +124,23 @@ class DiskObservationStore:
+         )
+         with self._dedupe_tracker() as seen:
+             for path in self._candidate_files(server_id, cutoff_ms):
+-                for row in self.codec.read_jsonl(path):
++                for row in self.codec.read_jsonl_window(path, cutoff_ms, end_ms):
+                     record = ObservationRecord.from_dict(row)
+                     if record.timestamp < cutoff_ms:
+                         continue
++                    if record.timestamp > end_ms:
++                        continue
+                     key = self.codec.dedupe_key(record)
+                     if seen.seen_or_add(key):
+                         continue
+                     builder.add(record)
+-        return builder.build()
++        result = builder.build()
++
++        if max_records is None:
++            self._window_cache_key = cache_key
++            self._window_cache_value = result
++            self._window_cache_at = now
++        return result
+ 
+     def export_records(
+         self,
+@@ -137,18 +168,21 @@ class DiskObservationStore:
+         if not self.config.enabled or not self.config.storage.enabled:
+             return None
+ 
+-        now = int(time.time())
+-        cutoff_ms = int((now - window_minutes * 60) * 1000)
+-        path = export_path(self.export_dir, window_minutes, server_id, label, now)
++        now_ts = int(time.time())
++        cutoff_ms = int((now_ts - window_minutes * 60) * 1000)
++        end_ms = int(now_ts * 1000)
++        path = export_path(self.export_dir, window_minutes, server_id, label, now_ts)
+ 
+         written = 0
+         with self._dedupe_tracker() as seen:
+             with path.open("w", encoding="utf-8") as handle:
+                 for source_path in self._candidate_files(server_id, cutoff_ms):
+-                    for row in self.codec.read_jsonl(source_path):
++                    for row in self.codec.read_jsonl_window(source_path, cutoff_ms, end_ms):
+                         record = ObservationRecord.from_dict(row)
+                         if record.timestamp < cutoff_ms:
+                             continue
++                        if record.timestamp > end_ms:
++                            continue
+                         key = self.codec.dedupe_key(record)
+                         if seen.seen_or_add(key):
+                             continue
+diff --git a/services/renderer.py b/services/renderer.py
+index 608f92c..521fbc4 100644
+--- a/services/renderer.py
++++ b/services/renderer.py
+@@ -9,19 +9,11 @@ from astrbot.api import logger
+ 
+ from .rendering import (
+     RenderResult,
+-    effective_player_info_server_id,
+-    flatten_player_cards,
+     format_multi_player_list_text,
+     format_player_detail_text,
+     format_server_status_text,
+-    get_effective_server_name,
+-    is_proxy_like_name,
+-    mode_cn,
+-    norm,
+-    safe_percent,
+ )
+ from .rendering.cards import ImageCardRenderer
+-from .rendering.image import status_color
+ 
+ if TYPE_CHECKING:
+     from ..core.models import PlayerDetail, PlayerInfo, ServerInfo, ServerStatus
+@@ -30,8 +22,6 @@ if TYPE_CHECKING:
+ class InfoRenderer:
+     """Chooses text or image rendering and keeps image failures non-fatal."""
+ 
+-    _PROXY_NAMES = {"vc", "velocity", "proxy", "bungeecord", "waterfall"}
+-
+     def __init__(self, text2image_enabled: bool = True, cache_dir: Path | None = None):
+         self.text2image_enabled = text2image_enabled
+         self._cache_dir = cache_dir or (Path(__file__).parent.parent / ".cache")
+@@ -177,48 +167,3 @@ class InfoRenderer:
+         server_tag: str = "",
+     ) -> str:
+         return format_player_detail_text(player, server_tag=server_tag)
+-
+-    @staticmethod
+-    def _safe_percent(value: float | int, lo: int = 0, hi: int = 100) -> int:
+-        return safe_percent(value, lo, hi)
+-
+-    @staticmethod
+-    def _mode_cn(mode: str) -> str:
+-        return mode_cn(mode)
+-
+-    @staticmethod
+-    def _norm(value: str) -> str:
+-        return norm(value)
+-
+-    def _get_status_color(self, value: float, type: str = "tps") -> str:
+-        return status_color(value, type)
+-
+-    def _is_proxy_like_name(self, name: str) -> bool:
+-        return is_proxy_like_name(name, self._PROXY_NAMES)
+-
+-    def _get_effective_server_name(
+-        self,
+-        player: "PlayerInfo | PlayerDetail",
+-        fallback: str,
+-    ) -> str:
+-        return get_effective_server_name(player, fallback, self._PROXY_NAMES)
+-
+-    def _effective_player_server_id(
+-        self,
+-        player: "PlayerDetail",
+-        fallback: str,
+-    ) -> str:
+-        return self._get_effective_server_name(player, fallback)
+-
+-    def _effective_player_info_server_id(
+-        self,
+-        player: "PlayerInfo",
+-        fallback: str,
+-    ) -> str:
+-        return effective_player_info_server_id(player, fallback, self._PROXY_NAMES)
+-
+-    def _flatten_player_cards(
+-        self,
+-        cards: list[tuple[str, list["PlayerInfo"], int, str]],
+-    ) -> list[tuple[str, list["PlayerInfo"], int, str]]:
+-        return flatten_player_cards(cards, self._PROXY_NAMES)
+diff --git a/services/rendering/avatar.py b/services/rendering/avatar.py
+index d65ae6b..119fa6b 100644
+--- a/services/rendering/avatar.py
++++ b/services/rendering/avatar.py
+@@ -6,6 +6,7 @@ import asyncio
+ import base64
+ import contextlib
+ import json
++from collections import OrderedDict
+ from io import BytesIO
+ from pathlib import Path
+ from urllib.parse import quote
+@@ -24,15 +25,52 @@ except Exception:  # pragma: no cover - exercised in minimal test environments.
+ 
+ AvatarRequest = tuple[str, str, int]
+ 
++# Max in-memory avatar images to cache. Each is small (size×size RGBA), so 256
++# entries is negligible memory but avoids repeated disk reads / HTTP fetches for
++# the same player across status cards, player lists, and detail cards.
++_AVATAR_LRU_SIZE = 256
++
+ 
+ class AvatarProvider:
+     def __init__(self, avatar_dir: Path, max_concurrency: int = 8):
+         self.avatar_dir = avatar_dir
+         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
++        # Lazy-init: created on first fetch and reused across all subsequent
++        # calls. Each aiohttp.ClientSession opens a connection pool, so
++        # re-using one avoids repeated TCP/TLS handshakes for the same CDN.
++        self._session: aiohttp.ClientSession | None = None
++        # LRU cache of recently loaded avatar images keyed by
++        # (player_name_lower, player_uuid_lower, size).
++        self._image_lru: OrderedDict[tuple[str, str, int], Image.Image] = OrderedDict()
+ 
+     def ensure_cache_dir(self):
+         self.avatar_dir.mkdir(parents=True, exist_ok=True)
+ 
++    async def _get_session(self) -> aiohttp.ClientSession:
++        if self._session is None or self._session.closed:
++            self._session = aiohttp.ClientSession(
++                timeout=aiohttp.ClientTimeout(total=10)
++            )
++        return self._session
++
++    async def close(self):
++        """Close the reusable HTTP session. Call on shutdown."""
++        if self._session is not None and not self._session.closed:
++            await self._session.close()
++            self._session = None
++
++    def _lru_get(self, key: tuple[str, str, int]) -> Image.Image | None:
++        img = self._image_lru.get(key)
++        if img is not None:
++            self._image_lru.move_to_end(key)
++        return img
++
++    def _lru_put(self, key: tuple[str, str, int], img: Image.Image):
++        self._image_lru[key] = img
++        self._image_lru.move_to_end(key)
++        while len(self._image_lru) > _AVATAR_LRU_SIZE:
++            self._image_lru.popitem(last=False)
++
+     async def get_avatar(
+         self,
+         player_name: str,
+@@ -61,12 +99,20 @@ class AvatarProvider:
+         player_uuid: str,
+         size: int,
+     ) -> Image.Image:
++        # LRU check first — avoids disk I/O entirely on cache hit.
++        lru_key = (norm(player_name).lower(), norm(player_uuid).lower(), size)
++        cached = self._lru_get(lru_key)
++        if cached is not None:
++            return cached
++
+         self.ensure_cache_dir()
+         key = self.cache_key(player_name, player_uuid)
+         path = self.avatar_dir / f"{key}_{size}.png"
+         if path.exists():
+             try:
+-                return Image.open(path).convert("RGBA")
++                img = Image.open(path).convert("RGBA")
++                self._lru_put(lru_key, img)
++                return img
+             except Exception:
+                 with contextlib.suppress(Exception):
+                     path.unlink()
+@@ -77,6 +123,7 @@ class AvatarProvider:
+         avatar = face.resize((size, size), Image.Resampling.NEAREST)
+         with contextlib.suppress(Exception):
+             avatar.save(path, format="PNG")
++        self._lru_put(lru_key, avatar)
+         return avatar
+ 
+     async def fetch_avatar_face(
+@@ -86,72 +133,71 @@ class AvatarProvider:
+     ) -> Image.Image | None:
+         if aiohttp is None:
+             return None
+-        timeout = aiohttp.ClientTimeout(total=10)
+         name = norm(player_name)
+         uuid = norm(player_uuid).replace("-", "")
+         try:
+-            async with aiohttp.ClientSession(timeout=timeout) as session:
+-                if name:
+-                    for url in (
+-                        f"https://mc-heads.net/avatar/{quote(name)}/8",
+-                        f"https://minotar.net/helm/{quote(name)}/8.png",
+-                    ):
+-                        img = await download_image(session, url)
+-                        if img is not None:
+-                            return img.resize((8, 8), Image.Resampling.NEAREST)
+-                if uuid:
+-                    for url in (
+-                        f"https://crafatar.com/avatars/{uuid}?size=8&overlay",
+-                        f"https://mc-heads.net/avatar/{uuid}/8",
+-                    ):
+-                        img = await download_image(session, url)
+-                        if img is not None:
+-                            return img.resize((8, 8), Image.Resampling.NEAREST)
+-
+-                resolved_uuid = uuid
+-                if not resolved_uuid and name:
+-                    lookup = (
+-                        f"https://api.mojang.com/users/profiles/minecraft/{quote(name)}"
+-                    )
+-                    async with session.get(lookup) as resp:
+-                        if resp.status == 200:
+-                            profile = await resp.json(content_type=None)
+-                            resolved_uuid = str(profile.get("id", ""))
+-                if not resolved_uuid:
+-                    return None
+-
+-                profile_url = (
+-                    "https://sessionserver.mojang.com/session/minecraft/profile/"
+-                    f"{resolved_uuid}"
++            session = await self._get_session()
++            if name:
++                for url in (
++                    f"https://mc-heads.net/avatar/{quote(name)}/8",
++                    f"https://minotar.net/helm/{quote(name)}/8.png",
++                ):
++                    img = await download_image(session, url)
++                    if img is not None:
++                        return img.resize((8, 8), Image.Resampling.NEAREST)
++            if uuid:
++                for url in (
++                    f"https://crafatar.com/avatars/{uuid}?size=8&overlay",
++                    f"https://mc-heads.net/avatar/{uuid}/8",
++                ):
++                    img = await download_image(session, url)
++                    if img is not None:
++                        return img.resize((8, 8), Image.Resampling.NEAREST)
++
++            resolved_uuid = uuid
++            if not resolved_uuid and name:
++                lookup = (
++                    f"https://api.mojang.com/users/profiles/minecraft/{quote(name)}"
+                 )
+-                async with session.get(profile_url) as resp:
+-                    if resp.status != 200:
+-                        return None
+-                    profile_data = await resp.json(content_type=None)
+-
+-                textures_b64 = ""
+-                for prop in profile_data.get("properties", []):
+-                    if prop.get("name") == "textures":
+-                        textures_b64 = prop.get("value", "")
+-                        break
+-                if not textures_b64:
+-                    return None
++                async with session.get(lookup) as resp:
++                    if resp.status == 200:
++                        profile = await resp.json(content_type=None)
++                        resolved_uuid = str(profile.get("id", ""))
++            if not resolved_uuid:
++                return None
+ 
+-                decoded = base64.b64decode(textures_b64).decode("utf-8")
+-                textures_obj = json.loads(decoded)
+-                skin_url = (
+-                    textures_obj.get("textures", {}).get("SKIN", {}).get("url", "")
+-                )
+-                if not skin_url:
+-                    return None
+-                skin = await download_image(session, skin_url)
+-                if skin is None or skin.width < 16 or skin.height < 16:
++            profile_url = (
++                "https://sessionserver.mojang.com/session/minecraft/profile/"
++                f"{resolved_uuid}"
++            )
++            async with session.get(profile_url) as resp:
++                if resp.status != 200:
+                     return None
+-                face = skin.crop((8, 8, 16, 16))
+-                if skin.width >= 64 and skin.height >= 16:
+-                    overlay = skin.crop((40, 8, 48, 16))
+-                    face = Image.alpha_composite(face, overlay)
+-                return face
++                profile_data = await resp.json(content_type=None)
++
++            textures_b64 = ""
++            for prop in profile_data.get("properties", []):
++                if prop.get("name") == "textures":
++                    textures_b64 = prop.get("value", "")
++                    break
++            if not textures_b64:
++                return None
++
++            decoded = base64.b64decode(textures_b64).decode("utf-8")
++            textures_obj = json.loads(decoded)
++            skin_url = (
++                textures_obj.get("textures", {}).get("SKIN", {}).get("url", "")
++            )
++            if not skin_url:
++                return None
++            skin = await download_image(session, skin_url)
++            if skin is None or skin.width < 16 or skin.height < 16:
++                return None
++            face = skin.crop((8, 8, 16, 16))
++            if skin.width >= 64 and skin.height >= 16:
++                overlay = skin.crop((40, 8, 48, 16))
++                face = Image.alpha_composite(face, overlay)
++            return face
+         except Exception as exc:
+             logger.debug(
+                 f"[Renderer] 获取玩家头像失败: {player_name}/{player_uuid} -> {exc}"
+diff --git a/services/rendering/cards.py b/services/rendering/cards.py
+index 091d2a5..81933fc 100644
+--- a/services/rendering/cards.py
++++ b/services/rendering/cards.py
+@@ -40,7 +40,6 @@ class ImageCardRenderer:
+ 
+     _CARD_W = DEFAULT_THEME.card_w
+     _CARD_BG = DEFAULT_THEME.card_bg
+-    _PROXY_NAMES = {"vc", "velocity", "proxy", "bungeecord", "waterfall"}
+ 
+     _COLOR_PRIMARY = DEFAULT_THEME.color_primary
+     _COLOR_TEXT_MAIN = DEFAULT_THEME.color_text_main
+@@ -60,9 +59,17 @@ class ImageCardRenderer:
+         cards: list[tuple[str, "ServerInfo", "ServerStatus"]],
+     ) -> BytesIO:
+         await self._ensure_assets()
++        # PIL drawing is CPU-bound; run it off the event loop so WebSocket
++        # heartbeats and message dispatch are not blocked while rendering.
++        return await asyncio.to_thread(self._render_multi_server_status_sync, cards)
++
++    def _render_multi_server_status_sync(
++        self,
++        cards: list[tuple[str, "ServerInfo", "ServerStatus"]],
++    ) -> BytesIO:
+         images: list[Image.Image] = []
+         for tag, info, status in cards:
+-            single = await self._render_server_status_card(
++            single = self._render_server_status_card(
+                 info,
+                 status,
+                 server_tag=tag,
+@@ -139,14 +146,14 @@ class ImageCardRenderer:
+         return norm(value)
+ 
+     def _is_proxy_like_name(self, name: str) -> bool:
+-        return is_proxy_like_name(name, self._PROXY_NAMES)
++        return is_proxy_like_name(name)
+ 
+     def _get_effective_server_name(
+         self,
+         player: "PlayerInfo | PlayerDetail",
+         fallback: str,
+     ) -> str:
+-        return get_effective_server_name(player, fallback, self._PROXY_NAMES)
++        return get_effective_server_name(player, fallback)
+ 
+     async def _get_avatar(
+         self,
+@@ -166,7 +173,7 @@ class ImageCardRenderer:
+     def _new_card(estimate_h: int) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+         return new_card(estimate_h)
+ 
+-    async def _render_server_status_card(
++    def _render_server_status_card(
+         self,
+         server_info: "ServerInfo",
+         server_status: "ServerStatus",
+@@ -325,13 +332,13 @@ class ImageCardRenderer:
+         player: "PlayerInfo",
+         fallback: str,
+     ) -> str:
+-        return effective_player_info_server_id(player, fallback, self._PROXY_NAMES)
++        return effective_player_info_server_id(player, fallback)
+ 
+     def _flatten_player_cards(
+         self,
+         cards: list[tuple[str, list["PlayerInfo"], int, str]],
+     ) -> list[tuple[str, list["PlayerInfo"], int, str]]:
+-        return flatten_player_cards(cards, self._PROXY_NAMES)
++        return flatten_player_cards(cards)
+ 
+     async def _render_multi_player_list_card(
+         self,
+diff --git a/services/rendering/fonts.py b/services/rendering/fonts.py
+index fc37a94..a17fcb9 100644
+--- a/services/rendering/fonts.py
++++ b/services/rendering/fonts.py
+@@ -33,10 +33,18 @@ class FontProvider:
+         self.font_dir = font_dir
+         self.font_path = font_dir / filename
+         self.urls = urls or DEFAULT_FONT_URLS
++        # Cache of loaded ImageFont objects keyed by (resolved_source, size).
++        # ImageFont.truetype parses the font file every call; for a multi-MB
++        # CJK font and repeated renders this is a major cost. Resolution of the
++        # underlying file is stable for the provider lifetime, so we cache by
++        # (source_label, size) once a font loads successfully.
++        self._font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
++        self._resolved_source: str | None = None
+ 
+     async def ensure_cached(self):
+         self.font_dir.mkdir(parents=True, exist_ok=True)
+         if self.font_path.exists() and self.font_path.stat().st_size > 0:
++            self._resolved_source = str(self.font_path)
+             return
+         if aiohttp is None:
+             logger.warning("[Renderer] aiohttp 不可用，跳过字体下载")
+@@ -56,27 +64,38 @@ class FontProvider:
+                 logger.info(
+                     f"[Renderer] 已缓存中文字体: {self.font_path.name} ({len(data) // 1024}KB)"
+                 )
++                self._resolved_source = str(self.font_path)
+                 return
+             except Exception as exc:
+                 logger.debug(f"[Renderer] 字体下载失败: {url} -> {exc}")
+         logger.warning("[Renderer] 字体下载失败，将回退到系统字体")
+ 
+     def font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+-        try:
+-            if self.font_path.exists():
+-                return ImageFont.truetype(str(self.font_path), size=size)
+-        except Exception as exc:
+-            logger.debug(f"[Renderer] 加载已缓存字体失败: {exc}")
+-
++        source = self._resolve_source()
++        cache_key = (source, size)
++        cached = self._font_cache.get(cache_key)
++        if cached is not None:
++            return cached
++        loaded = self._load_font(source, size)
++        self._font_cache[cache_key] = loaded
++        return loaded
++
++    def _resolve_source(self) -> str:
++        """Return the best available font source path/name, cached on first use."""
++        if self._resolved_source is not None:
++            return self._resolved_source
++        if self.font_path.exists() and self.font_path.stat().st_size > 0:
++            self._resolved_source = str(self.font_path)
++            return self._resolved_source
+         try:
+             from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+ 
+             custom_font = Path(get_astrbot_data_path()) / "font.ttf"
+-            if custom_font.exists():
+-                return ImageFont.truetype(str(custom_font), size=size)
++            if custom_font.exists() and custom_font.stat().st_size > 0:
++                self._resolved_source = str(custom_font)
++                return self._resolved_source
+         except Exception:
+             pass
+-
+         for font_name in (
+             "msyh.ttc",
+             "simsun.ttc",
+@@ -86,10 +105,26 @@ class FontProvider:
+             "DroidSansFallback.ttf",
+         ):
+             try:
+-                return ImageFont.truetype(font_name, size=size)
++                # Probe availability by attempting a load; reuse on success.
++                ImageFont.truetype(font_name, size=12)
++                self._resolved_source = font_name
++                return self._resolved_source
+             except Exception:
+                 continue
+-
++        # Nothing usable; fall back to default bitmap font under a sentinel key.
++        self._resolved_source = "__default__"
++        return self._resolved_source
++
++    def _load_font(
++        self, source: str, size: int
++    ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
++        if source != "__default__":
++            try:
++                return ImageFont.truetype(source, size=size)
++            except Exception as exc:
++                logger.debug(f"[Renderer] 加载已缓存字体失败: {exc}")
++                # Invalidate the resolved source so a later call can re-resolve.
++                self._resolved_source = None
+         if not self.font_path.exists():
+             logger.warning(
+                 f"[Renderer] 无法加载中文字体，渲染结果可能乱码。请确保网络畅通以自动下载字体，或手动放置字体文件到: {self.font_path}"
+diff --git a/tests/test_binding_commands.py b/tests/test_binding_commands.py
+index 9b58e2b..de58a80 100644
+--- a/tests/test_binding_commands.py
++++ b/tests/test_binding_commands.py
+@@ -90,11 +90,11 @@ class _BindingService:
+         self.bound = None
+         self.unbound = None
+ 
+-    def bind(self, **kwargs):
++    async def bind(self, **kwargs):
+         self.bound = kwargs
+         return self.bind_result
+ 
+-    def unbind(self, **kwargs):
++    async def unbind(self, **kwargs):
+         self.unbound = kwargs
+         return self.unbind_result
+ 
