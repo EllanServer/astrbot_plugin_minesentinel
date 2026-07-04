@@ -2,7 +2,7 @@
 name = "mine_sentinel_rs"
 version = "0.1.0"
 edition = "2021"
-description = "Rust core for the AstrBot minecraft_adapter mine_sentinel module (PyO3 bindings)"
+description = "Rust core for MineSentinel runtime-log audit (PyO3 bindings)"
 license = "MIT"
 publish = false
 
@@ -14,8 +14,6 @@ crate-type = ["cdylib"]
 # PyO3 0.29 原生支持 CPython 3.14。extension-module 模式产出 .so/.pyd。
 pyo3 = { version = "0.29", features = ["extension-module"] }
 blake2 = "0.10"
-regex = "1"
-ahash = "0.8"
 # In-Rust JSON serialization: removes the per-record PyO3 → json.dumps callback
 # (was the dominant cost in json_line / compact_value's fallback path).
 # `preserve_order` makes serde_json::Map backed by IndexMap, so iteration

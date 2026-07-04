@@ -8,7 +8,6 @@ from collections import Counter
 from typing import Any
 
 from ..models import MineSentinelConfig, ObservationRecord
-from .common import MAX_DISPLAY_PLAYERS, format_players, player_name_list
 from .sampling import even_sample, sample_records_for_ai
 
 
@@ -77,33 +76,31 @@ class AIReportPromptBuilder:
         return (
             "你是 Minecraft 服务器只读旁路监控 MineSentinel 的报告代理。"
             "只输出合法 JSON，不要执行任何管理动作。"
-            "必须使用以下 schema: summary,time_window,servers,chat_count,chat_players,"
-            "dialogue_findings,"
-            "categories(daily,complaint,bug,economy,moderation,suggestion,cross_server),"
-            "issues(category,tag,incident_index,severity,players,mentioned_players,"
-            "affected_locations,dialogue_terms,metric_context_text,"
-            "evidence_count,signal_count,unique_players,"
-            "suggested_action),"
+            "必须使用以下 schema: summary,time_window,servers,log_count,incident_findings,"
+            "categories(daily,complaint,bug,economy,community,moderation,suggestion,cross_server),"
+            "issues(category,tag,incident_index,severity,affected_locations,issue_terms,"
+            "evidence_count,signal_count,suggested_action),"
             "ops_notes。"
             "输入里的启发式初稿来自完整窗口记录；分段时间线也是完整窗口的压缩统计；"
-            "issues.evidence_samples 若包含多行上下文，> 行是命中的证据聊天，"
-            "其余行是同服/同后端前后文；"
-            "抽样观察里的 context 是来源、消息类型、世界/维度和后端服线索，"
+            "当前输入只来自 AstrBot 直接读取的 Minecraft 运行日志 SERVER_LOG。"
+            "issues.evidence_samples 若包含多行上下文，> 行是命中的证据日志，"
+            "其余行是同服/同后端前后文。"
+            "抽样观察里的 context 是来源、日志文件、日志级别、世界/维度和后端服线索，"
             "只能辅助判断前因后果；"
             "原始样本只用于补措辞，不代表全部记录。"
             "这些 JSON 字段会被组装为 QQ 群五段式总结："
-            "整体情况、聊天与事件总结、玩家问题/投诉识别、风险提醒、建议处理；"
+            "整体情况、运行日志与事件总结、异常/投诉识别、风险提醒、建议处理；"
             "不要臆测、改写或输出 QQ/UMO/session target；目标会话解析由 AstrBot 插件处理；"
-            "请让 summary、dialogue_findings、categories 和 suggested_action 面向玩家群可读，"
-            "保留具体玩家名、时间线索、上下文结论和人工处理建议。"
-            "生成聊天与事件相关内容时必须按事故聚合，而不是按问题类别拆分："
-            "同一服务器、同一世界或后端、同一 3 到 5 分钟窗口内的多条异常反馈，"
+            "请让 summary、incident_findings、categories 和 suggested_action 面向管理员群可读，"
+            "保留日志级别、时间线索、上下文结论和人工处理建议。"
+            "社区管理相关日志必须单独归入 community 类，例如 ban/kick/mute/report/spam/"
+            "grief/cheat/举报/封禁/禁言/刷屏，不要混入 bug 或 moderation。"
+            "生成运行日志与事件相关内容时必须按事故聚合，而不是按问题类别拆分："
+            "同一服务器、同一世界或后端、同一 3 到 5 分钟窗口内的多条异常日志，"
             "应优先合并为一个 incident，并在该 incident 内列出多个标签和影响面；"
-            "不要把卡顿/延迟、掉线/回档、传送异常、经济/商店异常等类别各自写成独立事件，"
-            "除非它们发生在不同时间、不同服务器/后端、不同玩家上下文或明显属于不同事故；"
+            "不要把卡顿/延迟、连接失败、传送异常、插件异常等类别各自写成独立事件，"
+            "除非它们发生在不同时间、不同服务器/后端或明显属于不同事故；"
             "incident_index 只能表示真实事故序号，同一批上下文不要重复输出多个 事件 #1；"
-            "server_metrics 不要作为聊天事件单独写入 issues 或 dialogue_findings，"
-            "服务器指标只用于 metric_context_text、ops_notes、风险提醒或解释玩家反馈；"
             "每个事故最多保留 2 到 4 条关键证据，避免在多个事件中重复粘贴同一批上下文；"
             "如果窗口内只有一个明显异常时间点，应说明其他时间段未发现明显持续异常。"
             f"时间窗口: 最近 {window_minutes} 分钟。\n"
@@ -124,6 +121,7 @@ class AIReportPromptBuilder:
                 "complaint",
                 "bug",
                 "economy",
+                "community",
                 "moderation",
                 "suggestion",
                 "cross_server",
@@ -141,13 +139,10 @@ class AIReportPromptBuilder:
             "summary": truncate(str(fallback.get("summary") or ""), 300),
             "time_window": fallback.get("time_window"),
             "servers": (fallback.get("servers") or [])[:20],
-            "chat_count": fallback.get("chat_count", 0),
-            "chat_players": (fallback.get("chat_players") or [])[
-                :MAX_DISPLAY_PLAYERS
-            ],
-            "dialogue_findings": [
+            "log_count": fallback.get("log_count", 0),
+            "incident_findings": [
                 truncate(str(item), 220)
-                for item in (fallback.get("dialogue_findings") or [])[:8]
+                for item in (fallback.get("incident_findings") or [])[:8]
             ],
             "categories": compact_categories,
             "issues": compact_issues,
@@ -177,7 +172,6 @@ class AIReportPromptBuilder:
                 continue
             kinds = Counter(record.kind for record in group)
             tags = Counter(tag for record in group for tag in record.tags if tag)
-            players = player_name_list(group)
             samples = [
                 truncate(record.evidence_text(), 160)
                 for record in even_sample(group, min(4, len(group)))
@@ -187,10 +181,10 @@ class AIReportPromptBuilder:
                     "start_ts": group[0].timestamp,
                     "end_ts": group[-1].timestamp,
                     "count": len(group),
-                    "chat_count": sum(1 for record in group if record.kind == "CHAT"),
+                    "log_count": sum(
+                        1 for record in group if record.kind == "SERVER_LOG"
+                    ),
                     "kinds": dict(kinds.most_common(8)),
-                    "players": players[:MAX_DISPLAY_PLAYERS],
-                    "players_text": format_players(players),
                     "top_tags": [tag for tag, _ in tags.most_common(8)],
                     "samples": samples,
                 }
@@ -213,13 +207,11 @@ class AIReportPromptBuilder:
             "kind": record.kind,
             "server": record.server_id,
             "backend": record.backend_server,
-            "player": record.player_name,
             "content": truncate(
                 record.content,
                 self.config.report.max_ai_content_length,
             ),
             "context": record.context,
-            "metrics": record.metrics,
             "timestamp": record.timestamp,
         }
 

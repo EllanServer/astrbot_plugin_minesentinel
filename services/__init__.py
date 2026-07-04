@@ -1,32 +1,18 @@
-"""Minecraft adapter services.
-
-Keep this package initializer light so focused modules can be imported without
-pulling AstrBot runtime dependencies into tests or tooling.
-"""
+"""MineSentinel audit services."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-__all__ = ["BindingService", "MessageBridge", "InfoRenderer"]
+__all__ = ["MineSentinelService"]
 
 if TYPE_CHECKING:
-    from .binding import BindingService
-    from .message_bridge import MessageBridge
-    from .renderer import InfoRenderer
+    from .mine_sentinel import MineSentinelService
 
 
 def __getattr__(name: str):
-    if name == "BindingService":
-        from .binding import BindingService
+    if name == "MineSentinelService":
+        from .mine_sentinel import MineSentinelService
 
-        return BindingService
-    if name == "MessageBridge":
-        from .message_bridge import MessageBridge
-
-        return MessageBridge
-    if name == "InfoRenderer":
-        from .renderer import InfoRenderer
-
-        return InfoRenderer
+        return MineSentinelService
     raise AttributeError(name)

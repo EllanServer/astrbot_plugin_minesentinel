@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "mine_sentinel_rs"
 version = "0.1.0"
-description = "Rust core for the AstrBot minecraft_adapter mine_sentinel module"
+description = "Rust core for MineSentinel runtime-log audit"
 requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Rust",

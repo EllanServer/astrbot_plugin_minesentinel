@@ -21,6 +21,7 @@ from .reporting import MineSentinelReporter
 from .reporting.image_renderer import MineSentinelReportImageRenderer
 from .reporting.report_result import MineSentinelRenderedReport
 from .routing import MineSentinelTargetRouter
+from .runtime_log import MineSentinelRuntimeLogTailer
 from .storage import DiskObservationStore, RecentObservationWindow
 
 
@@ -67,6 +68,11 @@ class MineSentinelService:
             self._set_last_error,
         )
         self.alerts = MineSentinelAlertEngine(self.config)
+        self.runtime_log_tailer = MineSentinelRuntimeLogTailer(
+            self.config.runtime_log,
+            self.handle_batch,
+            io_runner=self.io_runner,
+        )
         self._periodic_report_job = PeriodicReportJob(
             self.config,
             self._run_periodic_report_once,
@@ -83,9 +89,11 @@ class MineSentinelService:
                 "[MineSentinel] 定时 AI 报告已启用，"
                 f"间隔 {self.config.report.interval_minutes} 分钟"
             )
+        self.runtime_log_tailer.start()
         logger.info("[MineSentinel] 服务已启动")
 
     async def stop(self):
+        await self.runtime_log_tailer.stop()
         await self._periodic_report_job.stop()
 
     async def handle_batch(self, server_id: str, payload: dict):
@@ -122,6 +130,11 @@ class MineSentinelService:
             f"启用状态：{'启用' if self.config.enabled else '禁用'}",
             "存储模式：硬盘 JSONL（无 observation 内存缓存）",
             f"硬盘存储：{'启用' if self.disk_store else '禁用'}",
+            (
+                "MC 运行日志读取："
+                f"{'启用' if self.config.runtime_log.enabled else '禁用'}"
+                f"（{len(self.runtime_log_tailer.enabled_sources)} 个来源）"
+            ),
         ]
         if self.disk_store:
             lines.extend(

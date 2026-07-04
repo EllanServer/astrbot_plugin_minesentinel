@@ -39,7 +39,10 @@ jobs:
         run: python -m json.tool _conf_schema.json > /dev/null
 
       - name: Compile sources
-        run: python -m compileall __init__.py core handlers main.py platform services
+        run: python -m compileall __init__.py handlers main.py services
+
+      - name: Run tests
+        run: python -m unittest discover -s tests
 
   package:
     name: Package plugin

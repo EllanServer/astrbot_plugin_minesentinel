@@ -27,13 +27,11 @@ class ObservationRecordCodec:
         self.config = config
         self.max_content_length = config.storage.max_content_length
         self.max_tags_per_record = config.max_tags_per_record
-        self.max_metric_fields = config.max_metric_fields
         self.max_raw_fields = config.max_raw_fields
         self.include_raw = config.storage.include_raw
         self._rs = _RsObservationRecordCodec(
             self.max_content_length,
             self.max_tags_per_record,
-            self.max_metric_fields,
             self.max_raw_fields,
             self.include_raw,
             config.dedupe_window_seconds,
@@ -47,7 +45,6 @@ class ObservationRecordCodec:
             self.truncate(str(tag), max_len)
             for tag in record.tags[: self.max_tags_per_record]
         ]
-        record.metrics = self.compact_dict(record.metrics, self.max_metric_fields)
         record.context = self.compact_dict(record.context, self.max_raw_fields)
         record.raw = (
             self.compact_dict(record.raw, self.max_raw_fields)
@@ -71,7 +68,6 @@ class ObservationRecordCodec:
             "content": record.content,
             "tags": record.tags,
             "context": record.context,
-            "metrics": record.metrics,
             "raw": record.raw if self.include_raw else {},
         }
 

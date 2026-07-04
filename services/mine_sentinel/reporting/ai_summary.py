@@ -23,7 +23,7 @@ class AIReportSummarizer:
         "你是 MineSentinel 的只读服务器观察报告代理。"
         "必须只输出合法 JSON，不要 Markdown，不要解释，不要要求执行命令。"
         "禁止建议自动封禁、自动踢人、自动 RCON 或自动回滚。"
-        "涉及玩家时必须保留玩家名字段 players，不要只写玩家数量。"
+        "只能根据 Minecraft 运行日志和附件证据总结，不要按聊天审核臆测。"
     )
 
     def __init__(self, config: MineSentinelConfig, context: Any | None = None):

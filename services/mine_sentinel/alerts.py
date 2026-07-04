@@ -44,9 +44,6 @@ class MineSentinelAlertEngine:
             ):
                 continue
             self._alert_cooldowns[key] = now
-            players = issue.get("players_text") or "未知"
-            mentioned = issue.get("mentioned_players_text") or ""
-            mentioned_line = f"提到玩家：{mentioned}\n" if mentioned and mentioned != "未知" else ""
             signal_count = issue.get("signal_count")
             evidence_count = issue.get("evidence_count")
             signal_line = (
@@ -66,8 +63,6 @@ class MineSentinelAlertEngine:
             time_line = f"时间：{time_range}\n" if time_range else ""
             terms = format_issue_terms(issue)
             terms_line = f"关键词：{terms}\n" if terms else ""
-            metric_text = issue.get("metric_context_text") or ""
-            metric_line = f"指标：{metric_text}\n" if metric_text else ""
             messages.append(
                 "MineSentinel 即时告警\n"
                 f"服务器：{server_id}\n"
@@ -77,11 +72,8 @@ class MineSentinelAlertEngine:
                 f"{time_line}"
                 f"证据：{issue.get('evidence_count')} 条\n"
                 f"{signal_line}"
-                f"玩家：{players}\n"
-                f"{mentioned_line}"
                 f"{location_line}"
                 f"{terms_line}"
-                f"{metric_line}"
                 f"建议：{issue.get('suggested_action')}"
             )
         return messages

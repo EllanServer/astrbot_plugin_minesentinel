@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -44,6 +45,10 @@ def _positive_int(value: Any, default: int) -> int:
     return max(1, _as_int(value, default))
 
 
+def _nonnegative_int(value: Any, default: int) -> int:
+    return max(0, _as_int(value, default))
+
+
 def _report_interval_minutes(report_data: dict[str, Any]) -> int:
     if "interval_hours" in report_data and report_data.get("interval_hours") not in (
         None,
@@ -82,7 +87,6 @@ class MineSentinelAlertConfig:
     min_severity: str = "high"
     cooldown_seconds: int = 600
     min_evidence_count: int = 3
-    min_unique_players: int = 2
     window_minutes: int = 30
     analysis_interval_seconds: int = 60
 
@@ -98,22 +102,32 @@ class MineSentinelStorageConfig:
 
 
 @dataclass
-class MineSentinelChatConfig:
-    collect_for_ai_audit: bool = True
+class MineSentinelLogSourceConfig:
+    server_id: str = ""
+    server_name: str = ""
+    root: str = ""
+    log_file: str = ""
+    target_sessions: list[Any] = field(default_factory=list)
+    delivery_targets: list[Any] = field(default_factory=list)
+    enabled: bool = True
 
 
 @dataclass
-class MineSentinelDialogueConfig:
+class MineSentinelRuntimeLogConfig:
     enabled: bool = True
-    min_issue_score: float = 2.0
-    min_evidence_count: int = 1
-    max_findings: int = 10
-    max_issue_records: int = 50
-    incident_gap_seconds: int = 1800
-    continuation_window_seconds: int = 90
-    context_window_seconds: int = 120
-    context_messages_per_side: int = 2
-    custom_rules: list[dict[str, Any]] = field(default_factory=list)
+    sources: list[MineSentinelLogSourceConfig] = field(default_factory=list)
+    poll_interval_seconds: int = 5
+    backfill_on_start: bool = True
+    backfill_window_minutes: int = DEFAULT_REPORT_INTERVAL_MINUTES
+    initial_lines: int = 200
+    max_backfill_files: int = 16
+    max_backfill_lines: int = 50000
+    max_lines_per_poll: int = 200
+    max_line_length: int = 1000
+    max_bytes_per_poll: int = 262144
+    loop_filter_enabled: bool = True
+    loop_filter_window_seconds: int = 300
+    loop_summary_interval_seconds: int = 300
 
 
 @dataclass(slots=True)
@@ -121,12 +135,12 @@ class MineSentinelConfig:
     enabled: bool = True
     retention_minutes: int = DEFAULT_REPORT_INTERVAL_MINUTES
     max_tags_per_record: int = 8
-    max_metric_fields: int = 32
     max_raw_fields: int = 16
     dedupe_window_seconds: int = 120
     storage: MineSentinelStorageConfig = field(default_factory=MineSentinelStorageConfig)
-    chat: MineSentinelChatConfig = field(default_factory=MineSentinelChatConfig)
-    dialogue: MineSentinelDialogueConfig = field(default_factory=MineSentinelDialogueConfig)
+    runtime_log: MineSentinelRuntimeLogConfig = field(
+        default_factory=MineSentinelRuntimeLogConfig
+    )
     report: MineSentinelReportConfig = field(default_factory=MineSentinelReportConfig)
     alert: MineSentinelAlertConfig = field(default_factory=MineSentinelAlertConfig)
 
@@ -134,11 +148,9 @@ class MineSentinelConfig:
     def from_dict(cls, data: dict | None) -> "MineSentinelConfig":
         data = data or {}
         storage_data = data.get("storage", {}) or {}
-        chat_data = data.get("chat", {}) or {}
-        dialogue_data = data.get("dialogue", {}) or {}
+        runtime_log_data = data.get("runtime_log", {}) or {}
         report_data = data.get("report", {}) or {}
         alert_data = data.get("alert", {}) or {}
-        legacy_chat_enabled = _as_bool(chat_data.get("enabled"), True)
         interval_minutes = _report_interval_minutes(report_data)
         default_window_minutes = _positive_int(
             report_data.get("default_window_minutes"),
@@ -152,7 +164,6 @@ class MineSentinelConfig:
             enabled=data.get("enabled", True),
             retention_minutes=max(retention_minutes, default_window_minutes),
             max_tags_per_record=_positive_int(data.get("max_tags_per_record"), 8),
-            max_metric_fields=_positive_int(data.get("max_metric_fields"), 32),
             max_raw_fields=_positive_int(data.get("max_raw_fields"), 16),
             dedupe_window_seconds=_positive_int(data.get("dedupe_window_seconds"), 120),
             storage=MineSentinelStorageConfig(
@@ -175,57 +186,62 @@ class MineSentinelConfig:
                     100000,
                 ),
             ),
-            chat=MineSentinelChatConfig(
-                collect_for_ai_audit=_as_bool(
-                    chat_data.get("collect_for_ai_audit"),
-                    legacy_chat_enabled,
+            runtime_log=MineSentinelRuntimeLogConfig(
+                enabled=_as_bool(runtime_log_data.get("enabled"), True),
+                sources=_runtime_log_sources(runtime_log_data.get("sources")),
+                poll_interval_seconds=_positive_int(
+                    runtime_log_data.get("poll_interval_seconds"),
+                    5,
                 ),
-            ),
-            dialogue=MineSentinelDialogueConfig(
-                enabled=bool(dialogue_data.get("enabled", True)),
-                min_issue_score=max(
-                    0.0,
-                    _as_float(dialogue_data.get("min_issue_score"), 2.0),
+                backfill_on_start=_as_bool(
+                    runtime_log_data.get("backfill_on_start"),
+                    True,
                 ),
-                min_evidence_count=_positive_int(
-                    dialogue_data.get("min_evidence_count"),
-                    1,
+                backfill_window_minutes=_positive_int(
+                    runtime_log_data.get("backfill_window_minutes"),
+                    default_window_minutes,
                 ),
-                max_findings=_positive_int(dialogue_data.get("max_findings"), 10),
-                max_issue_records=_positive_int(
-                    dialogue_data.get("max_issue_records"),
-                    50,
+                initial_lines=_nonnegative_int(
+                    runtime_log_data.get("initial_lines"),
+                    200,
                 ),
-                incident_gap_seconds=max(
-                    0,
-                    _as_int(dialogue_data.get("incident_gap_seconds"), 1800),
+                max_backfill_files=_positive_int(
+                    runtime_log_data.get("max_backfill_files"),
+                    16,
                 ),
-                continuation_window_seconds=max(
-                    0,
-                    _as_int(dialogue_data.get("continuation_window_seconds"), 90),
+                max_backfill_lines=_positive_int(
+                    runtime_log_data.get("max_backfill_lines"),
+                    50000,
                 ),
-                context_window_seconds=max(
-                    0,
-                    _as_int(dialogue_data.get("context_window_seconds"), 120),
+                max_lines_per_poll=_positive_int(
+                    runtime_log_data.get("max_lines_per_poll"),
+                    200,
                 ),
-                context_messages_per_side=max(
-                    0,
-                    _as_int(dialogue_data.get("context_messages_per_side"), 2),
+                max_line_length=_positive_int(
+                    runtime_log_data.get("max_line_length"),
+                    1000,
                 ),
-                custom_rules=[
-                    dict(item)
-                    for item in (dialogue_data.get("custom_rules") or [])
-                    if isinstance(item, dict)
-                ],
+                max_bytes_per_poll=_positive_int(
+                    runtime_log_data.get("max_bytes_per_poll"),
+                    262144,
+                ),
+                loop_filter_enabled=_as_bool(
+                    runtime_log_data.get("loop_filter_enabled"),
+                    True,
+                ),
+                loop_filter_window_seconds=_positive_int(
+                    runtime_log_data.get("loop_filter_window_seconds"),
+                    300,
+                ),
+                loop_summary_interval_seconds=_positive_int(
+                    runtime_log_data.get("loop_summary_interval_seconds"),
+                    300,
+                ),
             ),
             report=MineSentinelReportConfig(
                 default_window_minutes=default_window_minutes,
                 send_to_target_sessions=bool(report_data.get("send_to_target_sessions", True)),
-                delivery_targets=[
-                    item
-                    for item in (report_data.get("delivery_targets") or [])
-                    if item not in (None, "")
-                ],
+                delivery_targets=_list_values(report_data.get("delivery_targets")),
                 include_evidence_samples=bool(report_data.get("include_evidence_samples", True)),
                 max_evidence_samples=_positive_int(report_data.get("max_evidence_samples"), 5),
                 provider_id=str(report_data.get("provider_id", "")),
@@ -253,7 +269,6 @@ class MineSentinelConfig:
                 min_severity=str(alert_data.get("min_severity", "high")),
                 cooldown_seconds=max(0, _as_int(alert_data.get("cooldown_seconds"), 600)),
                 min_evidence_count=_positive_int(alert_data.get("min_evidence_count"), 3),
-                min_unique_players=_positive_int(alert_data.get("min_unique_players"), 2),
                 window_minutes=_positive_int(alert_data.get("window_minutes"), 30),
                 analysis_interval_seconds=max(
                     0,
@@ -261,6 +276,94 @@ class MineSentinelConfig:
                 ),
             ),
         )
+
+
+def _runtime_log_sources(value: Any) -> list[MineSentinelLogSourceConfig]:
+    if not isinstance(value, list):
+        return []
+    sources: list[MineSentinelLogSourceConfig] = []
+    for index, item in enumerate(value):
+        source = _runtime_log_source(item, index)
+        if source:
+            sources.append(source)
+    return sources
+
+
+def _runtime_log_source(item: Any, index: int) -> MineSentinelLogSourceConfig | None:
+    if isinstance(item, str):
+        path_text = item.strip()
+        if not path_text:
+            return None
+        root, log_file = _split_runtime_log_path(path_text)
+        return MineSentinelLogSourceConfig(
+            server_id=_infer_log_source_id(root or log_file, index),
+            server_name=_infer_log_source_id(root or log_file, index),
+            root=root,
+            log_file=log_file,
+            enabled=True,
+        )
+    if not isinstance(item, dict):
+        return None
+
+    raw_path = str(item.get("path") or "").strip()
+    root = str(item.get("root") or item.get("server_root") or "").strip()
+    log_file = str(item.get("log_file") or item.get("log") or "").strip()
+    logs_dir = str(item.get("logs_dir") or "").strip()
+    if raw_path and not (root or log_file):
+        root, log_file = _split_runtime_log_path(raw_path)
+    if logs_dir and not log_file:
+        log_file = str(Path(logs_dir) / "latest.log")
+
+    source_hint = root or log_file
+    server_id = str(item.get("server_id") or "").strip()
+    server_name = str(item.get("server_name") or item.get("name") or "").strip()
+    if not server_id:
+        server_id = server_name or _infer_log_source_id(source_hint, index)
+    if not server_name:
+        server_name = server_id
+    if not (root or log_file):
+        return None
+    target_sessions = _list_values(item.get("target_sessions"))
+    delivery_targets = _list_values(item.get("delivery_targets"))
+    return MineSentinelLogSourceConfig(
+        server_id=server_id,
+        server_name=server_name,
+        root=root,
+        log_file=log_file,
+        target_sessions=target_sessions,
+        delivery_targets=delivery_targets,
+        enabled=_as_bool(item.get("enabled"), True),
+    )
+
+
+def _split_runtime_log_path(path_text: str) -> tuple[str, str]:
+    path = Path(path_text)
+    name = path.name.lower()
+    if name == "latest.log" or name.endswith(".log") or name.endswith(".log.gz"):
+        return "", path_text
+    return path_text, ""
+
+
+def _list_values(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = [value]
+    return [item for item in raw if item not in (None, "")]
+
+
+def _infer_log_source_id(path_text: str, index: int) -> str:
+    if not path_text:
+        return f"minecraft_{index + 1}"
+    path = Path(path_text)
+    if path.name.lower() == "latest.log" or path.name.lower().endswith((".log", ".gz")):
+        candidate = path.parent.parent.name or path.parent.name or path.stem
+    else:
+        candidate = path.name
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in candidate).strip("_")
+    return normalized or f"minecraft_{index + 1}"
 
 
 @dataclass(slots=True)
@@ -277,7 +380,6 @@ class ObservationRecord:
     content: str = ""
     tags: list[str] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
-    metrics: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -298,7 +400,6 @@ class ObservationRecord:
             content=str(data.get("content") or ""),
             tags=[str(t) for t in data.get("tags", []) if t is not None],
             context=dict(data.get("context") or {}),
-            metrics=dict(data.get("metrics") or {}),
             raw=dict(data.get("raw") or {}),
         )
 
@@ -309,6 +410,4 @@ class ObservationRecord:
     def evidence_text(self) -> str:
         source = self.backend_server or self.server_id
         player = f"{self.player_name}: " if self.player_name else ""
-        if self.kind == "SERVER_METRICS":
-            return f"[{source}] metrics {self.metrics}"
         return f"[{source}] {player}{self.content}".strip()

@@ -27,7 +27,7 @@ def format_issue_time_range(issue: dict[str, Any]) -> str:
 
 
 def format_issue_terms(issue: dict[str, Any]) -> str:
-    terms = issue.get("dialogue_terms") or issue.get("top_terms") or []
+    terms = issue.get("issue_terms") or issue.get("top_terms") or []
     if not isinstance(terms, list):
         return ""
     clean_terms = [str(term) for term in terms if term]

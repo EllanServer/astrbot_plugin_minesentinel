@@ -18,13 +18,15 @@ from .incidents import IncidentGroup, issue_sort_key
 
 
 def incident_title(group: IncidentGroup, labels: list[str]) -> str:
+    if group.family == "community":
+        return labels[0] if labels else "社区管理相关日志"
     if group.family == "moderation":
-        return "疑似作弊/破坏或利用漏洞反馈"
+        return "权限/登录相关运行日志异常"
     if group.family == "suggestion":
-        return labels[0] if labels else "玩家建议/体验请求"
+        return labels[0] if labels else "人工关注事项"
     if len(labels) > 1:
-        return "服务器集中出现多类异常反馈"
-    return labels[0] if labels else "玩家异常反馈"
+        return "服务器集中出现多类运行日志异常"
+    return labels[0] if labels else "运行日志异常"
 
 
 def incident_time_text(group: IncidentGroup) -> str:
@@ -75,8 +77,8 @@ def format_duration(report: dict) -> str:
 
 def evidence_line(total_count: int, dedupe_count: int, unique_players: int) -> str:
     if dedupe_count:
-        return f"证据：共 {total_count} 条观察，去重 {dedupe_count} 条，涉及玩家 {unique_players} 人。"
-    return f"证据：共 {total_count} 条观察，涉及玩家 {unique_players} 人。"
+        return f"证据：共 {total_count} 条运行日志观察，去重 {dedupe_count} 条。"
+    return f"证据：共 {total_count} 条运行日志观察。"
 
 
 def clean_sentence(value: str) -> str:
@@ -107,22 +109,17 @@ def as_millis(value: Any) -> int:
 def quiet_window_text(report: dict, groups: list[IncidentGroup]) -> str:
     """Shared quiet-window caption used by both renderers.
 
-    Returns an empty string when there is nothing to say (no incidents or no
-    chat), matching the original ``_quiet_window_line`` / ``_quiet_window_text``
-    behavior that both renderers relied on.
+    Returns an empty string when there is nothing to say.
     """
     if not groups:
-        return ""
-    chat_count = int(report.get("chat_count") or 0)
-    if chat_count <= 0:
         return ""
     if len(groups) == 1:
         time_text = incident_time_text(groups[0]).replace(" 左右", "")
         return (
-            f"除 {time_text} 的集中反馈外，当前摘要中没有体现其他时间段的"
-            "大规模聊天冲突、刷屏、广告或持续性争吵。"
+            f"除 {time_text} 的集中异常外，当前摘要中没有体现其他时间段的"
+            "持续 ERROR/WARN 或重复报错循环。"
         )
-    return "除上述事件外，当前摘要中没有体现其他时间段的大规模聊天冲突、刷屏、广告或持续性争吵。"
+    return "除上述事件外，当前摘要中没有体现其他时间段的持续 ERROR/WARN 或重复报错循环。"
 
 
 def resolve_attachment_name(report: dict) -> str:
@@ -138,4 +135,7 @@ def resolve_attachment_name(report: dict) -> str:
 
 
 def is_attachment_note(note: str) -> bool:
-    return "完整 observation 文件" in note or "完整聊天记录附件" in note
+    return (
+        "完整 observation 文件" in note
+        or "完整审计日志附件" in note
+    )

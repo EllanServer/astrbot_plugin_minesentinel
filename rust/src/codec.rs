@@ -26,7 +26,6 @@ use serde_json::{Map, Value};
 pub struct ObservationRecordCodec {
     max_content_length: usize,
     max_tags_per_record: usize,
-    max_metric_fields: usize,
     max_raw_fields: usize,
     include_raw: bool,
     dedupe_window_seconds: i64,
@@ -38,7 +37,6 @@ impl ObservationRecordCodec {
     #[pyo3(signature = (
         max_content_length = 4000,
         max_tags_per_record = 8,
-        max_metric_fields = 32,
         max_raw_fields = 16,
         include_raw = false,
         dedupe_window_seconds = 120,
@@ -47,7 +45,6 @@ impl ObservationRecordCodec {
     pub fn new(
         max_content_length: usize,
         max_tags_per_record: usize,
-        max_metric_fields: usize,
         max_raw_fields: usize,
         include_raw: bool,
         dedupe_window_seconds: i64,
@@ -55,7 +52,6 @@ impl ObservationRecordCodec {
         Self {
             max_content_length,
             max_tags_per_record,
-            max_metric_fields,
             max_raw_fields,
             include_raw,
             dedupe_window_seconds,
@@ -80,12 +76,6 @@ impl ObservationRecordCodec {
             .map(|t| truncate(&t, self.max_content_length))
             .collect();
         record.setattr("tags", new_tags)?;
-
-        // ---- metrics ----
-        let metrics_obj = record.getattr("metrics")?;
-        let metrics_dict: Bound<PyDict> = metrics_obj.extract()?;
-        let compacted_metrics = compact_py_dict(py, &metrics_dict, self.max_metric_fields, self.max_content_length)?;
-        record.setattr("metrics", compacted_metrics)?;
 
         // ---- context ----
         let context_obj = record.getattr("context")?;
@@ -125,8 +115,6 @@ impl ObservationRecordCodec {
         let tags: Vec<String> = record.getattr("tags")?.extract()?;
         let context_obj = record.getattr("context")?;
         let context_value = py_any_to_json(&context_obj)?;
-        let metrics_obj = record.getattr("metrics")?;
-        let metrics_value = py_any_to_json(&metrics_obj)?;
         let raw_value = if self.include_raw {
             let raw_obj = record.getattr("raw")?;
             py_any_to_json(&raw_obj)?
@@ -156,7 +144,6 @@ impl ObservationRecordCodec {
             Value::Array(tags.into_iter().map(Value::String).collect()),
         );
         out.insert("context".to_string(), context_value);
-        out.insert("metrics".to_string(), metrics_value);
         out.insert("raw".to_string(), raw_value);
 
         json_to_py(py, &Value::Object(out))?
@@ -181,8 +168,6 @@ impl ObservationRecordCodec {
         let tags: Vec<String> = record.getattr("tags")?.extract()?;
         let context_obj = record.getattr("context")?;
         let context_value = py_any_to_json(&context_obj)?;
-        let metrics_obj = record.getattr("metrics")?;
-        let metrics_value = py_any_to_json(&metrics_obj)?;
         let raw_value = if self.include_raw {
             let raw_obj = record.getattr("raw")?;
             py_any_to_json(&raw_obj)?
@@ -209,7 +194,6 @@ impl ObservationRecordCodec {
             Value::Array(tags.into_iter().map(Value::String).collect()),
         );
         out.insert("context".to_string(), context_value);
-        out.insert("metrics".to_string(), metrics_value);
         out.insert("raw".to_string(), raw_value);
 
         serde_json::to_string(&Value::Object(out))
@@ -254,7 +238,7 @@ impl ObservationRecordCodec {
 /// Preserves insertion order (PyDict iteration is insertion-ordered). For
 /// each value: None/bool/int/float pass through; str → truncate; anything
 /// else → `str()` then truncate (mirrors `json.dumps(value, default=str)`
-/// for the common cases we see in metrics/context/raw).
+/// for the common cases we see in context/raw).
 fn compact_py_dict<'py>(
     py: Python<'py>,
     data: &Bound<'py, PyDict>,
@@ -299,7 +283,7 @@ fn compact_py_value<'py>(
     }
     // Fallback (lists/dicts/unknown): stringify via Python str() then truncate.
     // Matches Python's `json.dumps(value, default=str)` for the common cases
-    // we see in metrics/context/raw.
+    // we see in context/raw.
     let s: String = value.str()?.extract().unwrap_or_else(|_| value.to_string());
     Ok(truncate(&s, max_len).into_pyobject(py)?.into_any())
 }

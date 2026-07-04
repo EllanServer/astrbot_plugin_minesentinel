@@ -1,161 +1,12 @@
 {
   "enabled": {
     "type": "bool",
-    "description": "启用 Minecraft 适配器",
+    "description": "启用 MineSentinel Minecraft 日志审计插件",
     "default": true
-  },
-  "mc_servers": {
-    "type": "template_list",
-    "description": "MC服务器列表",
-    "templates": {
-      "server": {
-        "name": "MC服务器",
-        "hint": "MC服务器配置",
-        "items": {
-          "enabled": {
-            "type": "bool",
-            "description": "启用此服务器",
-            "default": true
-          },
-          "server": {
-            "description": "服务器连接信息",
-            "type": "object",
-            "items": {
-              "server_id": {
-                "type": "string",
-                "description": "服务器ID",
-                "hint": "用于区分不同服务器的唯一标识，将用于UMO和指令参数",
-                "default": "my_server"
-              },
-              "host": {
-                "type": "string",
-                "description": "服务器地址",
-                "hint": "AstrbotAdaptor插件所在服务器的IP或域名",
-                "default": "localhost"
-              },
-              "port": {
-                "type": "int",
-                "description": "服务器端口",
-                "hint": "AstrbotAdaptor插件配置的端口，默认8765",
-                "default": 8765
-              },
-              "token": {
-                "type": "string",
-                "description": "认证 Token",
-                "hint": "从 AstrbotAdaptor 插件配置中获取的认证令牌",
-                "default": ""
-              }
-            }
-          },
-          "auto_server_id": {
-            "type": "bool",
-            "description": "自动匹配扫描到的服务器 ID",
-            "hint": "启用后会从 Java 插件 REST 扫描结果 servers[] 中自动选择对应服务器，并把 server_id 对齐为扫描到的真实 ID。单服通常会自动变为服务端名称，例如 Leaf。",
-            "default": true
-          },
-          "enable_ai_chat": {
-            "type": "bool",
-            "description": "启用 AI 对话功能",
-            "hint": "是否在此服务器启用AI聊天，将创建虚拟平台适配器",
-            "default": true
-          },
-          "text2image": {
-            "type": "bool",
-            "description": "将服务器信息渲染为图片输出",
-            "hint": "渲染失败会自动回退为文本发送",
-            "default": true
-          },
-          "message": {
-            "description": "消息转发配置",
-            "type": "object",
-            "items": {
-              "forward_chat_to_astrbot": {
-                "type": "bool",
-                "description": "转发游戏内聊天到指定会话",
-                "hint": "开关 1：将 Minecraft 玩家聊天实时转发到 QQ/外部会话。默认关闭，关闭后不影响 MineSentinel AI 审计采集；审计采集由 mine_sentinel.chat.collect_for_ai_audit 控制。",
-                "default": false
-              },
-              "forward_chat_format": {
-                "type": "string",
-                "description": "聊天消息格式",
-                "hint": "转发时的聊天消息格式。{player} 替换为玩家名称，{message} 替换为消息内容",
-                "default": "<{player}> {message}"
-              },
-              "forward_join_leave_to_astrbot": {
-                "type": "bool",
-                "description": "转发玩家进出消息",
-                "hint": "将玩家加入/离开服务器的消息转发到指定会话",
-                "default": false
-              },
-              "target_sessions": {
-                "type": "list",
-                "description": "目标会话",
-                "hint": "MC message bridge target sessions. Prefer AstrBot /sid output, e.g. napcat:GroupMessage:123456789 or qq_official:GroupMessage:group_openid. Shorthand is also supported: group:QQ group id/openid, qq:QQ user id/openid. Old adapter-name UMO such as aiocqhttp:GroupMessage:123456789 or qq_official:GroupMessage:group_openid is resolved to the active AstrBot platform id at runtime.",
-                "default": []
-              },
-              "auto_forward_prefix": {
-                "type": "string",
-                "description": "自动转发消息前缀",
-                "hint": "外部会话中以此前缀开头的消息将被转发到MC服务器（例如: *）。留空则转发全部消息",
-                "default": "*"
-              },
-              "mark_option": {
-                "type": "string",
-                "description": "转发提醒方式",
-                "hint": "选择转发成功后的提醒方式：text为文本提醒，emoji为贴表情，none为不提醒",
-                "options": ["text", "emoji", "none"],
-                "default": "emoji"
-              }
-            }
-          },
-          "cmd": {
-            "description": "远程指令配置",
-            "type": "object",
-            "items": {
-              "enabled": {
-                "type": "bool",
-                "description": "启用远程执行指令",
-                "hint": "是否允许通过 /mc cmd 指令远程执行服务器命令",
-                "default": true
-              },
-              "cmd_white_black_list": {
-                "type": "string",
-                "description": "指令名单类型",
-                "hint": "white: 仅允许名单内指令；black: 禁止名单内指令；none: 不启用黑白名单",
-                "options": ["white", "black", "none"],
-                "default": "white"
-              },
-              "cmd_list": {
-                "type": "list",
-                "description": "指令名单",
-                "hint": "指令白名单或黑名单，填写指令名（不带/）如 say, gamemode, tp",
-                "default": ["say", "list", "weather", "time"]
-              },
-              "bind_enable": {
-                "type": "bool",
-                "description": "启用绑定功能",
-                "hint": "允许用户将外部平台账号与MC游戏ID绑定",
-                "default": true
-              },
-              "custom_cmd_list": {
-                "type": "list",
-                "description": "自定义指令映射",
-                "hint": "自定义快捷指令。格式：触发词 <&参数&><<>>实际指令 {参数} {sender}。{sender}为用户绑定的游戏ID",
-                "default": [
-                  "head <&player&><<>>give {sender} minecraft:player_head[minecraft:profile='<&player&>'] 1",
-                  "tpa <&player&><<>>tpa {sender} {player}",
-                  "tp <&X&> <&y&> <&z&><<>>tp {sender} <&X&> <&y&> <&z&>"
-                ]
-              }
-            }
-          }
-        }
-      }
-    }
   },
   "mine_sentinel": {
     "type": "object",
-    "description": "MineSentinel 只读旁路监控",
+    "description": "MineSentinel 运行日志审计",
     "items": {
       "enabled": {
         "type": "bool",
@@ -164,16 +15,93 @@
       },
       "retention_minutes": {
         "type": "int",
-        "description": "Observation 保留分钟数，建议不小于报告统计窗口",
+        "description": "Observation 保留分钟数，建议不小于报告窗口",
         "default": 480
       },
-      "storage": {
+      "runtime_log": {
         "type": "object",
-        "description": "硬盘 observation 存储",
+        "description": "直接读取 Minecraft 运行日志",
         "items": {
           "enabled": {
             "type": "bool",
-            "description": "启用硬盘 JSONL 存储，报告优先从硬盘读取完整窗口",
+            "description": "启用运行日志审计",
+            "default": true
+          },
+          "sources": {
+            "type": "list",
+            "description": "Minecraft 日志来源",
+            "hint": "支持字符串或对象。字符串可填服务器根目录，AstrBot 会自动读取 root/logs/latest.log；也可直接填 latest.log 路径。对象字段：server_id、server_name、root、log_file、enabled、delivery_targets。",
+            "default": []
+          },
+          "poll_interval_seconds": {
+            "type": "int",
+            "description": "实时读取 latest.log 的轮询间隔秒数",
+            "default": 5
+          },
+          "backfill_on_start": {
+            "type": "bool",
+            "description": "启动时回扫最近日志窗口",
+            "default": true
+          },
+          "backfill_window_minutes": {
+            "type": "int",
+            "description": "启动回扫日志窗口分钟数，默认 8 小时",
+            "default": 480
+          },
+          "initial_lines": {
+            "type": "int",
+            "description": "关闭回扫时，从 latest.log 末尾补读的行数",
+            "default": 200
+          },
+          "max_backfill_files": {
+            "type": "int",
+            "description": "启动回扫最多读取的 .log/.log.gz 文件数",
+            "default": 16
+          },
+          "max_backfill_lines": {
+            "type": "int",
+            "description": "启动回扫最多写入的日志行数",
+            "default": 50000
+          },
+          "max_lines_per_poll": {
+            "type": "int",
+            "description": "每次轮询最多写入的日志行数",
+            "default": 200
+          },
+          "max_line_length": {
+            "type": "int",
+            "description": "单行运行日志最大保存长度",
+            "default": 1000
+          },
+          "max_bytes_per_poll": {
+            "type": "int",
+            "description": "每次轮询最多读取的字节数",
+            "default": 262144
+          },
+          "loop_filter_enabled": {
+            "type": "bool",
+            "description": "过滤服务器报错死循环",
+            "default": true
+          },
+          "loop_filter_window_seconds": {
+            "type": "int",
+            "description": "同类报错判定为循环的时间窗口秒数",
+            "default": 300
+          },
+          "loop_summary_interval_seconds": {
+            "type": "int",
+            "description": "重复报错循环摘要写入间隔秒数",
+            "default": 300
+          }
+        }
+      },
+      "storage": {
+        "type": "object",
+        "description": "硬盘 JSONL 存储",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用硬盘 JSONL 存储",
             "default": true
           },
           "retention_minutes": {
@@ -183,35 +111,23 @@
           },
           "cleanup_interval_seconds": {
             "type": "int",
-            "description": "过期 JSONL 文件清理间隔秒数；写入仍实时落盘，清理会节流以降低高频 batch 下的磁盘扫描压力，0 表示每批都清理",
+            "description": "过期 JSONL 文件清理间隔秒数",
             "default": 300
           },
           "include_raw": {
             "type": "bool",
-            "description": "硬盘文件是否保存 raw 字段，默认关闭以降低隐私和磁盘风险",
+            "description": "是否保存 raw 字段，默认关闭以降低隐私和磁盘风险",
             "default": false
           },
           "max_content_length": {
             "type": "int",
-            "description": "硬盘文件中单条 observation 内容最大长度",
+            "description": "单条 observation 内容最大长度",
             "default": 4000
           },
           "dedupe_memory_limit": {
             "type": "int",
-            "description": "读取/导出窗口时去重 key 的内存上限，超过后溢写临时 SQLite 文件",
+            "description": "读取/导出窗口时去重 key 的内存上限",
             "default": 100000
-          }
-        }
-      },
-      "chat": {
-        "type": "object",
-        "description": "聊天审计采集",
-        "items": {
-          "collect_for_ai_audit": {
-            "type": "bool",
-            "description": "只收集游戏内聊天用于 AI 审计",
-            "hint": "开关 2：控制 AstrBot 是否把 MC 端上报的 CHAT observation 写入 MineSentinel JSONL 并用于 AI 总结/告警。关闭后仍可继续实时转发游戏内聊天。",
-            "default": true
           }
         }
       },
@@ -220,68 +136,6 @@
         "description": "单条 observation 最多保存标签数",
         "default": 8
       },
-      "max_metric_fields": {
-        "type": "int",
-        "description": "单条指标 observation 最多保存字段数",
-        "default": 32
-      },
-      "dialogue": {
-        "type": "object",
-        "description": "玩家对话问题发现",
-        "items": {
-          "enabled": {
-            "type": "bool",
-            "description": "启用玩家聊天问题信号分析",
-            "default": true
-          },
-          "min_issue_score": {
-            "type": "float",
-            "description": "对话问题进入报告的最低评分；越高越克制",
-            "default": 2.0
-          },
-          "min_evidence_count": {
-            "type": "int",
-            "description": "对话问题进入报告的最少聊天证据条数",
-            "default": 1
-          },
-          "max_findings": {
-            "type": "int",
-            "description": "单次报告最多展示的玩家对话发现数",
-            "default": 10
-          },
-          "max_issue_records": {
-            "type": "int",
-            "description": "单个对话问题最多保留的证据记录数，防止超大窗口耗费过多内存",
-            "default": 50
-          },
-          "incident_gap_seconds": {
-            "type": "int",
-            "description": "同类玩家对话问题超过该秒数没有新反馈时切分为新的 incident，0 表示不按时间切分",
-            "default": 1800
-          },
-          "continuation_window_seconds": {
-            "type": "int",
-            "description": "同服/同后端短句跟进反馈继承最近明确问题上下文的秒数，0 表示关闭；用于识别“我也是”“一样”“+1”等玩家跟随反馈",
-            "default": 90
-          },
-          "context_window_seconds": {
-            "type": "int",
-            "description": "证据样本携带同服/同后端前后文聊天的时间窗口秒数，0 表示关闭",
-            "default": 120
-          },
-          "context_messages_per_side": {
-            "type": "int",
-            "description": "每条证据最多携带前后各多少条聊天上下文",
-            "default": 2
-          },
-          "custom_rules": {
-            "type": "list",
-            "description": "自定义玩家对话问题规则",
-            "hint": "每项为对象：category/tag/title/keywords/urgent_terms/suggested_action/base_severity。自定义 tag 会自动加 custom_ 前缀并去重，避免和内置规则冲突。例：{\"category\":\"bug\",\"tag\":\"quest_npc_broken\",\"title\":\"任务 NPC 异常\",\"keywords\":[\"npc不见了\",\"任务交不了\"],\"urgent_terms\":[\"所有人\"],\"suggested_action\":\"检查任务插件和 NPC 刷新日志。\",\"base_severity\":\"high\"}",
-            "default": []
-          }
-        }
-      },
       "dedupe_window_seconds": {
         "type": "int",
         "description": "读取硬盘窗口时的去重窗口秒数",
@@ -289,23 +143,48 @@
       },
       "report": {
         "type": "object",
-        "description": "报告配置",
+        "description": "AI 报告配置",
         "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用定时报告",
+            "default": true
+          },
+          "interval_hours": {
+            "type": "int",
+            "description": "定时报告间隔小时数",
+            "default": 8
+          },
           "default_window_minutes": {
             "type": "int",
             "description": "默认报告统计窗口分钟数",
             "default": 480
           },
-          "send_to_target_sessions": {
-            "type": "bool",
-            "description": "报告是否派发到服务器 target_sessions",
-            "default": true
-          },
           "delivery_targets": {
             "type": "list",
-            "description": "报告额外发送目标",
-            "hint": "AstrBot UMO or shorthand. Prefer /sid output, e.g. napcat:GroupMessage:123456 or qq_official:GroupMessage:group_openid. Shorthand: group:QQ group id/openid, qq/private:QQ user id/openid. Pure numbers default to QQ groups. Old aiocqhttp/qq_official UMO is resolved to the active AstrBot platform id at runtime.",
+            "description": "报告发送目标",
+            "hint": "优先使用 /sid 输出的完整 UMO，例如 napcat:GroupMessage:123456 或 qq_official:GroupMessage:group_openid；也支持 group:、qq: 简写。",
             "default": []
+          },
+          "provider_id": {
+            "type": "string",
+            "description": "指定 AstrBot 模型 Provider ID，留空使用当前/目标会话模型",
+            "default": ""
+          },
+          "send_to_target_sessions": {
+            "type": "bool",
+            "description": "是否同时发送到日志 source 上配置的 delivery_targets/target_sessions",
+            "default": true
+          },
+          "send_as_image": {
+            "type": "bool",
+            "description": "报告正文优先渲染为图片发送",
+            "default": true
+          },
+          "send_full_log_file": {
+            "type": "bool",
+            "description": "报告发送时附带完整窗口 JSONL",
+            "default": true
           },
           "include_evidence_samples": {
             "type": "bool",
@@ -316,21 +195,6 @@
             "type": "int",
             "description": "每个 issue 最大证据样本数",
             "default": 5
-          },
-          "provider_id": {
-            "type": "string",
-            "description": "指定 AstrBot 模型 Provider ID，留空使用当前/目标会话模型",
-            "default": ""
-          },
-          "enabled": {
-            "type": "bool",
-            "description": "启用定时报告",
-            "default": true
-          },
-          "interval_hours": {
-            "type": "int",
-            "description": "定时报告间隔小时数",
-            "default": 8
           },
           "cooldown_seconds": {
             "type": "int",
@@ -344,7 +208,7 @@
           },
           "max_records_in_memory": {
             "type": "int",
-            "description": "生成报告时最多放入内存分析的 observation 数，完整记录仍落盘并可导出",
+            "description": "生成报告时最多放入内存分析的 observation 数",
             "default": 50000
           },
           "max_ai_prompt_chars": {
@@ -356,22 +220,12 @@
             "type": "int",
             "description": "提交给 AI 的单条 observation 内容最大长度",
             "default": 240
-          },
-          "send_as_image": {
-            "type": "bool",
-            "description": "报告正文优先渲染为图片发送，失败时自动回退纯文本",
-            "default": true
-          },
-          "send_full_log_file": {
-            "type": "bool",
-            "description": "报告发送时是否额外上传完整窗口 JSONL 文件",
-            "default": true
           }
         }
       },
       "alert": {
         "type": "object",
-        "description": "基础告警配置",
+        "description": "即时告警配置",
         "items": {
           "enabled": {
             "type": "bool",
@@ -393,11 +247,6 @@
             "type": "int",
             "description": "触发告警所需最少证据数",
             "default": 3
-          },
-          "min_unique_players": {
-            "type": "int",
-            "description": "触发告警所需最少玩家数",
-            "default": 2
           },
           "window_minutes": {
             "type": "int",

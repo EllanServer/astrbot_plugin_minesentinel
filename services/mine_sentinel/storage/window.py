@@ -5,8 +5,7 @@ from __future__ import annotations
 import heapq
 
 from ..models import ObservationRecord
-from ..observation_priority import matcher_for_rules, observation_priority_score
-from ..reporting.dialogue_rules import DialogueRule
+from ..observation_priority import observation_priority_score
 from .models import RecentObservationWindow
 
 
@@ -16,11 +15,8 @@ class RecentWindowBuilder:
     def __init__(
         self,
         max_records: int,
-        dialogue_rules: tuple[DialogueRule, ...] | None = None,
     ):
         self.max_records = max(1, max_records)
-        self.dialogue_rules = dialogue_rules
-        self.priority_matcher = matcher_for_rules(dialogue_rules)
         self.priority_limit = max(1, min(self.max_records, (self.max_records * 2 + 2) // 3))
         self.reservoir_limit = max(0, self.max_records - self.priority_limit)
         self.priority_records: list[tuple[float, int, ObservationRecord]] = []
@@ -49,7 +45,7 @@ class RecentWindowBuilder:
     def _add_priority_record(self, record: ObservationRecord):
         if self.priority_limit <= 0:
             return
-        score = observation_priority_score(record, matcher=self.priority_matcher)
+        score = observation_priority_score(record)
         if score <= 0:
             return
         item = (score, self.total_count, record)

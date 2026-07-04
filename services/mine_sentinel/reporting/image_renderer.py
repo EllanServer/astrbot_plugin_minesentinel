@@ -103,7 +103,7 @@ class MineSentinelReportImageRenderer:
             [
                 ("观察记录", str(total_count), "#eff6ff", self.BLUE),
                 ("事故级问题", str(len(presentation.incidents)), "#fff7ed", self.AMBER),
-                ("涉及玩家", str(unique_players), "#ecfdf5", self.GREEN),
+                ("日志来源", str(len(report.get("servers") or []) or 1), "#ecfdf5", self.GREEN),
                 ("完整记录", _format_attachment_name(report), "#f0f9ff", self.CYAN),
             ]
         )
@@ -119,17 +119,17 @@ class MineSentinelReportImageRenderer:
             color=self.TEXT,
         )
 
-        canvas.section_title("聊天与事件总结")
+        canvas.section_title("运行日志与事件总结")
         if presentation.incidents:
             for index, group in enumerate(presentation.incidents[:8], 1):
                 canvas.incident_card(index, group)
             canvas.info_note(_quiet_window_text(report, presentation.incidents))
         else:
-            canvas.info_note("本窗口未发现需要特别记录的聊天或事件。")
+            canvas.info_note("本窗口未发现需要特别记录的运行日志或事件。")
 
-        canvas.section_title("玩家问题/投诉识别")
-        player_lines = _player_problem_lines(presentation.incidents, report)
-        canvas.bullet_list(player_lines)
+        canvas.section_title("日志异常识别")
+        log_lines = _log_problem_lines(presentation.incidents)
+        canvas.bullet_list(log_lines)
 
         canvas.section_title("风险提醒")
         canvas.bullet_list(_risk_lines(report, presentation.issues, presentation.incidents))
@@ -241,11 +241,7 @@ class _ReportCanvas:
         self.y += 76
 
         self._badge_row(labels[:10], x + self.r.CARD_PAD, badge_fill, accent)
-        self._detail_row("相关玩家", _incident_players(issues))
         self._detail_row("位置/后端", _incident_locations(issues))
-        metrics = _incident_metric_text(issues)
-        if metrics:
-            self._detail_row("同窗指标", metrics)
 
         actions = _incident_action_lines(issues, limit=3)
         if actions:
@@ -496,10 +492,10 @@ def _overall_line(
         if incident_count
         else f"过去 {duration}服务器整体稳定，未发现大规模异常。"
     )
-    players = str(report.get("chat_players_text") or "").strip()
-    if not players or players == "未知":
-        players = "暂无明确发言玩家"
-    return f"{status}共有 {unique_players} 名玩家出现记录，活跃玩家主要是：{players}。"
+    return (
+        f"{status}共记录 {report.get('log_count', 0)} 条运行日志观察，"
+        "主要来源于 Minecraft 服务器运行日志。"
+    )
 
 
 def _incident_labels(
@@ -540,21 +536,6 @@ def _incident_locations(issues: list[dict[str, Any]]) -> str:
                 seen.add(value)
                 locations.append(value)
     return "、".join(sorted(locations)) if locations else "未知"
-
-
-def _incident_metric_text(issues: list[dict[str, Any]]) -> str:
-    metrics: list[str] = []
-    seen: set[str] = set()
-    for issue in issues:
-        metric = str(issue.get("metric_context_text") or "").strip()
-        if not metric:
-            continue
-        key = _dedupe_key(metric)
-        if key in seen:
-            continue
-        seen.add(key)
-        metrics.append(metric)
-    return "；".join(metrics[:3])
 
 
 def _incident_evidence_lines(
@@ -631,30 +612,24 @@ def _incident_reference_items(
     return items
 
 
-def _player_problem_lines(groups: list[IncidentGroup], report: dict) -> list[str]:
+def _log_problem_lines(groups: list[IncidentGroup]) -> list[str]:
     lines: list[str] = []
     for group in groups[:8]:
         issues = list(group.issues)
-        players = _incident_players(issues)
-        if players == "未知":
-            continue
         labels = [
             DEFAULT_LABELS.issue_title(issue)
             for issue in sorted(issues, key=issue_sort_key)
         ]
         title = "、".join(_unique_text(labels[:6])) or _incident_title(group, labels)
         actions = "；".join(line.rstrip("。") for line in _incident_action_lines(issues, 3))
-        metric = _incident_metric_text(issues)
-        metric_part = f"，{metric}" if metric else ""
+        locations = _incident_locations(issues)
+        location_part = f"（{locations}）" if locations != "未知" else ""
         action_part = f"，{actions}。" if actions else "，建议管理员人工复核上下文。"
-        lines.append(f"{players}：集中反馈{title}{metric_part}{action_part}")
+        lines.append(f"{title}{location_part}{action_part}")
 
     if lines:
         return lines
-    players = [str(player) for player in report.get("chat_players") or [] if str(player)]
-    if players:
-        return [f"{'、'.join(players[:8])}：没有发现需要管理员介入的异常行为。"]
-    return ["没有发现玩家要求管理员紧急处理的未解决问题。"]
+    return ["没有发现需要管理员紧急处理的运行日志异常。"]
 
 
 def _risk_lines(
@@ -663,22 +638,28 @@ def _risk_lines(
     groups: list[IncidentGroup],
 ) -> list[str]:
     lines: list[str] = []
-    if any(group.family == "moderation" for group in groups):
-        lines.append("检测到聊天冲突、作弊/破坏举报或管理相关反馈，建议人工复核上下文。")
+    if any(group.family == "community" for group in groups):
+        lines.append("检测到社区管理相关日志，建议按服务器管理流程复核处理。")
+    elif any(group.family == "moderation" for group in groups):
+        lines.append("检测到权限/登录相关风险信号，建议人工复核运行日志上下文。")
     else:
-        lines.append("没有检测到明显辱骂、刷屏、广告或恶意引战。")
+        lines.append("没有检测到明显重复报错、严重异常或持续性告警。")
 
     if groups:
         lines.append(f"有 {len(groups)} 个事故级问题需要优先确认。")
     else:
-        lines.append("没有发现玩家要求管理员紧急处理的未解决问题。")
+        lines.append("没有发现需要管理员紧急处理的未解决运行日志异常。")
 
-    if any(str(issue.get("tag") or "") == "performance_lag" for issue in issues):
+    if any(str(issue.get("tag") or "") == "server_log_performance" for issue in issues):
         lines.append("卡顿反馈值得关注，建议下次巡检继续跟踪 TPS、内存、实体数量和红石机器。")
 
     for note in report.get("ops_notes") or []:
         note = str(note).strip()
-        if not note or "完整 observation 文件" in note or "完整聊天记录附件" in note:
+        if (
+            not note
+            or "完整 observation 文件" in note
+            or "完整审计日志附件" in note
+        ):
             continue
         lines.append(_clean_sentence(note))
         if len(lines) >= 6:
@@ -701,12 +682,14 @@ def _action_lines(issues: list[dict[str, Any]]) -> list[str]:
         if len(actions) >= 8:
             break
     return actions or [
-        "继续观察玩家反馈和服务器指标。",
-        "保留完整 JSONL 附件，必要时按玩家名和时间点人工复核。",
+        "继续观察服务器运行日志和关键错误线索。",
+        "保留完整 JSONL 附件，必要时按服务器、日志文件和时间点人工复核。",
     ]
 
 
 def _incident_colors(family: str) -> tuple[str, str]:
+    if family == "community":
+        return "#fefce8", "#ca8a04"
     if family == "moderation":
         return "#fef2f2", "#dc2626"
     if family == "suggestion":

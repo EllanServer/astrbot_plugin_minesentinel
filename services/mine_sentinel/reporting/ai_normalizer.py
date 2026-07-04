@@ -1,4 +1,4 @@
-"""Normalize AI report JSON back onto deterministic MineSentinel facts."""
+"""Normalize AI report JSON back onto deterministic runtime-log facts."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from .common import format_locations, format_players
+from .common import format_locations
 
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
@@ -23,7 +23,7 @@ def repair_json_object_text(text: str) -> str:
 
 
 class AIReportNormalizer:
-    """Preserves players, locations, metrics, and counts from fallback facts."""
+    """Preserves locations, evidence, and counts from fallback facts."""
 
     def normalize_report(
         self,
@@ -40,6 +40,7 @@ class AIReportNormalizer:
             "complaint",
             "bug",
             "economy",
+            "community",
             "moderation",
             "suggestion",
             "cross_server",
@@ -50,12 +51,8 @@ class AIReportNormalizer:
         self.normalize_issues(result, fallback)
         if not isinstance(result.get("ops_notes"), list):
             result["ops_notes"] = fallback["ops_notes"]
-        if not isinstance(result.get("chat_players"), list):
-            result["chat_players"] = fallback.get("chat_players", [])
-        if not result.get("chat_players_text"):
-            result["chat_players_text"] = format_players(result["chat_players"])
-        if not isinstance(result.get("dialogue_findings"), list):
-            result["dialogue_findings"] = fallback.get("dialogue_findings", [])
+        if not isinstance(result.get("incident_findings"), list):
+            result["incident_findings"] = fallback.get("incident_findings", [])
         return result
 
     def normalize_issues(self, result: dict[str, Any], fallback: dict[str, Any]):
@@ -84,10 +81,9 @@ class AIReportNormalizer:
             self._normalize_players(issue, fallback_issue)
             self._normalize_counts(issue, fallback_issue)
             self._normalize_locations(issue, fallback_issue)
-            self._normalize_metric_context(issue, fallback_issue)
             normalized_issues.append(issue)
 
-        if normalized_issues and any(issue.get("players") for issue in normalized_issues):
+        if normalized_issues:
             result["issues"] = normalized_issues
         else:
             result["issues"] = fallback["issues"]
@@ -138,9 +134,9 @@ class AIReportNormalizer:
         ):
             if field not in issue and field in fallback_issue:
                 issue[field] = fallback_issue[field]
-        if not isinstance(issue.get("dialogue_terms"), list):
-            terms = fallback_issue.get("dialogue_terms") or []
-            issue["dialogue_terms"] = [str(term) for term in terms if term]
+        if not isinstance(issue.get("issue_terms"), list):
+            terms = fallback_issue.get("issue_terms") or []
+            issue["issue_terms"] = [str(term) for term in terms if term]
         if not isinstance(issue.get("evidence_samples"), list):
             samples = fallback_issue.get("evidence_samples") or []
             issue["evidence_samples"] = [str(sample) for sample in samples if sample]
@@ -155,7 +151,7 @@ class AIReportNormalizer:
             players = fallback_issue.get("players") or []
         issue["players"] = [str(player) for player in players if player]
         if not issue.get("players_text"):
-            issue["players_text"] = format_players(issue["players"])
+            issue["players_text"] = "无"
 
         mentioned_players = issue.get("mentioned_players")
         if not isinstance(mentioned_players, list):
@@ -164,9 +160,7 @@ class AIReportNormalizer:
             str(player) for player in mentioned_players if player
         ]
         if not issue.get("mentioned_players_text"):
-            issue["mentioned_players_text"] = format_players(
-                issue["mentioned_players"]
-            )
+            issue["mentioned_players_text"] = "无"
 
     @staticmethod
     def _normalize_counts(
@@ -200,22 +194,6 @@ class AIReportNormalizer:
             issue["affected_locations_text"] = format_locations(
                 issue.get("affected_locations") or []
             )
-
-    @staticmethod
-    def _normalize_metric_context(
-        issue: dict[str, Any],
-        fallback_issue: dict[str, Any],
-    ):
-        if not issue.get("metric_context_text"):
-            issue["metric_context_text"] = fallback_issue.get(
-                "metric_context_text",
-                "",
-            )
-        if not isinstance(issue.get("metric_context"), dict):
-            metric_context = fallback_issue.get("metric_context")
-            if isinstance(metric_context, dict):
-                issue["metric_context"] = metric_context
-
 
 def _as_int(value: Any) -> int | None:
     try:

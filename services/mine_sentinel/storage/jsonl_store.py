@@ -19,7 +19,6 @@ from .paths import (
     safe_name,
 )
 from .window import RecentWindowBuilder
-from ..reporting.dialogue_rules import dialogue_rules_from_config
 
 
 class DiskObservationStore:
@@ -66,10 +65,7 @@ class DiskObservationStore:
                     batch_server_id,
                     batch_server_name,
                 )
-                if (
-                    record.kind.upper() == "CHAT"
-                    and not self.config.chat.collect_for_ai_audit
-                ):
+                if record.kind.upper() != "SERVER_LOG":
                     continue
                 if not record.server_id:
                     record.server_id = batch_server_id
@@ -123,10 +119,7 @@ class DiskObservationStore:
         # once it encounters records beyond the window upper bound.
         end_ms = int(now * 1000)
         limit = max(1, max_records or self.config.report.max_records_in_memory)
-        builder = RecentWindowBuilder(
-            limit,
-            dialogue_rules_from_config(self.config.dialogue.custom_rules),
-        )
+        builder = RecentWindowBuilder(limit)
         with self._dedupe_tracker() as seen:
             for path in self._candidate_files(server_id, cutoff_ms):
                 for row in self.codec.read_jsonl_window(path, cutoff_ms, end_ms):

@@ -58,7 +58,7 @@ class MineSentinelReportArtifacts:
             report["_export_file_path"] = str(export_path)
             report["_export_file_name"] = export_path.name
             report.setdefault("ops_notes", [])
-            report["ops_notes"].append(f"完整聊天记录附件：{export_path.name}")
+            report["ops_notes"].append(f"完整审计日志附件：{export_path.name}")
         return report
 
     async def export_report_records(

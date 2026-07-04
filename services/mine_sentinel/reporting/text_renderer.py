@@ -26,7 +26,7 @@ from .labels import DEFAULT_LABELS
 from .presentation import ReportPresentationBuilder
 
 MAX_EVENT_SUMMARIES = 8
-MAX_PLAYER_PROBLEMS = 8
+MAX_LOG_PROBLEMS = 8
 MAX_RISK_LINES = 6
 MAX_ACTIONS = 6
 MAX_INLINE_EVIDENCE_CHARS = 240
@@ -57,7 +57,7 @@ def format_report(report: dict, total_count: int, dedupe_count: int, unique_play
     lines = [
         f"时间范围：{_format_time_window(report)}",
         f"服务器：{_format_servers(report)}",
-        f"完整聊天记录：{_format_attachment(report)}",
+        f"完整审计日志：{_format_attachment(report)}",
         "",
         "一、整体情况",
         _overall_line(
@@ -68,12 +68,12 @@ def format_report(report: dict, total_count: int, dedupe_count: int, unique_play
             duration,
         ),
         "",
-        "二、聊天与事件总结",
+        "二、运行日志与事件总结",
     ]
     _append_numbered(lines, _event_summaries(report, categories, issues, incident_groups))
 
-    lines.extend(["", "三、玩家问题/投诉识别"])
-    lines.extend(_player_problem_lines(report, issues))
+    lines.extend(["", "三、日志异常识别"])
+    lines.extend(_log_problem_lines(issues))
 
     lines.extend(["", "四、风险提醒"])
     for line in _risk_lines(report, issues, immediate, immediate_count):
@@ -92,7 +92,7 @@ def format_report(report: dict, total_count: int, dedupe_count: int, unique_play
     lines.extend(
         [
             "",
-            f"本次总结由 AI 根据完整 {duration}聊天上下文、玩家事件和服务器指标生成。",
+            f"本次总结由 AI 根据完整 {duration}运行日志和事件上下文生成。",
         ]
     )
     return "\n".join(lines)
@@ -105,15 +105,13 @@ def _overall_line(
     immediate_count: int,
     duration: str,
 ) -> str:
-    chat_players = _chat_players(report)
     if immediate_count:
         status = f"发现 {immediate_count} 个需要优先关注的问题"
     else:
         status = "服务器整体稳定，未发现大规模异常"
-    players = chat_players if chat_players != "未知" else "暂无明确发言玩家"
     return (
-        f"过去 {duration}{status}。共有 {unique_players} 名玩家出现记录，"
-        f"其中活跃玩家主要是：\n{players}。"
+        f"过去 {duration}{status}。共记录 {report.get('log_count', total_count)} "
+        "条 Minecraft 运行日志观察。"
     )
 
 
@@ -136,10 +134,10 @@ def _event_summaries(
     if quiet_line and len(items) < MAX_EVENT_SUMMARIES:
         _append_unique(items, seen, quiet_line)
     if groups:
-        return items or ["本窗口未发现需要特别记录的聊天或事件。"]
+        return items or ["本窗口未发现需要特别记录的运行日志或事件。"]
 
     if not items:
-        for finding in report.get("dialogue_findings") or []:
+        for finding in report.get("incident_findings") or []:
             _append_unique(items, seen, _clean_sentence(str(finding)))
             if len(items) >= MAX_EVENT_SUMMARIES:
                 break
@@ -151,6 +149,7 @@ def _event_summaries(
             "bug",
             "cross_server",
             "economy",
+            "community",
             "moderation",
             "suggestion",
         ):
@@ -161,7 +160,7 @@ def _event_summaries(
             if len(items) >= MAX_EVENT_SUMMARIES:
                 break
 
-    return items or ["本窗口未发现需要特别记录的聊天或事件。"]
+    return items or ["本窗口未发现需要特别记录的运行日志或事件。"]
 
 
 def _incident_event_summary(index: int, group: IncidentGroup) -> str:
@@ -180,9 +179,6 @@ def _incident_event_summary(index: int, group: IncidentGroup) -> str:
     locations = _incident_locations(issues)
     if locations and locations != "未知":
         details.append(f"关联位置/后端：{locations}。")
-    metrics = _incident_metric_text(issues)
-    if metrics:
-        details.append(f"同窗口指标：{metrics}。")
     evidence = _incident_evidence(issues)
     if evidence:
         details.append(f"相关上下文：{evidence}")
@@ -229,21 +225,6 @@ def _incident_locations(issues: list[dict[str, Any]]) -> str:
                 seen.add(location)
                 locations.append(location)
     return _format_players(sorted(locations))
-
-
-def _incident_metric_text(issues: list[dict[str, Any]]) -> str:
-    metrics: list[str] = []
-    seen: set[str] = set()
-    for issue in issues:
-        metric = str(issue.get("metric_context_text") or "").strip()
-        if not metric:
-            continue
-        key = _dedupe_key(metric)
-        if key in seen:
-            continue
-        seen.add(key)
-        metrics.append(metric)
-    return "；".join(metrics[:2])
 
 
 def _incident_evidence(issues: list[dict[str, Any]]) -> str:
@@ -322,11 +303,7 @@ def _incident_action(issues: list[dict[str, Any]]) -> str:
 
 def _category_event_summary(item: str) -> str:
     raw = item.strip()
-    if raw.startswith("[") or raw.startswith("dialogue:"):
-        return ""
-    if raw.startswith("server_metrics:"):
-        return ""
-    if "SERVER_METRICS" in raw or "指标" in raw:
+    if raw.startswith("["):
         return ""
     text = _clean_sentence(raw)
     if not text:
@@ -334,32 +311,20 @@ def _category_event_summary(item: str) -> str:
     return text
 
 
-def _player_problem_lines(report: dict, issues: list[dict[str, Any]]) -> list[str]:
+def _log_problem_lines(issues: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
-    issue_players: set[str] = set()
     for group in _INCIDENT_GROUPER.group(
         _ISSUE_POLICY.actionable_issues(issues)
-    )[:MAX_PLAYER_PROBLEMS]:
+    )[:MAX_LOG_PROBLEMS]:
         group_issues = list(group.issues)
-        players = _incident_players(group_issues)
-        if players == "未知":
-            continue
-        for issue in group_issues:
-            for player in issue.get("players") or []:
-                issue_players.add(str(player))
         labels = _incident_labels(group_issues)
         title = "、".join(labels[:6]) or _incident_title(group, labels)
         action = _incident_action(group_issues) or "建议管理员人工复核上下文。"
-        metric = _incident_metric_text(group_issues)
-        metric_part = f"，{metric}" if metric else ""
-        lines.append(f"- {players}：集中反馈{title}{metric_part}，{action}")
+        locations = _incident_locations(group_issues)
+        location_part = f"（{locations}）" if locations != "未知" else ""
+        lines.append(f"- {title}{location_part}，{action}")
 
-    for player in (report.get("chat_players") or [])[:MAX_PLAYER_PROBLEMS]:
-        player = str(player)
-        if player and player not in issue_players and len(lines) < MAX_PLAYER_PROBLEMS:
-            lines.append(f"- {player}：没有发现需要管理员介入的异常行为。")
-
-    return lines or ["- 没有发现玩家要求管理员紧急处理的未解决问题。"]
+    return lines or ["- 没有发现需要管理员紧急处理的运行日志异常。"]
 
 
 def _risk_lines(
@@ -374,17 +339,19 @@ def _risk_lines(
         for issue in issues
         if _ISSUE_POLICY.is_moderation_issue(issue)
     ]
-    if moderation_issues:
-        lines.append("检测到聊天冲突、作弊/破坏举报或管理相关反馈，建议人工复核上下文。")
+    if any(str(issue.get("category") or "").lower() == "community" for issue in moderation_issues):
+        lines.append("检测到社区管理相关日志，建议按服务器管理流程复核处理。")
+    elif moderation_issues:
+        lines.append("检测到权限/登录相关风险信号，建议人工复核运行日志上下文。")
     else:
-        lines.append("没有检测到明显辱骂、刷屏、广告或恶意引战。")
+        lines.append("没有检测到明显重复报错、严重异常或持续性告警。")
 
     if immediate:
         lines.append(f"有 {immediate_count} 个事故级问题需要优先确认。")
     else:
-        lines.append("没有发现玩家要求管理员紧急处理的未解决问题。")
+        lines.append("没有发现需要管理员紧急处理的未解决运行日志异常。")
 
-    if any(issue.get("tag") == "performance_lag" for issue in issues):
+    if any(issue.get("tag") == "server_log_performance" for issue in issues):
         lines.append("卡顿反馈值得关注，建议下次巡检继续跟踪 TPS、内存、实体数量和红石机器。")
 
     for note in report.get("ops_notes") or []:
@@ -409,8 +376,8 @@ def _action_lines(issues: list[dict[str, Any]]) -> list[str]:
     if actions:
         return actions
     return [
-        "继续观察玩家反馈和服务器指标。",
-        "保留完整 JSONL 附件，必要时按玩家名和时间点人工复核。",
+        "继续观察服务器运行日志和关键错误线索。",
+        "保留完整 JSONL 附件，必要时按服务器、日志文件和时间点人工复核。",
     ]
 
 
@@ -455,13 +422,6 @@ def _format_attachment(report: dict) -> str:
     if name:
         return f"已保存为附件 {name}"
     return "未生成附件"
-
-
-def _chat_players(report: dict) -> str:
-    text = str(report.get("chat_players_text") or "").strip()
-    if text and text != "未知":
-        return text
-    return _format_players(report.get("chat_players") or [])
 
 
 def _format_players(players: list[str]) -> str:

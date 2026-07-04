@@ -10,19 +10,15 @@ from typing import Any
 INCIDENT_MERGE_WINDOW_MS = 5 * 60 * 1000
 ACTIONABLE_SEVERITIES = {"medium", "high", "critical"}
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-MODERATION_TAGS = {"cheat_or_grief_report", "chat_conflict"}
-SUGGESTION_TAGS = {"player_suggestion"}
+COMMUNITY_TAGS = {"server_log_community"}
+MODERATION_TAGS = {"server_log_auth", "server_log_permission"}
+SUGGESTION_TAGS = set()
 ABUSE_HINTS = (
-    "复制",
-    "dupe",
-    "刷物品",
-    "外挂",
-    "作弊",
-    "飞行",
-    "透视",
-    "举报",
-    "炸家",
-    "偷东西",
+    "permission",
+    "auth",
+    "whitelist",
+    "login",
+    "权限",
 )
 
 
@@ -77,14 +73,10 @@ class IssuePolicy:
         ]
 
     @staticmethod
-    def is_metric_issue(issue: dict[str, Any]) -> bool:
-        return is_metric_issue(issue)
-
-    @staticmethod
     def is_moderation_issue(issue: dict[str, Any]) -> bool:
         return (
-            str(issue.get("category") or "").lower() == "moderation"
-            or str(issue.get("tag") or "").lower() == "chat_conflict"
+            str(issue.get("category") or "").lower() in {"community", "moderation"}
+            or str(issue.get("tag") or "").lower() in COMMUNITY_TAGS | MODERATION_TAGS
         )
 
 
@@ -102,8 +94,6 @@ class IncidentGrouper:
         # roughly O(N×candidates_per_scope)).
         index: dict[tuple[str, str], list[IncidentGroup]] = {}
         for issue in sorted(issues, key=issue_sort_key):
-            if is_metric_issue(issue):
-                continue
             family = issue_family(issue)
             scopes = set(issue_scopes(issue))
             # Gather candidate groups that share at least one scope.
@@ -151,16 +141,7 @@ class IncidentGrouper:
 
 
 def is_passive_issue(issue: dict[str, Any]) -> bool:
-    return str(issue.get("category") or "").lower() == "daily" or is_metric_issue(issue)
-
-
-def is_metric_issue(issue: dict[str, Any]) -> bool:
-    tag = str(issue.get("tag") or "").lower()
-    source_tag = str(issue.get("source_tag") or "").lower()
-    category = str(issue.get("category") or "").lower()
-    return tag == "server_metrics" or (
-        category == "daily" and ("metric" in tag or "metric" in source_tag)
-    )
+    return str(issue.get("category") or "").lower() == "daily"
 
 
 def issue_sort_key(issue: dict[str, Any]) -> tuple[int, int, str]:
@@ -186,6 +167,8 @@ def issue_time_bounds(issue: dict[str, Any]) -> tuple[int, int]:
 def issue_family(issue: dict[str, Any]) -> str:
     category = str(issue.get("category") or "").lower()
     tag = str(issue.get("tag") or "").lower()
+    if category == "community" or tag in COMMUNITY_TAGS:
+        return "community"
     if category == "moderation" or tag in MODERATION_TAGS:
         return "moderation"
     if tag == "feature_broken" and looks_like_abuse(issue):
@@ -199,7 +182,7 @@ def looks_like_abuse(issue: dict[str, Any]) -> bool:
     text_parts = [
         str(issue.get("tag") or ""),
         str(issue.get("title") or ""),
-        " ".join(str(term) for term in issue.get("dialogue_terms") or []),
+        " ".join(str(term) for term in issue.get("issue_terms") or []),
         " ".join(str(sample) for sample in issue.get("evidence_samples") or []),
     ]
     text = " ".join(text_parts).lower()

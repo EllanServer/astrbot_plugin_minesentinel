@@ -12,7 +12,7 @@ def sample_records_for_ai(
     max_records: int,
     fallback: dict[str, Any] | None = None,
 ) -> list[ObservationRecord]:
-    """Keep the AI prompt small while preserving issue-relevant chat evidence."""
+    """Keep the AI prompt small while preserving issue-relevant log evidence."""
 
     if len(records) <= max_records:
         return list(records)
@@ -74,21 +74,12 @@ def _priority_records(
 
 
 def _focus_from_fallback(fallback: dict[str, Any]) -> dict[str, set[str]]:
-    players: set[str] = set()
     terms: set[str] = set()
     evidence: set[str] = set()
     for issue in fallback.get("issues") or []:
         if not isinstance(issue, dict):
             continue
-        for field in ("players", "mentioned_players"):
-            values = issue.get(field)
-            if not isinstance(values, list):
-                continue
-            for player in values:
-                value = _norm(player)
-                if value:
-                    players.add(value)
-        for term in issue.get("dialogue_terms") or []:
+        for term in issue.get("issue_terms") or []:
             value = _norm(term)
             if value:
                 terms.add(value)
@@ -101,7 +92,6 @@ def _focus_from_fallback(fallback: dict[str, Any]) -> dict[str, set[str]]:
                 evidence.add(value)
 
     return {
-        "players": players,
         "terms": terms,
         "evidence": evidence,
     }
@@ -110,13 +100,28 @@ def _focus_from_fallback(fallback: dict[str, Any]) -> dict[str, set[str]]:
 def _record_score(record: ObservationRecord, focus: dict[str, set[str]]) -> float:
     text = _norm(f"{record.content} {' '.join(record.tags)}")
     evidence_text = _norm(record.evidence_text())
-    player = _norm(record.player_name or record.identity)
 
     score = 0.0
-    if record.kind == "CHAT":
+    if record.kind == "SERVER_LOG":
         score += 1.0
-    if player and player in focus["players"]:
-        score += 5.0
+        if any(
+            marker in text
+            for marker in (
+                "error",
+                "exception",
+                "failed",
+                "fatal",
+                "severe",
+                "warn",
+                "warning",
+                "loop_suppressed",
+                "报错",
+                "异常",
+                "失败",
+                "超时",
+            )
+        ):
+            score += 4.0
     if any(term and term in text for term in focus["terms"]):
         score += 4.0
     content = _norm(record.content)
@@ -125,9 +130,7 @@ def _record_score(record: ObservationRecord, focus: dict[str, set[str]]) -> floa
         for sample in focus["evidence"]
     ):
         score += 8.0
-    if any(player and player in text for player in focus["players"]):
-        score += 2.0
-    if record.kind != "CHAT" and score > 0:
+    if record.kind != "SERVER_LOG" and score > 0:
         score *= 0.5
     return score
 
