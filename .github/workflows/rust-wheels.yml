@@ -74,6 +74,21 @@ jobs:
             python -c "import pathlib, sys; print(f'value={pathlib.Path(sys.executable).as_posix()}')" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Rust compile check
+        shell: bash
+        run: |
+          set +e
+          cargo check --manifest-path rust/Cargo.toml --target "${{ matrix.platform.target }}" 2>&1 | tee rust-check.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "### cargo check · ${{ matrix.platform.label }} · cp${{ matrix.python-version }}"
+            echo
+            echo '```text'
+            tail -n 160 rust-check.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
       - name: Build wheel (maturin)
         uses: PyO3/maturin-action@v1
         with:
