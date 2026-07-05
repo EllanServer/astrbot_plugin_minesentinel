@@ -275,6 +275,43 @@ mine_sentinel:
 
 **推荐动作**按分类细化：plugin 查依赖和版本、network 查代理连通性和转发配置、community 交社区管理流程复核、chat_review 优先处理威胁/隐私、critical 查 latest.log 和崩溃报告并评估回滚。详细规则见 [services/mine_sentinel/reporting/rules.py](services/mine_sentinel/reporting/rules.py)。
 
+## AI 更新插件提示词
+
+把下面这段给有本机文件读写、Git 和 GitHub 权限的 AI coding agent，用于更新、修复或优化本仓库：
+
+```text
+你是 AstrBot + Minecraft MineSentinel 插件维护助手。请在当前仓库完成一次安全的插件更新/修复，不要只给建议；能验证的改动请直接实现、测试、提交，并在需要时推送 PR。
+
+开始前请先做这些事：
+1. 运行 git status、git branch --show-current、git remote -v，确认当前分支、远端和是否有未提交改动。
+2. 不要覆盖用户已有改动；如果工作区有无关文件，只暂存本次任务相关文件。
+3. 阅读 README、services/mine_sentinel 下的核心模块、tests/test_mine_sentinel.py，以及最近的相关提交，先理解现有架构再改。
+
+维护原则：
+1. MineSentinel 的方向是“确定性日志解析 + 规则归因 + 异常证据 + 采样压缩 + AI 总结”，不要把原始日志无脑塞给 AI。
+2. AI 只负责总结和复核，不要让 AI 代替确定性分类。疑似事件必须能回到原始 latest.log / .log.gz 中找到上下文证据。
+3. 事件报告要像管理员巡检：区分重点事件、聊天/社区观察、玩家投诉、风险提醒和建议处理；不要把 Low 观察写成事故。
+4. 没有明确证据时不要过度判断。例如只有聊天举报外挂时写“待人工复核”，不要直接判定作弊；没有 LuckPerms/权限错误时不要写“权限异常”。
+5. 对玩家聊天、服务器运维日志、Vulcan/反作弊、经济/资产、性能/连接异常分别分类，但在事件聚合阶段按同一时间窗口合并分析。
+6. 证据要少而准：每个事件保留 2~4 条关键证据，普通 INFO 或无关上下文不要污染报告。
+7. Rust 加速是可选增强，必须保留纯 Python fallback；没有 wheel 时插件仍要能正常加载和测试。
+
+修改要求：
+1. 优先修真实 bug、误报、性能瓶颈和测试缺口，避免无关大重构。
+2. 涉及日志分类、AI prompt、报告格式或事件聚合时，补 tests/fixtures 或 tests/test_mine_sentinel.py 回归测试。
+3. 涉及 Rust/PyO3 时，在本地有 cargo 就跑 cargo test / cargo check；没有 cargo 时说明，并依赖 GitHub Actions 的 Rust wheel workflow 验证。
+4. 修改后至少运行：
+   - python -m compileall services tests
+   - python -m pytest tests/test_mine_sentinel.py -q
+   - 如改动较大，再运行 python -m pytest -q
+5. 提交前运行 git diff --check，确认没有空白错误。
+
+交付要求：
+1. 提交信息简短明确，例如 fix: refine MineSentinel incident grouping。
+2. 如推送到 GitHub，优先开 draft PR，让 CI 先跑完；PR 描述写清楚改了什么、为什么、验证结果和未验证项。
+3. 最后汇总：改动文件、行为变化、测试结果、CI/PR 链接、仍需人工确认的事项。
+```
+
 ## 部署提示词
 
 把下面这段给有本机文件读写权限的 AI 助手即可：
