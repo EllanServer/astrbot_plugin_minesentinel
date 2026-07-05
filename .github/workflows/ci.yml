@@ -43,19 +43,18 @@ jobs:
 
       - name: Import smoke test
         run: |
-          # 验证关键模块能 import（CI 不装完整 AstrBot，复用测试文件的 stub 注入）
+          # 验证核心子模块能 import（这些不依赖完整 AstrBot 运行时）
+          # 不 import tests.test_mine_sentinel，避免其注入 mine_sentinel_rs stub
+          # 污染 _HAS_RUST 判定。
           python -c "
-          import tests.test_mine_sentinel  # noqa: F401  注入 astrbot stubs
-          from services.mine_sentinel import MineSentinelService
+          from services.mine_sentinel.models import MineSentinelConfig
           from services.mine_sentinel.storage.codec import ObservationRecordCodec
           from services.mine_sentinel.observation_priority import observation_priority_score
           from services.mine_sentinel.template_miner import get_template_miner
           from services.mine_sentinel.anomaly_detector import get_anomaly_detector
-          # 验证无 Rust 时 codec 可初始化且 uses_native=False
-          from services.mine_sentinel.models import MineSentinelConfig
           cfg = MineSentinelConfig.from_dict({})
           codec = ObservationRecordCodec(cfg)
-          assert codec.uses_native is False, '无 Rust 时 uses_native 应为 False'
+          assert codec.uses_native is False, f'无 Rust 时 uses_native 应为 False，实际 {codec.uses_native}'
           print('Import smoke test OK (no Rust, uses_native=False)')
           "
 
