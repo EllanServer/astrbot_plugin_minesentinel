@@ -20,6 +20,12 @@ from .incidents import IncidentGroup, issue_sort_key
 def incident_title(group: IncidentGroup, labels: list[str]) -> str:
     if group.family == "community":
         return labels[0] if labels else "社区管理相关日志"
+    if group.family == "chat_review":
+        return labels[0] if labels else "聊天审查相关日志"
+    if group.family == "player_feedback":
+        return labels[0] if labels else "玩家反馈相关日志"
+    if group.family == "community_ops":
+        return labels[0] if labels else "社区运营相关日志"
     if group.family == "moderation":
         return "权限/登录相关运行日志异常"
     if group.family == "suggestion":

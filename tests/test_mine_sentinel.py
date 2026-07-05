@@ -725,6 +725,264 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertIn("崩溃报告", action)
         self.assertIn("回滚", action)
 
+    # --- 新增分类：chat_review / player_feedback / community_ops ---
+    def test_chat_review_classifies_profanity(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread]: <Steve> swore in chat (profanity detected)",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "chat_review")
+        self.assertEqual(builder.tag(record), "server_log_chat_review")
+
+    def test_chat_review_classifies_advertising_link(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread]: <Alex> posted advertising link discord.gg/xxxx",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "chat_review")
+
+    def test_chat_review_classifies_chinese_abuse(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread]: <Notch> 在聊天中辱骂其他玩家",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "chat_review")
+
+    def test_chat_review_word_boundary_ad_does_not_match_load(self):
+        """短词 'ad' 不应匹配 'load'/'road' 等普通英文词（词边界保护）。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/INFO]: Failed to load datapack road builder",
+            level="INFO",
+        )
+        # 不应被误判为 chat_review
+        self.assertNotEqual(builder.classify(record), "chat_review")
+
+    def test_chat_review_word_boundary_ad_matches_standalone_ad(self):
+        """独立的 'ad' 词应当匹配 chat_review。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread]: <Spammer> posted an ad for shop",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "chat_review")
+
+    def test_chat_review_threat_raises_to_high_and_alerts(self):
+        """chat_review 命中威胁敏感词应提级 high 并强制告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread]: <BadActor> made a threat against another player",
+            level="INFO",
+        )
+        report = builder.build([record], 60, "survival")
+        chat_issues = [
+            issue for issue in report["issues"] if issue["category"] == "chat_review"
+        ]
+        self.assertTrue(chat_issues, "expected chat_review issue")
+        self.assertEqual(chat_issues[0]["severity"], "high")
+        self.assertTrue(chat_issues[0]["should_alert"])
+
+    def test_chat_review_low_does_not_alert(self):
+        """chat_review 低严重度（普通聊天）不应告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "low", "min_evidence_count": 1}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread]: <Steve> said hello in chat",
+            level="INFO",
+        )
+        report = builder.build([record], 60, "survival")
+        chat_issues = [
+            issue for issue in report["issues"] if issue["category"] == "chat_review"
+        ]
+        if chat_issues:
+            # 普通聊天 severity=medium（chat_review 单条即 medium），
+            # 但 chat_review 默认不告警（需 high/5条/敏感词）
+            self.assertFalse(
+                chat_issues[0]["should_alert"],
+                "普通 chat_review 不应告警",
+            )
+
+    def test_chat_review_five_records_alert(self):
+        """chat_review evidence_count >= 5 应当告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
+        )
+        builder = HeuristicReportBuilder(config)
+        records = [
+            self._make_record(
+                f"[Async Chat Thread]: <Bot{_}> posted advertising link in chat",
+                level="INFO",
+            )
+            for _ in range(5)
+        ]
+        report = builder.build(records, 60, "survival")
+        chat_issues = [
+            issue for issue in report["issues"] if issue["category"] == "chat_review"
+        ]
+        self.assertTrue(chat_issues)
+        self.assertTrue(
+            chat_issues[0]["should_alert"],
+            "5 条 chat_review 应当告警",
+        )
+
+    def test_player_feedback_classifies_suggestion(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread]: <Steve> 建议加个新的副本玩法",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "player_feedback")
+        self.assertEqual(builder.tag(record), "server_log_player_feedback")
+
+    def test_player_feedback_does_not_alert(self):
+        """player_feedback 通常不告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "low", "min_evidence_count": 1}}
+        )
+        builder = HeuristicReportBuilder(config)
+        records = [
+            self._make_record(
+                f"[Async Chat Thread]: <Player{_}> 希望能不能优化一下商店",
+                level="INFO",
+            )
+            for _ in range(5)
+        ]
+        report = builder.build(records, 60, "survival")
+        feedback_issues = [
+            issue for issue in report["issues"] if issue["category"] == "player_feedback"
+        ]
+        if feedback_issues:
+            self.assertFalse(
+                all(issue["should_alert"] for issue in feedback_issues),
+                "player_feedback 不应告警",
+            )
+
+    def test_community_ops_classifies_event(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/INFO]: Summer event activity started, reward dispatched",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "community_ops")
+        self.assertEqual(builder.tag(record), "server_log_community_ops")
+
+    def test_community_ops_severe_raises_to_high(self):
+        """community_ops 命中事故关键词应提级 high 并告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/ERROR]: 奖励发放异常，活动事故导致大范围玩家不满",
+            level="ERROR",
+        )
+        report = builder.build([record], 60, "survival")
+        ops_issues = [
+            issue for issue in report["issues"] if issue["category"] == "community_ops"
+        ]
+        self.assertTrue(ops_issues, "expected community_ops issue")
+        self.assertEqual(ops_issues[0]["severity"], "high")
+        self.assertTrue(ops_issues[0]["should_alert"])
+
+    def test_community_ops_normal_does_not_alert(self):
+        """普通 community_ops 公告不应告警。"""
+        config = MineSentinelConfig.from_dict(
+            {"alert": {"enabled": True, "min_severity": "low", "min_evidence_count": 1}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/INFO]: 新公告：本周活动开启，请查看奖励详情",
+            level="INFO",
+        )
+        report = builder.build([record], 60, "survival")
+        ops_issues = [
+            issue for issue in report["issues"] if issue["category"] == "community_ops"
+        ]
+        if ops_issues:
+            self.assertFalse(
+                ops_issues[0]["should_alert"],
+                "普通 community_ops 不应告警",
+            )
+
+    def test_classify_priority_chat_review_beats_player_feedback(self):
+        """chat_review 优先级高于 player_feedback。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # 同时包含建议和辱骂 → 应归 chat_review
+        record = self._make_record(
+            "[Async Chat Thread]: <Troll> 建议你们都去死（辱骂+威胁）",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "chat_review")
+
+    def test_classify_priority_community_beats_chat_review(self):
+        """community 优先级高于 chat_review。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        # 同时包含作弊和聊天 → 应归 community
+        record = self._make_record(
+            "[Server thread/WARN]: Anticheat flagged Steve for cheat, chat log reviewed",
+            level="WARN",
+        )
+        self.assertEqual(builder.classify(record), "community")
+
+    def test_ops_notes_include_chat_review_feedback_ops_counters(self):
+        """ops_notes 应包含 chat_review/player_feedback/community_ops 计数。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record(
+                "[Async Chat Thread]: <A> 辱骂玩家",
+                level="INFO",
+                server_id="survival",
+            ),
+            self._make_record(
+                "[Async Chat Thread]: <B> 建议加个新功能",
+                level="INFO",
+                server_id="survival",
+            ),
+            self._make_record(
+                "[Server thread/INFO]: 活动公告：奖励已发放",
+                level="INFO",
+                server_id="survival",
+            ),
+        ]
+        report = builder.build(records, 60)
+        counters = report["counters"]
+        self.assertGreaterEqual(counters["chat_review"], 1)
+        self.assertGreaterEqual(counters["player_feedback"], 1)
+        self.assertGreaterEqual(counters["community_ops"], 1)
+        joined = " ".join(report["ops_notes"])
+        self.assertIn("聊天审查", joined)
+        self.assertIn("玩家建议", joined)
+        self.assertIn("社区运营", joined)
+
+    def test_suggest_action_for_new_categories(self):
+        """新分类应有针对性的推荐动作。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        cases = [
+            ("chat_review", "server_log_chat_review", "聊天审查流程"),
+            ("player_feedback", "server_log_player_feedback", "工单"),
+            ("community_ops", "server_log_community_ops", "社区运营"),
+        ]
+        for category, tag, keyword in cases:
+            action = builder._suggest_action(category, tag, "medium")
+            self.assertIn(keyword, action, f"category={category} action missing '{keyword}'")
+
+    def test_categories_dict_includes_new_categories(self):
+        """build 输出的 categories 应包含新分类键。"""
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record("[Server thread/INFO]: Done!", level="INFO")
+        report = builder.build([record], 60, "survival")
+        for key in ("chat_review", "player_feedback", "community_ops"):
+            self.assertIn(key, report["categories"])
+            self.assertIsInstance(report["categories"][key], list)
+
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
     """Tests for the hourly summary mode (no polling, per-hour log read + AI integrate)."""

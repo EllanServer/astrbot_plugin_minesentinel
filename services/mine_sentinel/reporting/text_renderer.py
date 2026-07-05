@@ -146,13 +146,16 @@ def _event_summaries(
         for key in (
             "daily",
             "complaint",
+            "bug",
             "network",
             "plugin",
-            "bug",
-            "cross_server",
             "economy",
             "community",
+            "chat_review",
+            "player_feedback",
+            "community_ops",
             "moderation",
+            "cross_server",
             "suggestion",
         ):
             for item in categories.get(key) or []:
@@ -341,11 +344,20 @@ def _risk_lines(
         for issue in issues
         if _ISSUE_POLICY.is_moderation_issue(issue)
     ]
-    if any(str(issue.get("category") or "").lower() == "community" for issue in moderation_issues):
+    categories_seen = {
+        str(issue.get("category") or "").lower() for issue in moderation_issues
+    }
+    if "community" in categories_seen:
         lines.append("检测到社区管理相关日志，建议按服务器管理流程复核处理。")
-    elif moderation_issues:
+    if "chat_review" in categories_seen:
+        lines.append("检测到聊天审查相关日志，建议复核聊天原文、频道来源与是否涉及辱骂/广告/威胁。")
+    if "community_ops" in categories_seen:
+        lines.append("检测到社区运营相关日志，建议跟进活动/奖励/公告上下文，确认是否存在争议或事故。")
+    if "player_feedback" in categories_seen:
+        lines.append("检测到玩家建议/反馈，建议整理为运营工单汇总评估。")
+    if "moderation" in categories_seen:
         lines.append("检测到权限/登录相关风险信号，建议人工复核运行日志上下文。")
-    else:
+    if not lines:
         lines.append("没有检测到明显重复报错、严重异常或持续性告警。")
 
     if immediate:

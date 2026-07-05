@@ -1,22 +1,29 @@
 """Rule-based analysis for Minecraft runtime logs.
 
 分类优先级（先命中先返回）：
-    community > complaint > network > plugin > cross_server > moderation > bug > economy > daily
+    community > chat_review > player_feedback > community_ops
+    > complaint > network > plugin > cross_server > moderation > bug > economy > daily
 
 严重级别：
     critical: 崩溃/OOM/watchdog/服务停止/代理大面积不可用
     high:     循环刷屏、多条 ERROR、插件加载失败、多服务器受影响、性能问题重复
+              chat_review 出现威胁/隐私泄露/严重骚扰、community_ops 活动事故
     medium:   单条 ERROR、多条 WARN、单次性能警告、权限/登录/网络异常
-    low:      单条 WARN、日常 join/quit/start/stop、无明显异常的普通日志
+              单次聊天违规/广告/可疑链接、活动奖励争议
+    low:      单条 WARN、日常 join/quit/start/stop、普通玩家建议、普通活动公告
 
 告警策略：
     critical 直告；high 默认 evidence_count >= min_evidence_count；
-    medium 仅在多服务器/多后端或证据数较多时告警；low 不告警。
+    medium 仅在多服务器/多后端、证据数较多或命中敏感词时告警；low 不告警。
+    chat_review 默认不告警，除非 severity>=high / evidence_count>=5 / 命中威胁/开盒；
+    player_feedback 通常不告警；community_ops 仅活动事故/奖励异常/大范围不满才告警。
 """
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
+from functools import lru_cache
 from typing import Any
 
 from ..models import MineSentinelConfig, ObservationRecord
@@ -34,7 +41,6 @@ CATEGORY_KEYS = {
         "joined",
         "quit",
         "left the game",
-        "lost connection",
         "connected",
         "disconnected",
     ),
@@ -80,94 +86,6 @@ CATEGORY_KEYS = {
         "警告",
         "崩溃",
     ),
-    "economy": (
-        "economy",
-        "vault",
-        "shop",
-        "money",
-        "coin",
-        "balance",
-        "pay",
-        "sell",
-        "buy",
-        "auction",
-        "market",
-        "trade",
-        "商店",
-        "经济",
-        "金币",
-        "余额",
-        "交易",
-        "拍卖",
-    ),
-    "community": (
-        "ban",
-        "banned",
-        "kick",
-        "kicked",
-        "mute",
-        "muted",
-        "report",
-        "reported",
-        "spam",
-        "profanity",
-        "grief",
-        "griefing",
-        "cheat",
-        "cheating",
-        "anticheat",
-        "anti-cheat",
-        "xray",
-        "violation",
-        "vl",
-        "kill aura",
-        "killaura",
-        "封禁",
-        "禁言",
-        "踢出",
-        "作弊",
-        "外挂",
-        "举报",
-        "刷屏",
-        "破坏",
-    ),
-    "moderation": (
-        "whitelist",
-        "permission",
-        "permissions",
-        "auth",
-        "login",
-        "logged in",
-        "logged out",
-        "premium",
-        "offline mode",
-        "online mode",
-        "uuid",
-        "session",
-        "白名单",
-        "权限",
-        "登录",
-        "认证",
-        "正版验证",
-    ),
-    "suggestion": (),
-    "cross_server": (
-        "velocity",
-        "bungeecord",
-        "bungee",
-        "proxy",
-        "backend",
-        "server switch",
-        "forwarding",
-        "modern forwarding",
-        "player forwarding",
-        "ip forwarding",
-        "connection request",
-        "转发",
-        "后端",
-        "代理",
-        "跨服",
-    ),
     "network": (
         "connection reset",
         "connection refused",
@@ -200,11 +118,169 @@ CATEGORY_KEYS = {
         "加载失败",
         "启用失败",
     ),
+    "economy": (
+        "economy",
+        "vault",
+        "shop",
+        "money",
+        "coin",
+        "balance",
+        "pay",
+        "sell",
+        "buy",
+        "auction",
+        "market",
+        "trade",
+        "商店",
+        "经济",
+        "金币",
+        "余额",
+        "交易",
+        "拍卖",
+    ),
+    "community": (
+        "ban",
+        "banned",
+        "kick",
+        "kicked",
+        "mute",
+        "muted",
+        "grief",
+        "cheat",
+        "cheating",
+        "anticheat",
+        "xray",
+        "fly",
+        "speed",
+        "reach",
+        "kill aura",
+        "killaura",
+        "violation",
+        "vl",
+        "封禁",
+        "禁言",
+        "踢出",
+        "作弊",
+        "外挂",
+    ),
+    "chat_review": (
+        # 仅保留违规信号词；generic chat/message/said/tell/msg/whisper/pm
+        # 会命中所有 [Async Chat Thread] 日志，导致 player_feedback 永远不可达，
+        # 且与"辱骂/广告/骚扰/刷屏归 chat_review"的设计意图不符。
+        "swear",
+        "profanity",
+        "insult",
+        "abuse",
+        "harassment",
+        "threat",
+        "toxic",
+        "advertising",
+        "ad",
+        "link",
+        "url",
+        "discord.gg",
+        "辱骂",
+        "骂人",
+        "脏话",
+        "骚扰",
+        "威胁",
+        "广告",
+        "刷屏",
+        "私聊",
+        "举报聊天",
+    ),
+    "player_feedback": (
+        "suggest",
+        "suggestion",
+        "feedback",
+        "idea",
+        "request",
+        "feature request",
+        "proposal",
+        "wish",
+        "hope",
+        "建议",
+        "反馈",
+        "想法",
+        "希望",
+        "能不能",
+        "可不可以",
+        "加个",
+        "新增",
+        "优化",
+        "改进",
+    ),
+    "community_ops": (
+        "event",
+        "activity",
+        "announcement",
+        "notice",
+        "reward",
+        "vote",
+        "poll",
+        "rank",
+        "season",
+        "competition",
+        "discord",
+        "qq group",
+        "community",
+        "运营",
+        "活动",
+        "公告",
+        "通知",
+        "奖励",
+        "投票",
+        "赛季",
+        "比赛",
+        "招募",
+        "群",
+        "社区",
+    ),
+    "moderation": (
+        "whitelist",
+        "permission",
+        "permissions",
+        "auth",
+        "login",
+        "logged in",
+        "logged out",
+        "premium",
+        "offline mode",
+        "online mode",
+        "uuid",
+        "session",
+        "白名单",
+        "权限",
+        "登录",
+        "认证",
+        "正版验证",
+    ),
+    "cross_server": (
+        "velocity",
+        "bungeecord",
+        "bungee",
+        "proxy",
+        "backend",
+        "server switch",
+        "forwarding",
+        "modern forwarding",
+        "player forwarding",
+        "ip forwarding",
+        "connection request",
+        "转发",
+        "后端",
+        "代理",
+        "跨服",
+    ),
+    "suggestion": (),
 }
 
 # 分类匹配优先级（先匹配先返回）。daily 永远兜底。
 CLASSIFY_PRIORITY = (
     "community",
+    "chat_review",
+    "player_feedback",
+    "community_ops",
     "complaint",
     "network",
     "plugin",
@@ -228,7 +304,6 @@ ERROR_MARKERS = (
     "异常",
     "失败",
 )
-COMMUNITY_MARKERS = CATEGORY_KEYS["community"]
 WARN_MARKERS = ("warn", "warning", "警告")
 PERFORMANCE_MARKERS = (
     "can't keep up",
@@ -244,6 +319,10 @@ PERFORMANCE_MARKERS = (
 )
 NETWORK_MARKERS = CATEGORY_KEYS["network"]
 PLUGIN_MARKERS = CATEGORY_KEYS["plugin"]
+COMMUNITY_MARKERS = CATEGORY_KEYS["community"]
+CHAT_REVIEW_MARKERS = CATEGORY_KEYS["chat_review"]
+PLAYER_FEEDBACK_MARKERS = CATEGORY_KEYS["player_feedback"]
+COMMUNITY_OPS_MARKERS = CATEGORY_KEYS["community_ops"]
 CRITICAL_MARKERS = (
     "fatal",
     "severe",
@@ -257,23 +336,54 @@ CRITICAL_MARKERS = (
     "崩溃",
     "内存溢出",
 )
-# community 里的反作弊信号词，命中即提升 community（避免 fly/speed 误伤）
-ANTICHEAT_MARKERS = (
-    "anticheat",
-    "anti-cheat",
-    "violation",
-    "vl",
-    "kill aura",
-    "killaura",
-    "xray",
-    "cheat",
-    "cheating",
-    "grief",
-    "griefing",
-    "作弊",
-    "外挂",
-    "破坏",
+# chat_review 中的敏感词：命中即提级 high 并强制告警
+CHAT_SENSITIVE_MARKERS = (
+    "threat",
+    "dox",
+    "privacy",
+    "威胁",
+    "开盒",
+    "人肉",
+    "隐私",
 )
+# community_ops 中的事故关键词：命中即提级 high
+COMMUNITY_OPS_SEVERE_MARKERS = (
+    "奖励发放异常",
+    "活动配置错误",
+    "活动事故",
+    "大范围玩家不满",
+    "玩家不满",
+    "事故",
+)
+
+
+# --- 关键词匹配辅助 -----------------------------------------------------
+def _is_word_key(key: str) -> bool:
+    """纯 ASCII 单字关键词（如 ad/pm/vl/fly）需要词边界匹配，避免误伤 load/road 等。"""
+    return (
+        bool(key)
+        and key.isascii()
+        and key.isalpha()
+        and " " not in key
+        and len(key) <= 6
+    )
+
+
+@lru_cache(maxsize=256)
+def _word_boundary_regex(keys: tuple[str, ...]) -> "re.Pattern[str] | None":
+    """把短英文词编译成单个词边界正则。"""
+    word_keys = [k for k in keys if _is_word_key(k)]
+    if not word_keys:
+        return None
+    return re.compile(r"\b(?:" + "|".join(re.escape(k) for k in word_keys) + r")\b")
+
+
+def _keys_match(text: str, keys: tuple[str, ...]) -> bool:
+    """关键词匹配：短 ASCII 单词用词边界，其余（短语/中文）用子串。"""
+    word_re = _word_boundary_regex(keys)
+    if word_re is not None and word_re.search(text) is not None:
+        return True
+    return any(key in text for key in keys if not _is_word_key(key))
 
 
 class HeuristicReportBuilder:
@@ -394,26 +504,13 @@ class HeuristicReportBuilder:
     # --- 分类 -------------------------------------------------------------
     def classify(self, record: ObservationRecord) -> str:
         text = self._record_text(record)
-        # community 优先：反作弊信号词命中即归 community
-        if any(marker in text for marker in ANTICHEAT_MARKERS):
-            return "community"
-        # 其他 community 关键词（ban/kick/mute/spam 等）
-        if any(marker in text for marker in COMMUNITY_MARKERS):
-            return "community"
-        if any(marker in text for marker in PERFORMANCE_MARKERS):
-            return "complaint"
-        if any(marker in text for marker in NETWORK_MARKERS):
-            return "network"
-        if any(marker in text for marker in PLUGIN_MARKERS):
-            return "plugin"
-        if any(marker in text for marker in CATEGORY_KEYS["cross_server"]):
-            return "cross_server"
-        if any(marker in text for marker in CATEGORY_KEYS["moderation"]):
-            return "moderation"
-        if any(marker in text for marker in ERROR_MARKERS + WARN_MARKERS):
-            return "bug"
-        if any(marker in text for marker in CATEGORY_KEYS["economy"]):
-            return "economy"
+        # 按 CLASSIFY_PRIORITY 顺序匹配，daily 兜底
+        for category in CLASSIFY_PRIORITY:
+            if category == "daily":
+                continue
+            keys = CATEGORY_KEYS.get(category, ())
+            if _keys_match(text, keys):
+                return category
         return "daily"
 
     # --- Tag --------------------------------------------------------------
@@ -422,22 +519,22 @@ class HeuristicReportBuilder:
         level = str((record.context or {}).get("level") or "").lower()
         if "loop_suppressed" in record.tags:
             return f"server_log_loop_{level or 'warn'}"
-        if any(marker in text for marker in ANTICHEAT_MARKERS):
-            return "server_log_community"
-        if any(marker in text for marker in COMMUNITY_MARKERS):
-            return "server_log_community"
-        if any(marker in text for marker in CATEGORY_KEYS["moderation"]):
-            return "server_log_auth"
-        if any(marker in text for marker in PERFORMANCE_MARKERS):
-            return "server_log_performance"
-        if any(marker in text for marker in NETWORK_MARKERS):
-            return "server_log_network"
-        if any(marker in text for marker in PLUGIN_MARKERS):
-            return "server_log_plugin"
-        if any(marker in text for marker in CATEGORY_KEYS["cross_server"]):
-            return "server_log_cross_server"
-        if any(marker in text for marker in CATEGORY_KEYS["economy"]):
-            return "server_log_economy"
+        # 按分类优先级给 tag
+        category = self.classify(record)
+        tag_map = {
+            "community": "server_log_community",
+            "chat_review": "server_log_chat_review",
+            "player_feedback": "server_log_player_feedback",
+            "community_ops": "server_log_community_ops",
+            "complaint": "server_log_performance",
+            "network": "server_log_network",
+            "plugin": "server_log_plugin",
+            "cross_server": "server_log_cross_server",
+            "moderation": "server_log_auth",
+            "economy": "server_log_economy",
+        }
+        if category in tag_map:
+            return tag_map[category]
         return f"server_log_{level or 'info'}"
 
     def _category_line(self, tag: str, group: list[ObservationRecord]) -> str:
@@ -469,7 +566,13 @@ class HeuristicReportBuilder:
             for marker in ("could not load", "could not enable", "加载失败", "启用失败")
         ):
             return "high" if n >= 1 else "medium"
-        # high: 多条 ERROR
+        # high: chat_review 出现威胁/隐私泄露/严重骚扰
+        if any(marker in text for marker in CHAT_SENSITIVE_MARKERS):
+            return "high"
+        # high: community_ops 活动事故/奖励异常/大范围玩家不满
+        if any(marker in text for marker in COMMUNITY_OPS_SEVERE_MARKERS):
+            return "high"
+        # high: 多条 ERROR（substring，便于匹配 errors/failed 等）
         if any(marker in text for marker in ERROR_MARKERS):
             return "high" if n >= 2 else "medium"
         # high: 性能问题重复出现 >=3
@@ -478,15 +581,24 @@ class HeuristicReportBuilder:
                 return "high"
             return "medium" if n >= 1 else "low"
         # high: 网络错误 >=5
-        if any(marker in text for marker in NETWORK_MARKERS):
+        if _keys_match(text, NETWORK_MARKERS):
             if n >= 5:
                 return "high"
             return "medium" if n >= 2 else "low"
+        # medium: chat_review 单次违规/广告/可疑链接/私聊举报
+        if _keys_match(text, CHAT_REVIEW_MARKERS):
+            return "medium" if n >= 1 else "low"
+        # medium: community_ops 活动/奖励争议
+        if _keys_match(text, COMMUNITY_OPS_MARKERS):
+            return "medium" if n >= 1 else "low"
+        # medium: player_feedback 多名玩家反复提出同类建议
+        if _keys_match(text, PLAYER_FEEDBACK_MARKERS):
+            return "medium" if n >= 3 else "low"
         # medium: 多条 WARN
         if any(marker in text for marker in WARN_MARKERS):
             return "medium" if n >= 2 else "low"
         # medium: 权限/登录/网络异常
-        if any(marker in text for marker in CATEGORY_KEYS["moderation"]):
+        if _keys_match(text, CATEGORY_KEYS["moderation"]):
             return "medium" if n >= 1 else "low"
         return "low"
 
@@ -506,14 +618,27 @@ class HeuristicReportBuilder:
         # critical 直告，不受 evidence_count 限制
         if severity == "critical":
             return True
-        # 循环刷屏 + high/critical 强制告警
         text = " ".join(self._record_text(record) for record in group)
+        # 循环刷屏 + high/critical 强制告警
         if "loop_suppressed" in text and severity in {"high", "critical"}:
             return True
         # 多服务器/多后端 + medium/high 强制告警
         multi_scope = len(affected_servers) >= 2 or len(affected_backends) >= 2
         if multi_scope and severity in {"medium", "high"}:
             return True
+        # chat_review 特殊规则：默认不告警，除非 severity>=high / evidence_count>=5 / 命中敏感词
+        if category == "chat_review":
+            if severity in {"high", "critical"}:
+                return True
+            if any(marker in text for marker in CHAT_SENSITIVE_MARKERS):
+                return True
+            return evidence_count >= 5
+        # player_feedback 通常不告警
+        if category == "player_feedback":
+            return False
+        # community_ops 仅活动事故/奖励异常/大范围不满才告警（已由 severity=high 覆盖）
+        if category == "community_ops":
+            return severity in {"high", "critical"}
         # low 不告警
         if SEVERITY_RANK.get(severity, 0) < SEVERITY_RANK.get(alert.min_severity, 3):
             return False
@@ -529,6 +654,26 @@ class HeuristicReportBuilder:
             )
         if tag.startswith("server_log_loop_"):
             return "优先查看首条样本对应的插件或服务端模块，避免重复报错继续刷屏。"
+        if category == "community":
+            return (
+                "交由社区管理流程复核；确认处罚来源、玩家 UUID、触发规则、证据样本，"
+                "避免误封。"
+            )
+        if category == "chat_review":
+            return (
+                "交由聊天审查流程复核；检查聊天原文、上下文、玩家 UUID、时间点、频道/私聊来源，"
+                "并确认是否涉及辱骂、骚扰、广告、刷屏、威胁或隐私泄露。"
+            )
+        if category == "player_feedback":
+            return (
+                "整理为玩家反馈工单；记录玩家诉求、出现频率、影响范围和可执行性，"
+                "交由社区运营或产品负责人评估。"
+            )
+        if category == "community_ops":
+            return (
+                "交由社区运营跟进；确认活动、公告、奖励、投票、赛季或玩家关系相关上下文，"
+                "评估是否需要发布公告、回复玩家、调整活动规则或同步管理组。"
+            )
         if category == "complaint" or tag == "server_log_performance":
             return (
                 "检查 TPS、MSPT、内存、实体数量、区块加载、红石机器、定时任务和插件耗时；"
@@ -544,30 +689,28 @@ class HeuristicReportBuilder:
                 "检查报错首条堆栈对应插件、插件版本、服务端核心版本、依赖插件是否缺失，"
                 "以及最近是否更新过插件或配置。"
             )
-        if category == "community" or tag == "server_log_community":
+        if category == "cross_server" or tag == "server_log_cross_server":
             return (
-                "交由社区管理流程复核；确认处罚来源、玩家 UUID、触发规则、证据样本，"
-                "避免误封。"
+                "检查 Velocity/Bungee 配置、player-info-forwarding-mode、forwarding secret、"
+                "后端服务器地址、端口、转发协议和防火墙。"
             )
         if category == "moderation" or tag == "server_log_auth":
             return (
                 "检查权限组、白名单、登录插件、正版验证、UUID 模式，"
                 "以及代理和后端的转发配置是否一致。"
             )
-        if category == "cross_server" or tag == "server_log_cross_server":
-            return (
-                "检查 Velocity/Bungee 配置、player-info-forwarding-mode、forwarding secret、"
-                "后端服务器地址、端口、转发协议和防火墙。"
-            )
         if category == "economy" or tag == "server_log_economy":
             return (
                 "检查 Vault、经济插件、商店插件、数据库连接、玩家余额数据和最近交易记录。"
             )
-        if severity == "high":
-            return "尽快查看 Minecraft latest.log 与压缩历史日志，确认根因后再处理。"
+        if severity in {"high", "critical"}:
+            return (
+                "优先检查 latest.log、压缩历史日志、崩溃报告、最近部署/重启/插件更新记录，"
+                "并评估是否需要回滚。"
+            )
         if severity == "medium":
-            return "继续观察同类 WARN/ERROR 是否扩大，必要时按日志文件和时间点人工复核。"
-        return "持续观察运行日志即可。"
+            return "继续观察同类 WARN/ERROR 是否扩大，并保留样本用于后续排查。"
+        return "持续观察，无需立即处理。"
 
     # --- 运维备注（增强版）------------------------------------------------
     def _ops_notes(
@@ -584,6 +727,9 @@ class HeuristicReportBuilder:
             "performance": 0,
             "network": 0,
             "plugin": 0,
+            "chat_review": 0,
+            "player_feedback": 0,
+            "community_ops": 0,
             "loop_suppressed": 0,
             "affected_servers": 0,
             "affected_backends": 0,
@@ -610,10 +756,16 @@ class HeuristicReportBuilder:
                 counters["warn"] += 1
             if any(marker in text for marker in PERFORMANCE_MARKERS):
                 counters["performance"] += 1
-            if any(marker in text for marker in NETWORK_MARKERS):
+            if _keys_match(text, NETWORK_MARKERS):
                 counters["network"] += 1
-            if any(marker in text for marker in PLUGIN_MARKERS):
+            if _keys_match(text, PLUGIN_MARKERS):
                 counters["plugin"] += 1
+            if _keys_match(text, CHAT_REVIEW_MARKERS):
+                counters["chat_review"] += 1
+            if _keys_match(text, PLAYER_FEEDBACK_MARKERS):
+                counters["player_feedback"] += 1
+            if _keys_match(text, COMMUNITY_OPS_MARKERS):
+                counters["community_ops"] += 1
 
         affected_servers_set: set[str] = set()
         affected_backends_set: set[str] = set()
@@ -636,6 +788,16 @@ class HeuristicReportBuilder:
             counter_parts.append(f"PLUGIN {counters['plugin']} 条")
         if counter_parts:
             notes.append("窗口内 " + "，".join(counter_parts) + "。")
+
+        ops_parts = []
+        if counters["chat_review"]:
+            ops_parts.append(f"聊天审查 {counters['chat_review']} 条")
+        if counters["player_feedback"]:
+            ops_parts.append(f"玩家建议 {counters['player_feedback']} 条")
+        if counters["community_ops"]:
+            ops_parts.append(f"社区运营 {counters['community_ops']} 条")
+        if ops_parts:
+            notes.append("窗口内 " + "，".join(ops_parts) + "。")
 
         scope_parts = []
         if counters["affected_servers"]:
@@ -664,37 +826,65 @@ class HeuristicReportBuilder:
 
     # --- 辅助 -------------------------------------------------------------
     def _categories_dict(self, categories: dict[str, list[str]]) -> dict[str, list[str]]:
-        """按固定顺序输出 categories，包含新增的 network/plugin。"""
+        """按固定顺序输出 categories，包含 network/plugin/chat_review/player_feedback/community_ops。"""
         return {
             "daily": categories.get("daily", []),
             "complaint": categories.get("complaint", []),
+            "bug": categories.get("bug", []),
             "network": categories.get("network", []),
             "plugin": categories.get("plugin", []),
-            "cross_server": categories.get("cross_server", []),
-            "moderation": categories.get("moderation", []),
-            "bug": categories.get("bug", []),
             "economy": categories.get("economy", []),
             "community": categories.get("community", []),
+            "chat_review": categories.get("chat_review", []),
+            "player_feedback": categories.get("player_feedback", []),
+            "community_ops": categories.get("community_ops", []),
+            "moderation": categories.get("moderation", []),
+            "cross_server": categories.get("cross_server", []),
             "suggestion": categories.get("suggestion", []),
         }
 
     @staticmethod
     def _issue_terms(group: list[ObservationRecord]) -> list[str]:
         terms: list[str] = []
-        all_markers = (
-            CRITICAL_MARKERS
-            + ERROR_MARKERS
-            + WARN_MARKERS
-            + PERFORMANCE_MARKERS
-            + NETWORK_MARKERS
-            + PLUGIN_MARKERS
-            + COMMUNITY_MARKERS
-        )
-        for marker in all_markers:
+        # severity markers 用 substring（便于匹配 errors/failed 等）
+        substring_markers = CRITICAL_MARKERS + ERROR_MARKERS + WARN_MARKERS + PERFORMANCE_MARKERS
+        for marker in substring_markers:
             if any(marker in HeuristicReportBuilder._record_text(record) for record in group):
                 terms.append(marker)
             if len(terms) >= 8:
-                break
+                return terms
+        # 分类 markers 用 _keys_match（与 classify 一致）
+        category_marker_groups = (
+            NETWORK_MARKERS,
+            PLUGIN_MARKERS,
+            COMMUNITY_MARKERS,
+            CHAT_REVIEW_MARKERS,
+            PLAYER_FEEDBACK_MARKERS,
+            COMMUNITY_OPS_MARKERS,
+        )
+        combined_text = " ".join(
+            HeuristicReportBuilder._record_text(record) for record in group
+        )
+        for markers in category_marker_groups:
+            for marker in markers:
+                if _is_word_key(marker):
+                    # 词边界匹配的交给 _keys_match 整体判断，单独词不重复输出
+                    continue
+                if marker in combined_text and marker not in terms:
+                    terms.append(marker)
+                    if len(terms) >= 8:
+                        return terms
+        # 补齐词边界命中的短词
+        for markers in category_marker_groups:
+            word_re = _word_boundary_regex(markers)
+            if word_re is None:
+                continue
+            for match in word_re.finditer(combined_text):
+                word = match.group(0)
+                if word not in terms:
+                    terms.append(word)
+                    if len(terms) >= 8:
+                        return terms
         return terms
 
     @staticmethod

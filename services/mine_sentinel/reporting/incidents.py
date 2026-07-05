@@ -11,6 +11,9 @@ INCIDENT_MERGE_WINDOW_MS = 5 * 60 * 1000
 ACTIONABLE_SEVERITIES = {"medium", "high", "critical"}
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 COMMUNITY_TAGS = {"server_log_community"}
+CHAT_REVIEW_TAGS = {"server_log_chat_review"}
+PLAYER_FEEDBACK_TAGS = {"server_log_player_feedback"}
+COMMUNITY_OPS_TAGS = {"server_log_community_ops"}
 MODERATION_TAGS = {"server_log_auth", "server_log_permission"}
 SUGGESTION_TAGS = set()
 ABUSE_HINTS = (
@@ -75,8 +78,20 @@ class IssuePolicy:
     @staticmethod
     def is_moderation_issue(issue: dict[str, Any]) -> bool:
         return (
-            str(issue.get("category") or "").lower() in {"community", "moderation"}
-            or str(issue.get("tag") or "").lower() in COMMUNITY_TAGS | MODERATION_TAGS
+            str(issue.get("category") or "").lower() in {
+                "community",
+                "chat_review",
+                "player_feedback",
+                "community_ops",
+                "moderation",
+            }
+            or str(issue.get("tag") or "").lower() in (
+                COMMUNITY_TAGS
+                | CHAT_REVIEW_TAGS
+                | PLAYER_FEEDBACK_TAGS
+                | COMMUNITY_OPS_TAGS
+                | MODERATION_TAGS
+            )
         )
 
 
@@ -169,6 +184,12 @@ def issue_family(issue: dict[str, Any]) -> str:
     tag = str(issue.get("tag") or "").lower()
     if category == "community" or tag in COMMUNITY_TAGS:
         return "community"
+    if category == "chat_review" or tag in CHAT_REVIEW_TAGS:
+        return "chat_review"
+    if category == "player_feedback" or tag in PLAYER_FEEDBACK_TAGS:
+        return "player_feedback"
+    if category == "community_ops" or tag in COMMUNITY_OPS_TAGS:
+        return "community_ops"
     if category == "moderation" or tag in MODERATION_TAGS:
         return "moderation"
     if tag == "feature_broken" and looks_like_abuse(issue):

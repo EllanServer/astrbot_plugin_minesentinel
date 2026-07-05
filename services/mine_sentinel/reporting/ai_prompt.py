@@ -77,7 +77,8 @@ class AIReportPromptBuilder:
             "你是 Minecraft 服务器只读旁路监控 MineSentinel 的报告代理。"
             "只输出合法 JSON，不要执行任何管理动作。"
             "必须使用以下 schema: summary,time_window,servers,log_count,incident_findings,"
-            "categories(daily,complaint,bug,economy,community,moderation,suggestion,cross_server),"
+            "categories(daily,complaint,bug,network,plugin,economy,community,chat_review,"
+            "player_feedback,community_ops,moderation,cross_server,suggestion),"
             "issues(category,tag,incident_index,severity,affected_locations,issue_terms,"
             "evidence_count,signal_count,suggested_action),"
             "ops_notes。"
@@ -93,8 +94,12 @@ class AIReportPromptBuilder:
             "不要臆测、改写或输出 QQ/UMO/session target；目标会话解析由 AstrBot 插件处理；"
             "请让 summary、incident_findings、categories 和 suggested_action 面向管理员群可读，"
             "保留日志级别、时间线索、上下文结论和人工处理建议。"
-            "社区管理相关日志必须单独归入 community 类，例如 ban/kick/mute/report/spam/"
-            "grief/cheat/举报/封禁/禁言/刷屏，不要混入 bug 或 moderation。"
+            "社区管理相关日志必须单独归入 community 类，例如 ban/kick/mute/grief/cheat/"
+            "举报/封禁/禁言/外挂/反作弊，不要混入 bug 或 moderation。"
+            "聊天审查相关内容必须归入 chat_review 类（辱骂/广告/刷屏/骚扰/威胁/私聊/链接），"
+            "不要混入 community；玩家建议/反馈/功能请求归 player_feedback；"
+            "活动/公告/奖励/投票/赛季/社区运营归 community_ops；"
+            "卡顿/延迟/TPS 等无明显建议语气时归 complaint。"
             "生成运行日志与事件相关内容时必须按事故聚合，而不是按问题类别拆分："
             "同一服务器、同一世界或后端、同一 3 到 5 分钟窗口内的多条异常日志，"
             "应优先合并为一个 incident，并在该 incident 内列出多个标签和影响面；"
@@ -119,13 +124,16 @@ class AIReportPromptBuilder:
             for key in (
                 "daily",
                 "complaint",
+                "bug",
                 "network",
                 "plugin",
-                "cross_server",
-                "moderation",
-                "bug",
                 "economy",
                 "community",
+                "chat_review",
+                "player_feedback",
+                "community_ops",
+                "moderation",
+                "cross_server",
                 "suggestion",
             )
         }
