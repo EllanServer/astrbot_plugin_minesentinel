@@ -88,6 +88,7 @@ from services.mine_sentinel.reporting.rules import HeuristicReportBuilder
 from services.mine_sentinel.runtime_log import (
     MineSentinelRuntimeLogTailer,
     _build_observation,
+    _read_appended_lines,
     _resolve_log_file,
     _logs_dir,
     build_hour_observations,
@@ -456,6 +457,63 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             any("未配置任何 Minecraft 运行日志源" in msg for msg in captured),
             f"expected no-sources warning, got: {captured}",
         )
+
+    def test_read_appended_lines_reports_dropped_count_in_burst(self):
+        """burst 超过 max_lines 时应当返回 dropped_count 而不是静默丢弃。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "burst.log"
+            # 写入 10 行，max_lines=3 应丢弃前 7 行
+            path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
+            lines, position, partial, dropped = _read_appended_lines(
+                path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
+            )
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(dropped, 7)
+            self.assertEqual(partial, "")
+            self.assertGreater(position, 0)
+            # 应保留最后 3 行（最近的日志更相关）
+            self.assertEqual(lines[0], "line 7")
+            self.assertEqual(lines[2], "line 9")
+
+    def test_read_appended_lines_no_drop_when_under_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ok.log"
+            path.write_text("a\nb\n")
+            lines, _position, partial, dropped = _read_appended_lines(
+                path, 0, "", max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            self.assertEqual(lines, ["a", "b"])
+            self.assertEqual(dropped, 0)
+            self.assertEqual(partial, "")
+
+    def test_build_hour_observations_respects_max_line_length(self):
+        """build_hour_observations 应当用 max_line_length 裁剪超长行，而不是把 hour_start_ms 当长度。"""
+        from datetime import datetime, timedelta
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+
+        now = datetime.now()
+        cur_hour = now.replace(minute=0, second=0, microsecond=0)
+        prev_hour = cur_hour - timedelta(hours=1)
+        hour_start_ms = int(prev_hour.timestamp() * 1000)
+        hour_end_ms = int(cur_hour.timestamp() * 1000)
+        long_payload = "X" * 5000
+        line = f"[{prev_hour:%H:%M:%S}] [Server thread/INFO]: {long_payload}"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            logs_dir = tmp_path / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            (logs_dir / "latest.log").write_text(line + "\n", encoding="utf-8")
+            source = MineSentinelLogSourceConfig(
+                server_id="srv", server_name="Srv",
+                server_type="minecraft", root=str(tmp_path),
+            )
+            observations = build_hour_observations(
+                source, hour_start_ms, hour_end_ms,
+                max_records=10, max_line_length=50,
+            )
+            self.assertEqual(len(observations), 1)
+            # content 应被裁剪到 max_line_length=50 左右，远小于原始 5000
+            self.assertLess(len(observations[0]["content"]), 100)
 
 
 class MineSentinelRulesTests(unittest.TestCase):

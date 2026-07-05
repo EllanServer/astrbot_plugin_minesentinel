@@ -360,6 +360,7 @@ class MineSentinelService:
         # Read the hour's logs in a worker thread to avoid blocking the event loop.
         max_lines = self.config.hourly_summary.max_log_lines_per_hour
         max_records = self.config.hourly_summary.max_records_per_hour
+        max_line_length = self.config.runtime_log.max_line_length
         observations = await self.io_runner(
             build_hour_observations,
             source,
@@ -367,6 +368,7 @@ class MineSentinelService:
             hour_end_ms,
             max_lines,
             max_records,
+            max_line_length,
         )
         records = [ObservationRecord.from_dict(o) for o in observations]
         if not records:

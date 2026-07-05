@@ -224,6 +224,11 @@ class MineSentinelRuntimeLogTailer:
         self.loop_filter = RuntimeLogLoopFilter(config)
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
+        # Supervisor settings for transient-failure recovery (file permission,
+        # rotation race, network drive hiccup). Exponential backoff with cap.
+        self._initial_backoff_seconds = 5.0
+        self._max_backoff_seconds = 300.0
+        self._max_restarts = 10
 
     @property
     def enabled_sources(self) -> list[MineSentinelLogSourceConfig]:
@@ -268,23 +273,47 @@ class MineSentinelRuntimeLogTailer:
         await self._emit_observations(self.loop_filter.drain_due(force=True))
 
     async def _run_source(self, source: MineSentinelLogSourceConfig, log_file: Path):
+        """Supervisor wrapper: restart the tailer loop on transient failures."""
+        backoff = self._initial_backoff_seconds
+        max_backoff = self._max_backoff_seconds
+        consecutive_failures = 0
+        while not self._stopping.is_set():
+            try:
+                await self._run_source_loop(source, log_file)
+                # Normal exit (stopping) — no retry needed.
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                logger.error(
+                    f"[MineSentinel] runtime log source {source.server_id} crashed "
+                    f"(attempt {consecutive_failures}): {exc}. Restarting in {backoff}s."
+                )
+                if consecutive_failures >= self._max_restarts:
+                    logger.error(
+                        f"[MineSentinel] runtime log source {source.server_id} reached "
+                        f"max_restarts={self._max_restarts}, giving up."
+                    )
+                    return
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), timeout=backoff)
+                    return  # Stopped during backoff.
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, max_backoff)
+
+    async def _run_source_loop(self, source: MineSentinelLogSourceConfig, log_file: Path):
         state = _SourceState(source=source, log_file=log_file)
-        try:
-            if self.config.backfill_on_start:
-                await self._backfill_source(state, self.config.backfill_window_minutes)
-            elif self.config.initial_lines:
-                await self._emit_initial_tail(state)
-            state.position = await self.io_runner(_file_size, state.log_file) or 0
-            while not self._stopping.is_set():
-                await asyncio.sleep(max(1, self.config.poll_interval_seconds))
-                await self._poll_source(state)
-                await self._emit_observations(self.loop_filter.drain_due(force=False))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error(
-                f"[MineSentinel] runtime log source {source.server_id} stopped: {exc}"
-            )
+        if self.config.backfill_on_start:
+            await self._backfill_source(state, self.config.backfill_window_minutes)
+        elif self.config.initial_lines:
+            await self._emit_initial_tail(state)
+        state.position = await self.io_runner(_file_size, state.log_file) or 0
+        while not self._stopping.is_set():
+            await asyncio.sleep(max(1, self.config.poll_interval_seconds))
+            await self._poll_source(state)
+            await self._emit_observations(self.loop_filter.drain_due(force=False))
 
     async def _poll_source(self, state: _SourceState):
         size = await self.io_runner(_file_size, state.log_file)
@@ -305,7 +334,7 @@ class MineSentinelRuntimeLogTailer:
         if size == state.position:
             return
 
-        lines, position, partial = await self.io_runner(
+        lines, position, partial, dropped_count = await self.io_runner(
             _read_appended_lines,
             state.log_file,
             state.position,
@@ -316,6 +345,13 @@ class MineSentinelRuntimeLogTailer:
         )
         state.position = position
         state.partial = partial
+        if dropped_count > 0:
+            logger.warning(
+                f"[MineSentinel] runtime log {state.source.server_id} dropped "
+                f"{dropped_count} line(s) in burst (max_lines_per_poll="
+                f"{self.config.max_lines_per_poll}); consider raising the limit."
+            )
+            await self._emit_dropped_observation(state, dropped_count)
         await self._emit_lines(state, lines, state.log_file)
 
     async def _emit_initial_tail(self, state: _SourceState):
@@ -387,6 +423,31 @@ class MineSentinelRuntimeLogTailer:
             observations.extend(self.loop_filter.process(observation))
         await self._emit_observations(observations)
 
+    async def _emit_dropped_observation(self, state: _SourceState, dropped_count: int):
+        """Emit a synthetic observation so burst drops surface in reports, not just logs."""
+        timestamp_ms = int(time.time() * 1000)
+        observation = {
+            "eventId": f"local-drop:{state.source.server_id}:{timestamp_ms}",
+            "kind": "SERVER_LOG",
+            "timestamp": timestamp_ms,
+            "serverId": state.source.server_id or "minecraft",
+            "serverName": state.source.server_name or state.source.server_id or "Minecraft",
+            "content": (
+                f"hourly tailer 在单次轮询中丢弃了 {dropped_count} 行日志（超过 max_lines_per_poll="
+                f"{self.config.max_lines_per_poll}），建议调大 max_bytes_per_poll / max_lines_per_poll。"
+            ),
+            "tags": ["server_log", "runtime_log", "loop_suppressed", "warn"],
+            "context": {
+                "source": "astrbot_runtime_log",
+                "logFile": str(state.log_file),
+                "level": "WARN",
+                "loopSuppressed": dropped_count,
+                "drop_event": True,
+                "serverType": (state.source.server_type or "minecraft").lower(),
+            },
+        }
+        await self._emit_observations(self.loop_filter.process(observation))
+
     async def _emit_observations(self, observations: list[dict[str, Any]]):
         if not observations:
             return
@@ -442,16 +503,24 @@ def _read_appended_lines(
     max_bytes: int,
     max_lines: int,
     max_line_length: int,
-) -> tuple[list[str], int, str]:
+) -> tuple[list[str], int, str, int]:
+    """Read appended bytes from ``path`` and split into lines.
+
+    Returns ``(lines, new_position, next_partial, dropped_count)``. When the
+    decoded chunk yields more than ``max_lines`` complete lines, the **earlier**
+    lines are dropped (the tail is kept because recent logs are usually more
+    relevant) and ``dropped_count`` reports how many were skipped so callers can
+    emit a ``loop_suppressed``-style observation instead of silently losing data.
+    """
     try:
         with path.open("rb") as handle:
             handle.seek(max(0, position))
             data = handle.read(max(1, max_bytes))
             new_position = handle.tell()
     except OSError:
-        return [], position, partial
+        return [], position, partial, 0
     if not data:
-        return [], new_position, partial
+        return [], new_position, partial, 0
     text = data.decode("utf-8", errors="replace")
     if partial:
         text = partial + text
@@ -462,9 +531,11 @@ def _read_appended_lines(
     if len(next_partial) > max_line_length * 2:
         next_partial = next_partial[-max_line_length:]
     lines = [_truncate(part.rstrip("\r\n"), max_line_length) for part in parts if part.strip()]
+    dropped_count = 0
     if len(lines) > max_lines:
+        dropped_count = len(lines) - max_lines
         lines = lines[-max_lines:]
-    return lines, new_position, next_partial
+    return lines, new_position, next_partial, dropped_count
 
 
 def _read_tail_lines(path: Path, line_count: int, max_line_length: int) -> list[str]:
@@ -569,6 +640,7 @@ def build_hour_observations(
     hour_end_ms: int,
     max_lines: int = 20000,
     max_records: int = 5000,
+    max_line_length: int = 1000,
 ) -> list[dict]:
     """Read an hour of logs and turn them into observation dicts (in-memory only).
 
@@ -590,7 +662,7 @@ def build_hour_observations(
             Path(source_file),
             line,
             timestamp_ms,
-            hour_start_ms,
+            max_line_length,
         )
         # Override the logFile context to point at the actual source file,
         # and drop the compressed flag (it was inferred from the original latest.log).
