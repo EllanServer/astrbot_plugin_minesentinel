@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from .runtime_log import MineSentinelRuntimeLogTailer, build_hour_observations
 from .storage import DiskObservationStore, RecentObservationWindow
 from .template_miner import get_template_miner
 from .anomaly_detector import get_anomaly_detector
+from .io_executor import build_io_executor, executor_runner, shutdown_io_executor
 
 
 class MineSentinelService:
@@ -46,7 +48,16 @@ class MineSentinelService:
         self.context = context
         self.config = MineSentinelConfig.from_dict(config_data)
         self.get_server_config = get_server_config
-        self.io_runner = io_runner or asyncio.to_thread
+        # PR9: 专用 bounded ThreadPoolExecutor。当配置 io_workers > 0 且调用方
+        # 未注入 io_runner 时，创建独立线程池隔离 MineSentinel 的 IO 任务。
+        self._io_executor: ThreadPoolExecutor | None = None
+        if io_runner is None:
+            self._io_executor = build_io_executor(
+                self.config.runtime_log.io_workers
+            )
+            self.io_runner = executor_runner(self._io_executor)
+        else:
+            self.io_runner = io_runner
         self.last_report_time = 0.0
         self.last_error = ""
         storage_path = Path(storage_dir) if storage_dir else Path(__file__).parent / ".cache"
@@ -158,6 +169,9 @@ class MineSentinelService:
         await self.runtime_log_tailer.stop()
         await self._periodic_report_job.stop()
         await self._hourly_job.stop()
+        # PR9: 关闭专用 bounded ThreadPoolExecutor（如有）。
+        shutdown_io_executor(self._io_executor)
+        self._io_executor = None
 
     async def handle_batch(self, server_id: str, payload: dict):
         if not self.config.enabled:
@@ -380,6 +394,7 @@ class MineSentinelService:
             max_lines,
             max_records,
             max_line_length,
+            self.config.runtime_log,
         )
         records = [ObservationRecord.from_dict(o) for o in observations]
         if not records:

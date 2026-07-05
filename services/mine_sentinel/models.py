@@ -79,6 +79,9 @@ class MineSentinelReportConfig:
     max_ai_content_length: int = 240
     send_full_log_file: bool = True
     send_as_image: bool = True
+    # PR9: 导出附件优化——压缩格式 + 同窗口复用
+    export_format: str = "jsonl"  # "jsonl" | "jsonl.gz"
+    export_reuse_existing: bool = True
 
 
 @dataclass
@@ -155,6 +158,14 @@ class MineSentinelRuntimeLogConfig:
     anomaly_max_templates_per_server: int = 500
     anomaly_inactive_template_ttl_hours: int = 24
     anomaly_cleanup_interval: int = 200
+    # PR9: 普通 INFO 降采样——高日志量服 CPU 优化
+    # - template_parse_mode: "all" 全量解析 | "warn_error" 只解析 WARN+ | "interesting" 只解析 WARN+/命中关键词的 INFO
+    # - anomaly_track_info: False 时普通 INFO 不进入 anomaly detector（仅 fingerprint + 简化 observation）
+    template_parse_mode: str = "all"
+    anomaly_track_info: bool = True
+    # PR9: 专用 bounded ThreadPoolExecutor，避免和 asyncio 默认线程池争用。
+    # 0 表示沿用 asyncio.to_thread（默认池），>0 表示创建独立的有界池。
+    io_workers: int = 0
 
 
 @dataclass(slots=True)
@@ -284,6 +295,17 @@ class MineSentinelConfig:
                     runtime_log_data.get("anomaly_cleanup_interval"),
                     200,
                 ),
+                template_parse_mode=str(
+                    runtime_log_data.get("template_parse_mode", "all")
+                ).strip().lower(),
+                anomaly_track_info=_as_bool(
+                    runtime_log_data.get("anomaly_track_info"),
+                    True,
+                ),
+                io_workers=max(
+                    0,
+                    _as_int(runtime_log_data.get("io_workers"), 0),
+                ),
             ),
             report=MineSentinelReportConfig(
                 default_window_minutes=default_window_minutes,
@@ -310,6 +332,12 @@ class MineSentinelConfig:
                 ),
                 send_full_log_file=bool(report_data.get("send_full_log_file", True)),
                 send_as_image=bool(report_data.get("send_as_image", True)),
+                export_format=str(
+                    report_data.get("export_format", "jsonl")
+                ).strip().lower(),
+                export_reuse_existing=bool(
+                    report_data.get("export_reuse_existing", True)
+                ),
             ),
             alert=MineSentinelAlertConfig(
                 enabled=bool(alert_data.get("enabled", False)),

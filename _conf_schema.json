@@ -112,6 +112,21 @@
             "type": "int",
             "description": "每隔多少次 observe 触发一次不活跃模板清理，默认 200",
             "default": 200
+          },
+          "template_parse_mode": {
+            "type": "string",
+            "description": "Drain3 模板解析模式：all=全量解析（默认，适合小服）；warn_error=只解析 WARN/ERROR/FATAL/SEVERE；interesting=WARN+ 与命中关键词的 INFO 才解析（高日志量服推荐，CPU 大幅下降）",
+            "default": "all"
+          },
+          "anomaly_track_info": {
+            "type": "bool",
+            "description": "普通 INFO 是否进入异常检测器。False 时普通 INFO 只做 fingerprint 去重，不更新 EWMA/分位数基线，适合高日志量服降低 CPU",
+            "default": true
+          },
+          "io_workers": {
+            "type": "int",
+            "description": "专用 bounded ThreadPoolExecutor 线程数，用于 runtime log 读取/报告生成/hourly 扫描，避免与 asyncio 默认线程池争用。0=沿用 asyncio.to_thread（默认）；单服建议 1，Velocity+3~5 后端建议 2，大型多服建议 min(4, 数据盘数)",
+            "default": 0
           }
         }
       },
@@ -204,6 +219,16 @@
           "send_full_log_file": {
             "type": "bool",
             "description": "报告发送时附带完整窗口 JSONL",
+            "default": true
+          },
+          "export_format": {
+            "type": "string",
+            "description": "导出附件格式：jsonl（明文）或 jsonl.gz（gzip 压缩，省磁盘）",
+            "default": "jsonl"
+          },
+          "export_reuse_existing": {
+            "type": "bool",
+            "description": "同窗口同分钟的导出文件已存在时直接复用，避免重复写",
             "default": true
           },
           "include_evidence_samples": {

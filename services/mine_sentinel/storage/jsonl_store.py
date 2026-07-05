@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -11,6 +12,7 @@ from ..models import MineSentinelConfig, ObservationRecord
 from .codec import ObservationRecordCodec
 from .dedupe import DedupeTracker
 from .models import RecentObservationWindow
+from .offset_index import JsonlOffsetIndex
 from .paths import (
     candidate_files,
     cleanup_old_files,
@@ -55,7 +57,8 @@ class DiskObservationStore:
         batch_server_name = str(payload.get("serverName") or batch_server_id)
 
         written = 0
-        handles = {}
+        handles: dict[Path, Any] = {}
+        indexes: dict[Path, JsonlOffsetIndex] = {}
         with ExitStack() as stack:
             for item in observations:
                 if not isinstance(item, dict):
@@ -78,9 +81,21 @@ class DiskObservationStore:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     handle = stack.enter_context(path.open("a", encoding="utf-8"))
                     handles[path] = handle
+                    # Load or create the offset index sidecar for this file.
+                    idx = JsonlOffsetIndex.for_jsonl(path)
+                    idx.load()
+                    indexes[path] = idx
+                idx = indexes[path]
+                # Record the byte offset of this line's start before writing.
+                line_offset = handle.tell()
+                idx.maybe_index(record.timestamp, line_offset)
                 handle.write(self.codec.json_line(record))
                 handle.write("\n")
                 written += 1
+
+            # Flush all touched indexes so reads can use them immediately.
+            for idx in indexes.values():
+                idx.flush()
 
         self.cleanup_if_due(now)
         # New observations invalidate the cached window read.
@@ -124,7 +139,12 @@ class DiskObservationStore:
         builder = RecentWindowBuilder(limit)
         with self._dedupe_tracker() as seen:
             for path in self._candidate_files(server_id, cutoff_ms):
-                for row in self.codec.read_jsonl_window(path, cutoff_ms, end_ms):
+                # 加载 .idx 偏移索引，让 read_jsonl_window 从 cutoff 附近 seek。
+                idx = JsonlOffsetIndex.for_jsonl(path)
+                idx.load()
+                for row in self.codec.read_jsonl_window(
+                    path, cutoff_ms, end_ms, index=idx
+                ):
                     record = ObservationRecord.from_dict(row)
                     if record.timestamp < cutoff_ms:
                         continue
@@ -142,6 +162,18 @@ class DiskObservationStore:
             self._window_cache_at = now
         return result
 
+    def _export_suffix(self) -> str:
+        """Return the file suffix for exports based on config."""
+        if self.config.report.export_format == "jsonl.gz":
+            return ".jsonl.gz"
+        return ".jsonl"
+
+    def _open_export(self, path: Path, mode: str = "w"):
+        """Open an export file, using gzip when the suffix is ``.jsonl.gz``."""
+        if path.name.endswith(".gz"):
+            return gzip.open(path, mode + "t", encoding="utf-8")
+        return path.open(mode, encoding="utf-8")
+
     def export_records(
         self,
         records: list[ObservationRecord],
@@ -152,8 +184,14 @@ class DiskObservationStore:
         if not records:
             return None
         now = int(time.time())
-        path = export_path(self.export_dir, window_minutes, server_id, label, now)
-        with path.open("w", encoding="utf-8") as handle:
+        suffix = self._export_suffix()
+        path = export_path(
+            self.export_dir, window_minutes, server_id, label, now, suffix=suffix
+        )
+        # 同窗口复用：如果文件已存在且复用开启，直接返回
+        if self.config.report.export_reuse_existing and path.exists():
+            return path
+        with self._open_export(path) as handle:
             for record in records:
                 handle.write(self.codec.json_line(record))
                 handle.write("\n")
@@ -173,13 +211,24 @@ class DiskObservationStore:
         # +1ms 余量：read_jsonl_window 的 end_ms 是右开边界（ts >= end_ms break），
         # 当前时刻写入的记录不应被排除。
         end_ms = int(now_ts * 1000) + 1
-        path = export_path(self.export_dir, window_minutes, server_id, label, now_ts)
+        suffix = self._export_suffix()
+        path = export_path(
+            self.export_dir, window_minutes, server_id, label, now_ts, suffix=suffix
+        )
+
+        # 同窗口复用：如果文件已存在且复用开启，直接返回
+        if self.config.report.export_reuse_existing and path.exists():
+            return path
 
         written = 0
         with self._dedupe_tracker() as seen:
-            with path.open("w", encoding="utf-8") as handle:
+            with self._open_export(path) as handle:
                 for source_path in self._candidate_files(server_id, cutoff_ms):
-                    for row in self.codec.read_jsonl_window(source_path, cutoff_ms, end_ms):
+                    idx = JsonlOffsetIndex.for_jsonl(source_path)
+                    idx.load()
+                    for row in self.codec.read_jsonl_window(
+                        source_path, cutoff_ms, end_ms, index=idx
+                    ):
                         record = ObservationRecord.from_dict(row)
                         if record.timestamp < cutoff_ms:
                             continue

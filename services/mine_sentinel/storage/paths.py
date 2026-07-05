@@ -21,12 +21,19 @@ def export_path(
     server_id: str | None = None,
     label: str = "",
     now: int | None = None,
+    suffix: str = ".jsonl",
 ) -> Path:
+    """Generate a deterministic export file path for the given window.
+
+    The stem encodes (start_day, start_time, end_day, end_time, server_id),
+    rounded to the minute. Two exports for the same window/server within
+    the same minute produce the same path, enabling ``export_reuse_existing``.
+    """
     timestamp = int(time.time()) if now is None else now
     stem = window_export_stem(window_minutes, timestamp, server_id)
-    path = export_dir / f"{stem}.jsonl"
+    path = export_dir / f"{stem}{suffix}"
     if label and path.exists():
-        path = export_dir / f"{stem}_{safe_name(label)}.jsonl"
+        path = export_dir / f"{stem}_{safe_name(label)}{suffix}"
     return path
 
 
@@ -80,14 +87,18 @@ def cleanup_old_files(
     for path in observation_dir.glob("*/*.jsonl"):
         if path.stem < cutoff_day:
             path.unlink(missing_ok=True)
+            # 同时清理对应的 .idx 偏移索引文件
+            path.with_suffix(".idx").unlink(missing_ok=True)
 
     export_cutoff = time.time() - max(retention_minutes, 60) * 60
-    for path in export_dir.glob("*.jsonl"):
-        try:
-            if path.stat().st_mtime < export_cutoff:
-                path.unlink(missing_ok=True)
-        except FileNotFoundError:
-            pass
+    # 清理 export 目录下的 .jsonl 和 .jsonl.gz 文件
+    for pattern in ("*.jsonl", "*.jsonl.gz"):
+        for path in export_dir.glob(pattern):
+            try:
+                if path.stat().st_mtime < export_cutoff:
+                    path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
 
 
 def safe_name(value: str) -> str:

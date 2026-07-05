@@ -7,8 +7,9 @@ import gzip
 import hashlib
 import re
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,8 @@ from typing import Any
 from astrbot.api import logger
 
 from .models import MineSentinelLogSourceConfig, MineSentinelRuntimeLogConfig
-from .template_miner import get_template_miner
-from .anomaly_detector import get_anomaly_detector
+from .template_miner import ParsedTemplate, get_template_miner
+from .anomaly_detector import AnomalyResult, TemplateStat, get_anomaly_detector
 
 
 BatchHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
@@ -74,15 +75,85 @@ _ERROR_WORDS = (
     "警告",
 )
 
+# PR9: interesting-only 模式下，普通 INFO 命中这些关键词才进 template/anomaly。
+# 覆盖 Minecraft 服常见的事故线索：性能、连接、世界/区块、内存/GC、插件异常。
+_INTERESTING_INFO_KEYWORDS = (
+    "tps",
+    "mspt",
+    "lag",
+    "overloaded",
+    "can't keep up",
+    "cannot keep up",
+    "running behind",
+    "timeout",
+    "timed out",
+    "disconnect",
+    "disconnected",
+    "lost connection",
+    "moved too quickly",
+    "moved wrongly",
+    "kicked",
+    "banned",
+    "exception",
+    "stacktrace",
+    "failed",
+    "failure",
+    "plugin",
+    "chunk",
+    "world",
+    "gc",
+    "garbage collect",
+    "memory",
+    "outofmemory",
+    "out of memory",
+    "deadlock",
+    "watchdog",
+    "stuck",
+    "thread",
+    "save",
+    "saving",
+    "saved",
+    "crash",
+    "restart",
+    "stopped",
+    "started",
+    "reloaded",
+    "reload",
+    "error",
+    "warn",
+    "severe",
+    "fatal",
+    "严重",
+    "卡顿",
+    "延迟",
+    "掉线",
+    "断开",
+    "异常",
+    "报错",
+    "失败",
+    "超时",
+    "内存",
+    "插件",
+    "崩服",
+    "卡死",
+)
+
 
 @dataclass
 class _SourceState:
     source: MineSentinelLogSourceConfig
     log_file: Path
     position: int = 0
-    partial: str = ""
+    partial: str = ""  # 兼容字段：仅在无 backlog 时表示未闭合行；新代码用 partial_line
+    partial_line: str = ""  # 未闭合的最后一行（不含换行符）
+    backlog: deque[str] = field(default_factory=deque)  # 完整行积压队列
     last_timestamp_ms: int = 0
     missing_logged: bool = False
+
+    @property
+    def has_pending(self) -> bool:
+        """是否有待处理数据（backlog 或未闭合行）。"""
+        return bool(self.backlog) or bool(self.partial_line) or bool(self.partial)
 
 
 @dataclass
@@ -359,23 +430,29 @@ class MineSentinelRuntimeLogTailer:
             )
             state.position = 0
             state.partial = ""
-        if size == state.position and not state.partial:
+            state.partial_line = ""
+            state.backlog.clear()
+        if size == state.position and not state.has_pending:
             # 无新数据且无 backlog：本轮无事可做。
-            # 注意：如果 state.partial 非空（有 backlog 未处理），即使文件
-            # 没有新数据也必须继续，否则 backlog 会永久滞留（PR7 修复）。
+            # 注意：如果有 backlog 未处理，即使文件没新数据也必须继续，
+            # 否则 backlog 会永久滞留（PR7 修复）。
             return
 
-        lines, position, partial, dropped_count = await self.io_runner(
+        lines, position, partial_line, backlog, dropped_count = await self.io_runner(
             _read_appended_lines,
             state.log_file,
             state.position,
-            state.partial,
+            state.partial_line,
+            state.backlog,
             self.config.max_bytes_per_poll,
             self.config.max_lines_per_poll,
             self.config.max_line_length,
         )
         state.position = position
-        state.partial = partial
+        state.partial_line = partial_line
+        state.backlog = backlog
+        # 清空旧 partial 字段（兼容）：新代码用 partial_line + backlog
+        state.partial = ""
         if dropped_count > 0:
             logger.warning(
                 f"[MineSentinel] runtime log {state.source.server_id} dropped "
@@ -416,6 +493,7 @@ class MineSentinelRuntimeLogTailer:
                         line,
                         timestamp_ms,
                         self.config.max_line_length,
+                        runtime_config=self.config,
                     )
                 )
             )
@@ -450,6 +528,7 @@ class MineSentinelRuntimeLogTailer:
                 line,
                 timestamp_ms,
                 self.config.max_line_length,
+                runtime_config=self.config,
             )
             observations.extend(self.loop_filter.process(observation))
         await self._emit_observations(observations)
@@ -551,73 +630,90 @@ def _file_size(path: Path) -> int | None:
 def _read_appended_lines(
     path: Path,
     position: int,
-    partial: str,
+    partial_line: str,
+    backlog: deque[str],
     max_bytes: int,
     max_lines: int,
     max_line_length: int,
-) -> tuple[list[str], int, str, int]:
+) -> tuple[list[str], int, str, deque[str], int]:
     """Read appended bytes from ``path`` and split into lines.
 
-    Returns ``(lines, new_position, next_partial, dropped_count)``.
+    Returns ``(lines, new_position, next_partial_line, next_backlog, dropped_count)``.
 
-    Burst handling: 当本轮完整行数超过 ``max_lines`` 时，**不再丢弃早期行**。
-    前面 ``max_lines`` 行本轮处理，剩余完整行存入 ``next_partial`` 作为
-    backlog，下一轮继续处理。只有当 backlog 累积超过 ``max_lines * 4`` 行时，
-    才丢弃最旧的行并报告 ``dropped_count``。
+    Burst handling 采用 deque backlog（PR9 优化）：
+
+    1. 优先从 backlog 弹出 ``max_lines`` 行处理；
+    2. backlog 不够时再读文件追加新行；
+    3. 新读出来超过 ``max_lines`` 的完整行 append 到 backlog 末尾；
+    4. ``partial_line`` 只保存未闭合的一行，不再混用完整 backlog。
+
+    只有当 backlog 累积超过 ``max_lines * 4`` 行时，才丢弃最旧的行并报告
+    ``dropped_count``。相比旧 str partial 方案，避免了大 burst 时反复
+    split/join 的 O(n) 字符串复制开销。
     """
+    max_backlog_lines = max(1, max_lines * 4)
+
+    # 第一步：先从 backlog 取 max_lines 行
+    lines: list[str] = []
+    while len(lines) < max_lines and backlog:
+        lines.append(backlog.popleft())
+
+    new_position = position
+    dropped_count = 0
+
+    # 第二步：如果 backlog 已经填满本轮 max_lines，不需要读文件
+    # 但要处理 backlog 超限丢弃
+    if len(lines) >= max_lines:
+        if len(backlog) > max_backlog_lines:
+            dropped_count = len(backlog) - max_backlog_lines
+            while dropped_count > 0 and backlog:
+                backlog.popleft()
+        return lines, new_position, partial_line, backlog, dropped_count
+
+    # 第三步：backlog 不足 max_lines，读文件追加
     try:
         with path.open("rb") as handle:
             handle.seek(max(0, position))
             data = handle.read(max(1, max_bytes))
             new_position = handle.tell()
     except OSError:
-        return [], position, partial, 0
+        return lines, position, partial_line, backlog, 0
 
-    # 构建 text：backlog (partial) + 新数据
-    if data:
-        text = data.decode("utf-8", errors="replace")
-        if partial:
-            text = partial + text
-    elif partial:
-        # 无新数据但有 backlog —— 继续处理积压行
-        text = partial
-        new_position = position
-    else:
-        return [], new_position, partial, 0
+    if not data:
+        # 无新数据：可能 backlog 还剩一些（少于 max_lines），本轮就处理这些
+        return lines, new_position, partial_line, backlog, 0
+
+    text = data.decode("utf-8", errors="replace")
+    if partial_line:
+        text = partial_line + text
 
     parts = text.splitlines(keepends=True)
-    next_partial = ""
+    next_partial_line = ""
     if parts and not parts[-1].endswith(("\n", "\r")):
-        next_partial = parts.pop()
+        next_partial_line = parts.pop()
 
-    lines = [_truncate(part.rstrip("\r\n"), max_line_length) for part in parts if part.strip()]
+    new_lines = [_truncate(part.rstrip("\r\n"), max_line_length) for part in parts if part.strip()]
 
-    dropped_count = 0
-    if len(lines) > max_lines:
-        # Backlog: 本轮处理前 max_lines 行，剩余行推迟到下一轮
-        backlog_lines = lines[max_lines:]
-        lines = lines[:max_lines]
+    # 填满本轮 lines，剩余 append 到 backlog
+    for line in new_lines:
+        if len(lines) < max_lines:
+            lines.append(line)
+        else:
+            backlog.append(line)
 
-        # 防止 backlog 无限增长：超过 max_lines*4 行时丢弃最旧的
-        max_backlog_lines = max(1, max_lines * 4)
-        if len(backlog_lines) > max_backlog_lines:
-            dropped_count = len(backlog_lines) - max_backlog_lines
-            backlog_lines = backlog_lines[-max_backlog_lines:]
+    # backlog 超限丢弃最旧的
+    if len(backlog) > max_backlog_lines:
+        dropped_count = len(backlog) - max_backlog_lines
+        for _ in range(dropped_count):
+            if not backlog:
+                break
+            backlog.popleft()
 
-        # 构建 backlog 文本：完整行用 \n 连接并加尾部换行，
-        # 再追加不完整的末行（如果有）
-        backlog_text = "\n".join(backlog_lines)
-        if backlog_text:
-            backlog_text += "\n"
-        if next_partial:
-            backlog_text += next_partial
-        next_partial = backlog_text
-    elif next_partial:
-        # 无溢出：裁剪过长的单行 partial
-        if len(next_partial) > max_line_length * 2:
-            next_partial = next_partial[-max_line_length:]
+    # 裁剪过长的 partial_line
+    if next_partial_line and len(next_partial_line) > max_line_length * 2:
+        next_partial_line = next_partial_line[-max_line_length:]
 
-    return lines, new_position, next_partial, dropped_count
+    return lines, new_position, next_partial_line, backlog, dropped_count
 
 
 def _read_tail_lines(path: Path, line_count: int, max_line_length: int) -> list[str]:
@@ -669,6 +765,54 @@ def _read_backfill_lines(
     return rows
 
 
+# PR9: per-process 已扫描 .gz 归档缓存。
+# 同一个 .log.gz 文件内容不会变化（归档后只读），同一进程内对同一小时
+# 重复扫描会浪费 CPU 和磁盘 IO。缓存键 (path, mtime, hour_start_ms)，
+# 命中时直接复用上次结果。latest.log 不缓存（实时增长）。
+# 上限：避免长期运行内存膨胀，超过 _GZ_SCAN_CACHE_MAX_BYTES 时清空最旧条目。
+_GZ_SCAN_CACHE_MAX_ENTRIES = 64
+_gz_scan_cache: dict[tuple[str, int, int], list[tuple[str, int, str]]] = {}
+
+
+def _gz_scan_cache_get(
+    path: Path, mtime: int, hour_start_ms: int
+) -> list[tuple[str, int, str]] | None:
+    key = (str(path), mtime, hour_start_ms)
+    return _gz_scan_cache.get(key)
+
+
+def _gz_scan_cache_put(
+    path: Path,
+    mtime: int,
+    hour_start_ms: int,
+    rows: list[tuple[str, int, str]],
+) -> None:
+    if len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES:
+        # 简单淘汰：清空最旧的一半。.gz 扫描结果较小，逐条 LRU 收益有限。
+        keep = sorted(_gz_scan_cache.items())[: _GZ_SCAN_CACHE_MAX_ENTRIES // 2]
+        _gz_scan_cache.clear()
+        _gz_scan_cache.update(keep)
+    key = (str(path), mtime, hour_start_ms)
+    _gz_scan_cache[key] = rows
+
+
+def _file_date_overlaps_hour(
+    file_date: date | None,
+    hour_start_ms: int,
+    hour_end_ms: int,
+) -> bool:
+    """PR9: 文件名日期是否与目标小时区间重叠（含前一天，覆盖跨日边界）。
+
+    无文件名日期时返回 True（保守保留，让 mtime/内容过滤决定）。
+    """
+    if file_date is None:
+        return True
+    start_day = datetime.fromtimestamp(hour_start_ms / 1000).date()
+    end_day = datetime.fromtimestamp(hour_end_ms / 1000).date()
+    # 允许前一天（跨日边界的归档）和后一天（极端时钟漂移）。
+    return file_date >= start_day - timedelta(days=1) and file_date <= end_day + timedelta(days=1)
+
+
 def read_hour_log_lines(
     source: MineSentinelLogSourceConfig,
     hour_start_ms: int,
@@ -681,6 +825,12 @@ def read_hour_log_lines(
     Directly scans the logs/ directory (latest.log + archives) without any
     long-lived polling loop, so it has zero impact on Minecraft server mspt/tps.
     Returns a list of (line, timestamp_ms, file_path) tuples.
+
+    PR9 优化：
+    - 文件名日期预过滤：归档文件名日期与目标小时不在同一天（含前一天）则跳过，
+      避免 .gz 很多时逐个解压扫描。
+    - .gz 已扫描缓存：同一进程内对同一 (path, mtime, hour_start) 重复扫描时
+      直接复用上次结果，归档文件内容不会变化。
     """
     if hour_end_ms <= hour_start_ms:
         return []
@@ -698,6 +848,51 @@ def read_hour_log_lines(
     )
     rows: list[tuple[str, int, str]] = []
     for path in _backfill_candidates(source, dummy_config, scan_cutoff_ms):
+        # PR9: 文件名日期预过滤。归档 .log.gz 通常按日期命名，
+        # 如果文件名日期明显不在目标小时附近，直接跳过不解压。
+        file_date = _date_from_filename(path)
+        if not _file_date_overlaps_hour(file_date, hour_start_ms, hour_end_ms):
+            continue
+        is_gz = path.name.lower().endswith(".gz")
+        # PR9: .gz 已扫描缓存。归档文件不会变化，同进程重复扫描直接复用。
+        if is_gz:
+            try:
+                mtime = int(path.stat().st_mtime)
+            except OSError:
+                mtime = 0
+            cached = _gz_scan_cache_get(path, mtime, hour_start_ms)
+            if cached is not None:
+                for line, ts, fp in cached:
+                    if ts < hour_start_ms or ts >= hour_end_ms:
+                        continue
+                    rows.append((line, ts, fp))
+                    if len(rows) >= max_lines:
+                        return rows
+                continue
+            cached_rows: list[tuple[str, int, str]] = []
+            base_date = _infer_file_date(path)
+            last_ts = 0
+            for raw_line in _iter_log_file(path):
+                line = _truncate(raw_line.rstrip("\r\n"), max_line_length)
+                if not line.strip():
+                    continue
+                timestamp_ms = _parse_log_timestamp(line, base_date, last_ts)
+                last_ts = timestamp_ms
+                # 缓存该 .gz 在 [hour_start-1h, hour_end] 范围内的所有行，
+                # 后续同小时重复扫描可直接复用（不必重新解压）。
+                if timestamp_ms >= scan_cutoff_ms and timestamp_ms < hour_end_ms:
+                    cached_rows.append((line, timestamp_ms, str(path)))
+                if timestamp_ms < hour_start_ms:
+                    continue
+                if timestamp_ms >= hour_end_ms:
+                    continue
+                rows.append((line, timestamp_ms, str(path)))
+                if len(rows) >= max_lines:
+                    _gz_scan_cache_put(path, mtime, hour_start_ms, cached_rows)
+                    return rows
+            _gz_scan_cache_put(path, mtime, hour_start_ms, cached_rows)
+            continue
+        # latest.log / 普通 .log：实时增长，不缓存。
         base_date = _infer_file_date(path)
         last_ts = 0
         for raw_line in _iter_log_file(path):
@@ -723,6 +918,7 @@ def build_hour_observations(
     max_lines: int = 20000,
     max_records: int = 5000,
     max_line_length: int = 1000,
+    runtime_config: MineSentinelRuntimeLogConfig | None = None,
 ) -> list[dict]:
     """Read an hour of logs and turn them into observation dicts (in-memory only).
 
@@ -745,6 +941,7 @@ def build_hour_observations(
             line,
             timestamp_ms,
             max_line_length,
+            runtime_config=runtime_config,
         )
         # Override the logFile context to point at the actual source file,
         # and drop the compressed flag (it was inferred from the original latest.log).
@@ -811,28 +1008,137 @@ def _iter_log_file(path: Path):
         return
 
 
+def _should_parse_and_track(
+    level: str,
+    lowered_content: str,
+    runtime_config: MineSentinelRuntimeLogConfig | None,
+) -> tuple[bool, bool]:
+    """决定是否对这条日志做 Drain3 解析和异常检测。
+
+    返回 (run_template, run_anomaly)：
+    - run_template=False 时用 fingerprint 作为 template_id（降采样，跳过 parse tree 更新）
+    - run_anomaly=False 时跳过 anomaly detector.observe（不更新 EWMA/分位数基线）
+
+    策略（PR9 INFO 降采样）：
+    - mode="all"：全量解析；anomaly 是否跟踪 INFO 由 anomaly_track_info 控制
+    - mode="warn_error"：只 WARN/ERROR/FATAL/SEVERE 才解析和跟踪
+    - mode="interesting"：WARN+ 始终解析；INFO 命中关键词才解析和跟踪
+    """
+    if runtime_config is None:
+        return True, True
+
+    mode = (runtime_config.template_parse_mode or "all").strip().lower()
+    if mode not in {"all", "warn_error", "interesting"}:
+        mode = "all"
+
+    upper = level.upper()
+    is_warn_plus = upper in {"ERROR", "FATAL", "SEVERE", "WARN", "WARNING"}
+
+    if mode == "all":
+        # 全量解析；anomaly 是否跟踪 INFO 由单独开关控制
+        return True, runtime_config.anomaly_track_info or is_warn_plus
+
+    # warn_error / interesting：WARN+ 始终解析和跟踪
+    if is_warn_plus:
+        return True, True
+
+    if mode == "warn_error":
+        # INFO/DEBUG 都不解析、不跟踪
+        return False, False
+
+    # mode == "interesting"：INFO 命中关键词才解析和跟踪
+    if _is_interesting_info(lowered_content):
+        return True, True
+    # 普通 INFO：用 fingerprint，不进 anomaly
+    return False, False
+
+
+def _is_interesting_info(lowered_content: str) -> bool:
+    """检查一条 INFO 日志是否值得关注（template/anomaly）。
+
+    覆盖 Minecraft 服常见的事故线索：性能（tps/mspt/lag/overloaded）、
+    连接（disconnect/timeout/kicked）、世界/区块、内存/GC、插件异常、
+    保存/重启等关键状态变化。
+    """
+    return any(kw in lowered_content for kw in _INTERESTING_INFO_KEYWORDS)
+
+
+def _skip_parsed_template(content: str, fingerprint: str) -> ParsedTemplate:
+    """构造降采样的 ParsedTemplate（不调用 drain3，用 fingerprint 作为 id）。"""
+    return ParsedTemplate(
+        template_id=fingerprint,
+        template=content,
+        params=[],
+        is_new_template=False,
+        cluster_size=0,
+        fallback=True,
+        fallback_fingerprint=fingerprint,
+    )
+
+
+def _skip_anomaly_result(
+    server_id: str,
+    template_id: str,
+    template: str,
+    level: str,
+) -> AnomalyResult:
+    """构造降采样的 AnomalyResult（不调用 anomaly detector.observe）。"""
+    stat = TemplateStat(
+        server_id=server_id,
+        template_id=template_id,
+        template=template,
+        level=level,
+    )
+    return AnomalyResult(
+        is_anomaly=False,
+        score=0.0,
+        reason="skipped: info downsampling",
+        stat=stat,
+        current_count=0,
+        baseline=0.0,
+    )
+
+
 def _build_observation(
     source: MineSentinelLogSourceConfig,
     log_file: Path,
     line: str,
     timestamp_ms: int,
     max_line_length: int,
+    runtime_config: MineSentinelRuntimeLogConfig | None = None,
 ) -> dict[str, Any]:
     content = _sanitize_line(_truncate(line, max_line_length))
     level = _detect_level(content)
     fingerprint = _fingerprint(content)
-    # 模板解析：drain3 可用时返回 template_id，否则降级为 fingerprint
-    parsed = get_template_miner().parse(content, server_id=source.server_id or "default")
+    lowered = content.lower()
+    server_id = source.server_id or "minecraft"
+
+    # PR9: 决定是否对这条日志做 Drain3 解析和异常检测。
+    # 高日志量服可设 template_parse_mode="interesting" + anomaly_track_info=false
+    # 来跳过普通 INFO 的重处理，大幅降低 CPU。
+    run_template, run_anomaly = _should_parse_and_track(level, lowered, runtime_config)
+
+    if run_template:
+        # 模板解析：drain3 可用时返回 template_id，否则降级为 fingerprint
+        parsed = get_template_miner().parse(content, server_id=server_id or "default")
+    else:
+        # 降采样：用 fingerprint 作为 template_id，不更新 drain3 parse tree
+        parsed = _skip_parsed_template(content, fingerprint)
     template_id = parsed.template_id
     template = parsed.template
-    # 异常检测：基于模板计数突增（EWMA + 分位数）
-    anomaly = get_anomaly_detector().observe(
-        server_id=source.server_id or "minecraft",
-        template_id=template_id,
-        template=template,
-        level=level,
-        timestamp_ms=timestamp_ms,
-    )
+
+    if run_anomaly:
+        # 异常检测：基于模板计数突增（EWMA + 分位数）
+        anomaly = get_anomaly_detector().observe(
+            server_id=server_id,
+            template_id=template_id,
+            template=template,
+            level=level,
+            timestamp_ms=timestamp_ms,
+        )
+    else:
+        # 降采样：跳过 anomaly detector.observe，返回零值结果
+        anomaly = _skip_anomaly_result(server_id, template_id, template, level)
     digest = hashlib.sha1(
         f"{source.server_id}:{timestamp_ms}:{fingerprint}:{log_file.name}".encode("utf-8")
     ).hexdigest()[:20]
@@ -843,7 +1149,6 @@ def _build_observation(
         tags.append("proxy")
     else:
         tags.append("minecraft")
-    lowered = content.lower()
     if "exception" in lowered:
         tags.append("exception")
     if level in {"ERROR", "FATAL", "SEVERE"}:
@@ -854,8 +1159,10 @@ def _build_observation(
         tags.append("new_template")
     if anomaly.is_anomaly:
         tags.append("anomaly_spike")
+    if not run_template:
+        # 标记降采样记录，便于后续报告/调试识别
+        tags.append("info_downsampled")
     observed_ms = int(time.time() * 1000)
-    server_id = source.server_id or "minecraft"
     server_name = source.server_name or source.server_id or "Minecraft"
     context = {
         "source": "astrbot_runtime_log",
@@ -900,6 +1207,9 @@ def _build_observation(
     if parsed.fallback:
         context["templateFallback"] = True
         context["otel"]["attributes"]["template.fallback"] = True
+    if not run_template:
+        context["infoDownsampled"] = True
+        context["otel"]["attributes"]["info.downsampled"] = True
     return {
         "eventId": f"local-log:{source.server_id}:{digest}",
         "kind": "SERVER_LOG",

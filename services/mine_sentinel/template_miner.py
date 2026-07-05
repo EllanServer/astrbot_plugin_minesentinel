@@ -73,6 +73,11 @@ class LogTemplateMiner:
     场景下不同后端的模板互相污染（A 服出现过的模板不会影响 B 服的
     new_template 判定）。
 
+    PR9 锁分片：``parse()`` / ``match()`` 使用 per-server 锁（``_locks``），
+    不同服务器的解析可以真正并行；仅在 namespace 创建/枚举时短暂持有
+    ``_dict_lock``。snapshot/save_state 会按 server 名排序依次获取所有
+    per-server 锁，避免与 parse 互相阻塞太久。
+
     Parameters
     ----------
     persistence_path:
@@ -96,7 +101,10 @@ class LogTemplateMiner:
         max_children: int = 100,
         max_namespaces: int = 16,
     ):
-        self._lock = threading.Lock()
+        # PR9: per-server 分片锁。_dict_lock 仅保护 _miners/_locks 字典本身，
+        # 持有时间极短（一次 dict get/set）；真正的 parse 在 _locks[server_id] 下进行。
+        self._dict_lock = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
         self._persistence_path = persistence_path
         self._available = _DRAIN3_AVAILABLE
         self._sim_th = sim_th
@@ -112,13 +120,42 @@ class LogTemplateMiner:
                 "建议 pip install drain3 启用模板驱动的异常检测。"
             )
 
+    def _lock_for(self, server_id: str) -> threading.Lock:
+        """获取或创建指定 server_id 的专用锁。"""
+        with self._dict_lock:
+            lock = self._locks.get(server_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[server_id] = lock
+            return lock
+
+    def _resolve_namespace(self, server_id: str) -> str:
+        """返回实际使用的 namespace key。
+
+        - 已存在或未超上限时：返回 server_id 本身。
+        - 超过 max_namespaces 时：回落到 "default"，与原 _get_or_create_miner 行为一致。
+          这样 parse() 会锁 "default" 而非溢出的 server_id，保证 overflow 路径下
+          所有溢出 server 共享 default 的锁，不会与 default 的正常 parse 竞争。
+        """
+        with self._dict_lock:
+            if server_id in self._miners:
+                return server_id
+            if len(self._miners) < self._max_namespaces:
+                return server_id
+            return "default"
+
     def _get_or_create_miner(self, server_id: str) -> Any:
-        """获取或创建指定 server_id 的 drain3 miner。"""
+        """获取或创建指定 server_id 的 drain3 miner。
+
+        调用方必须已持有 ``_locks[server_id]``。
+        """
         if server_id in self._miners:
             return self._miners[server_id]
 
         if len(self._miners) >= self._max_namespaces:
-            # 超出上限：复用 "default" miner，不再创建新 namespace
+            # 超出上限：复用 "default" miner，不再创建新 namespace。
+            # 注意：调用方应通过 _resolve_namespace 已经把 server_id 归一到 "default"，
+            # 这里保留兜底逻辑以防直接调用。
             logger.warning(
                 f"[MineSentinel] template miner namespaces 达到上限 "
                 f"{self._max_namespaces}，server_id={server_id} 将复用 default namespace。"
@@ -162,10 +199,10 @@ class LogTemplateMiner:
         return self._available
 
     def parse(self, line: str, server_id: str = "default") -> ParsedTemplate:
-        """解析一条日志，返回模板信息。线程安全。
+        """解析一条日志，返回模板信息。线程安全（per-server 锁）。
 
         ``server_id`` 用于分 namespace：不同服务器的日志使用独立的 parse tree，
-        避免模板互相污染。
+        避免模板互相污染。PR9 起不同 server_id 的 parse 互相不阻塞。
         """
         if not self._available:
             # 降级：返回 fallback fingerprint，调用方用旧逻辑去重
@@ -182,8 +219,10 @@ class LogTemplateMiner:
                 fallback_fingerprint=fp,
             )
 
-        with self._lock:
-            miner = self._get_or_create_miner(server_id)
+        namespace = self._resolve_namespace(server_id)
+        lock = self._lock_for(namespace)
+        with lock:
+            miner = self._get_or_create_miner(namespace)
             result = miner.add_log_message(line)
             cluster_id = str(result.get("cluster_id") or "")
             template = str(result.get("template_mined") or line)
@@ -208,11 +247,13 @@ class LogTemplateMiner:
             )
 
     def match(self, line: str, server_id: str = "default") -> ParsedTemplate | None:
-        """只匹配不学习。若模板未见过的返回 None。"""
+        """只匹配不学习。若模板未见过的返回 None。线程安全（per-server 锁）。"""
         if not self._available:
             return None
-        with self._lock:
-            miner = self._miners.get(server_id)
+        namespace = self._resolve_namespace(server_id)
+        lock = self._lock_for(namespace)
+        with lock:
+            miner = self._miners.get(namespace)
             if miner is None:
                 return None
             result = miner.match(line)
@@ -227,6 +268,26 @@ class LogTemplateMiner:
                 fallback=False,
             )
 
+    def _snapshot_namespaces(self) -> dict[str, dict[str, Any]]:
+        """按 server 名排序依次获取所有 per-server 锁，构建 namespaces 快照。
+
+        排序获取避免死锁；snapshot 是冷路径（报告生成），可接受短暂阻塞。
+        """
+        with self._dict_lock:
+            items = sorted(self._miners.items())
+        namespaces: dict[str, dict[str, Any]] = {}
+        for server_id, miner in items:
+            lock = self._lock_for(server_id)
+            with lock:
+                clusters: dict[str, dict[str, Any]] = {}
+                for cluster_id, cluster in miner.drain.id_to_cluster.items():
+                    clusters[str(cluster_id)] = {
+                        "template": cluster.get_template(),
+                        "size": cluster.size,
+                    }
+                namespaces[server_id] = clusters
+        return namespaces
+
     def snapshot(self) -> dict[str, Any]:
         """返回所有已学习模板的快照，用于报告和 LLM 证据。
 
@@ -235,31 +296,24 @@ class LogTemplateMiner:
         """
         if not self._available:
             return {"available": False, "namespaces": {}}
-        with self._lock:
-            namespaces: dict[str, dict[str, Any]] = {}
-            for server_id, miner in self._miners.items():
-                clusters: dict[str, dict[str, Any]] = {}
-                for cluster_id, cluster in miner.drain.id_to_cluster.items():
-                    clusters[str(cluster_id)] = {
-                        "template": cluster.get_template(),
-                        "size": cluster.size,
-                    }
-                namespaces[server_id] = clusters
-            return {"available": True, "namespaces": namespaces}
+        return {"available": True, "namespaces": self._snapshot_namespaces()}
 
     def save_state(self) -> bool:
         """手动触发模板树存盘。返回是否成功。"""
         if not self._available or not self._persistence_path:
             return False
-        with self._lock:
-            success = True
-            for miner in self._miners.values():
+        with self._dict_lock:
+            items = sorted(self._miners.items())
+        success = True
+        for server_id, miner in items:
+            lock = self._lock_for(server_id)
+            with lock:
                 try:
                     miner.save_state(self._persistence_path)
                 except Exception as exc:
                     logger.warning(f"[MineSentinel] 模板树存盘失败: {exc}")
                     success = False
-            return success
+        return success
 
 
 # 全局单例：整个进程共享一棵 parse tree

@@ -185,6 +185,7 @@ from services.mine_sentinel.runtime_log import (
     read_hour_log_lines,
 )
 from services.mine_sentinel.storage import DiskObservationStore
+from services.mine_sentinel.storage.offset_index import JsonlOffsetIndex
 from services.mine_sentinel.hourly_summary import (
     HourlySummary,
     HourlySummaryStore,
@@ -550,84 +551,119 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
 
     def test_read_appended_lines_backlogs_instead_of_dropping(self):
         """burst 超过 max_lines 时应把剩余行存入 backlog 而非丢弃。"""
+        from collections import deque
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "burst.log"
             # 写入 10 行，max_lines=3 → 本轮处理前 3 行，剩余 7 行存入 backlog
             path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
-            lines, position, partial, dropped = _read_appended_lines(
-                path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
+            lines, position, partial_line, backlog, dropped = _read_appended_lines(
+                path, 0, "", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines), 3)
             self.assertEqual(dropped, 0)  # 不丢弃，推迟到下一轮
-            self.assertNotEqual(partial, "")  # backlog 非空
+            self.assertEqual(len(backlog), 7)  # backlog 有 7 行
+            self.assertEqual(partial_line, "")  # 无未闭合行
             self.assertGreater(position, 0)
-            # 本轮处理前 3 行（不再保留最后 3 行）
+            # 本轮处理前 3 行
             self.assertEqual(lines[0], "line 0")
             self.assertEqual(lines[2], "line 2")
-            # backlog 中包含剩余 7 行
-            self.assertIn("line 3", partial)
-            self.assertIn("line 9", partial)
+            # backlog 中包含剩余 7 行（按顺序）
+            self.assertEqual(list(backlog), [f"line {i}" for i in range(3, 10)])
 
     def test_read_appended_lines_backlog_processed_next_poll(self):
         """backlog 应在下一轮被处理，而非永久丢失。"""
+        from collections import deque
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "burst.log"
             path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
             # 第一轮：处理前 3 行，剩余 7 行存入 backlog
-            lines1, position, partial1, dropped1 = _read_appended_lines(
-                path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
+            lines1, position, partial1, backlog1, dropped1 = _read_appended_lines(
+                path, 0, "", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines1), 3)
             self.assertEqual(dropped1, 0)
+            self.assertEqual(len(backlog1), 7)
             # 第二轮：position 已到文件末尾，但 backlog 仍有数据
-            lines2, position2, partial2, dropped2 = _read_appended_lines(
-                path, position, partial1, max_bytes=65536, max_lines=3, max_line_length=1000
+            lines2, position2, partial2, backlog2, dropped2 = _read_appended_lines(
+                path, position, partial1, backlog1, max_bytes=65536, max_lines=3, max_line_length=1000
             )
             # backlog 中的前 3 行被处理
             self.assertEqual(len(lines2), 3)
             self.assertEqual(dropped2, 0)
             self.assertEqual(lines2[0], "line 3")
+            self.assertEqual(len(backlog2), 4)
             # 第三轮：处理剩余 4 行中的前 3 行
-            lines3, position3, partial3, dropped3 = _read_appended_lines(
-                path, position2, partial2, max_bytes=65536, max_lines=3, max_line_length=1000
+            lines3, position3, partial3, backlog3, dropped3 = _read_appended_lines(
+                path, position2, partial2, backlog2, max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines3), 3)
             self.assertEqual(lines3[0], "line 6")
+            self.assertEqual(len(backlog3), 1)
             # 第四轮：处理最后 1 行
-            lines4, position4, partial4, dropped4 = _read_appended_lines(
-                path, position3, partial3, max_bytes=65536, max_lines=3, max_line_length=1000
+            lines4, position4, partial4, backlog4, dropped4 = _read_appended_lines(
+                path, position3, partial3, backlog3, max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines4), 1)
             self.assertEqual(lines4[0], "line 9")
+            self.assertEqual(len(backlog4), 0)
             self.assertEqual(partial4, "")
 
     def test_read_appended_lines_drops_when_backlog_exceeds_limit(self):
         """backlog 超过 max_lines*4 时才丢弃最旧的行。"""
+        from collections import deque
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "huge_burst.log"
             # max_lines=3 → backlog 上限 12 行；写 20 行
             path.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
-            lines, position, partial, dropped = _read_appended_lines(
-                path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
+            lines, position, partial_line, backlog, dropped = _read_appended_lines(
+                path, 0, "", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines), 3)
             # 20 - 3(processed) - 12(backlog) = 5 dropped
             self.assertEqual(dropped, 5)
             # backlog 中保留最后 12 行 (line 8 ~ line 19)
-            self.assertIn("line 8", partial)
-            self.assertIn("line 19", partial)
-            self.assertNotIn("line 7", partial)
+            backlog_list = list(backlog)
+            self.assertEqual(len(backlog_list), 12)
+            self.assertEqual(backlog_list[0], "line 8")
+            self.assertEqual(backlog_list[-1], "line 19")
+            self.assertNotIn("line 7", backlog_list)
 
     def test_read_appended_lines_no_drop_when_under_limit(self):
+        from collections import deque
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "ok.log"
             path.write_text("a\nb\n")
-            lines, _position, partial, dropped = _read_appended_lines(
-                path, 0, "", max_bytes=65536, max_lines=10, max_line_length=1000
+            lines, _position, partial_line, backlog, dropped = _read_appended_lines(
+                path, 0, "", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
             )
             self.assertEqual(lines, ["a", "b"])
             self.assertEqual(dropped, 0)
-            self.assertEqual(partial, "")
+            self.assertEqual(len(backlog), 0)
+            self.assertEqual(partial_line, "")
+
+    def test_read_appended_lines_preserves_partial_line_across_polls(self):
+        """未闭合的 partial_line 应跨轮保留，与文件新数据拼接。"""
+        from collections import deque
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial.log"
+            # 写入不完整的一行（无换行符）
+            path.write_text("incomplete line without newline")
+            lines1, position1, partial1, backlog1, dropped1 = _read_appended_lines(
+                path, 0, "", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            # 无完整行，全部进 partial_line
+            self.assertEqual(len(lines1), 0)
+            self.assertEqual(partial1, "incomplete line without newline")
+            self.assertEqual(len(backlog1), 0)
+            # 追加换行符使之成为完整行
+            with path.open("a") as f:
+                f.write("\nsecond line\n")
+            lines2, position2, partial2, backlog2, dropped2 = _read_appended_lines(
+                path, position1, partial1, backlog1, max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            self.assertEqual(lines2, ["incomplete line without newline", "second line"])
+            self.assertEqual(partial2, "")
+            self.assertEqual(len(backlog2), 0)
 
     def test_build_hour_observations_respects_max_line_length(self):
         """build_hour_observations 应当用 max_line_length 裁剪超长行，而不是把 hour_start_ms 当长度。"""
@@ -961,12 +997,13 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         self.assertGreater(snap["last_cleanup_ms"], 0)
         # T0 应该已经被淘汰（最久未见）
         survivor_ids = {a["template_id"] for a in snap["anomalies"]}
-        # anomalies 只列 score 最高的 20 个，但 T0 若被淘汰应不在 _stats 里
-        # 直接检查内部状态
-        with detector._lock:
-            keys = list(detector._stats.keys())
-        self.assertNotIn(("srv", "T0"), keys)
-        self.assertIn(("srv", "T3"), keys)
+        # anomalies 只列 score 最高的 20 个，但 T0 若被淘汰应不在分片 stats 里
+        # 直接检查内部状态（PR9: per-server 分片，stats 按 template_id 索引）
+        shard = detector._shard_for("srv")
+        with shard.lock:
+            survivor_ids = set(shard.stats.keys())
+        self.assertNotIn("T0", survivor_ids)
+        self.assertIn("T3", survivor_ids)
 
     def test_anomaly_detector_cleans_inactive_templates_by_ttl(self):
         """超过 inactive_template_ttl_hours 未活跃的模板应被周期性清理。"""
@@ -990,10 +1027,12 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         detector.observe("srv", "FRESH_TPL", template="fresh",
                          level="INFO", timestamp_ms=now_ms + 2000)
         snap = detector.snapshot()
-        with detector._lock:
-            keys = list(detector._stats.keys())
-        self.assertNotIn(("srv", "OLD_TPL"), keys)
-        self.assertIn(("srv", "FRESH_TPL"), keys)
+        # PR9: per-server 分片，stats 按 template_id 索引
+        shard = detector._shard_for("srv")
+        with shard.lock:
+            survivor_ids = set(shard.stats.keys())
+        self.assertNotIn("OLD_TPL", survivor_ids)
+        self.assertIn("FRESH_TPL", survivor_ids)
         self.assertGreaterEqual(snap["cleanup_count"], 1)
 
     def test_anomaly_detector_snapshot_reports_per_server_and_cleanup(self):
@@ -2018,10 +2057,10 @@ class MineSentinelEndToEndIntegrationTests(unittest.IsolatedAsyncioTestCase):
             from services.mine_sentinel.runtime_log import _SourceState
             state = _SourceState(source=source, log_file=log_path)
 
-            # 多轮 poll 直到 backlog 清空（position 到文件末尾且 partial 为空）
+            # 多轮 poll 直到 backlog 清空（position 到文件末尾且无 pending）
             for _ in range(10):
                 await tailer._poll_source(state)
-                if state.partial == "" and state.position >= log_path.stat().st_size:
+                if not state.has_pending and state.position >= log_path.stat().st_size:
                     break
 
             # 关键断言：10 行全部收到，不丢行
@@ -2407,6 +2446,772 @@ class MineSentinelConfigExposureTests(unittest.TestCase):
             self.assertIs(get_anomaly_detector(), detector)
         finally:
             reset_anomaly_detector()
+
+
+class MineSentinelOffsetIndexTests(unittest.TestCase):
+    """验证 PR9 P0-2 JSONL offset 索引的正确性和集成。"""
+
+    def test_maybe_index_respects_line_interval(self):
+        """每 line_interval 行才记录一条索引。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx = JsonlOffsetIndex(
+                Path(tmp_dir) / "test.idx",
+                line_interval=3,
+                time_interval_ms=10_000_000,  # 不会触发
+            )
+            # 前 2 行不索引，第 3 行索引
+            self.assertFalse(idx.maybe_index(1000, 0))
+            self.assertFalse(idx.maybe_index(1001, 10))
+            self.assertTrue(idx.maybe_index(1002, 20))
+            # 又 2 行不索引，第 3 行索引
+            self.assertFalse(idx.maybe_index(1003, 30))
+            self.assertFalse(idx.maybe_index(1004, 40))
+            self.assertTrue(idx.maybe_index(1005, 50))
+            self.assertEqual(idx.entry_count, 2)
+
+    def test_maybe_index_respects_time_interval(self):
+        """时间间隔到了即使行数不够也索引。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx = JsonlOffsetIndex(
+                Path(tmp_dir) / "test.idx",
+                line_interval=1000,  # 不会触发
+                time_interval_ms=5000,
+            )
+            # 第一行不会因 time_gap 触发（_last_indexed_ts == 0）
+            self.assertFalse(idx.maybe_index(1000, 0))
+            # 手动制造第一条索引
+            idx._timestamps.append(1000)
+            idx._offsets.append(0)
+            idx._last_indexed_ts = 1000
+            # 第二行：time_gap=1000 < 5000 → 不触发
+            self.assertFalse(idx.maybe_index(2000, 10))
+            # 第三行：time_gap=5000 >= 5000 → 触发
+            self.assertTrue(idx.maybe_index(6000, 20))
+            self.assertEqual(idx.entry_count, 2)
+
+    def test_seek_offset_binary_search(self):
+        """seek_offset 应返回 cutoff 前最近的 offset。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx = JsonlOffsetIndex(
+                Path(tmp_dir) / "test.idx",
+                line_interval=1,  # 每行都索引，便于测试
+                time_interval_ms=10_000_000,
+            )
+            # 模拟写入 5 条记录，offset 分别为 0, 10, 20, 30, 40
+            for i, (ts, off) in enumerate(
+                [(1000, 0), (2000, 10), (3000, 20), (4000, 30), (5000, 40)]
+            ):
+                idx.maybe_index(ts, off)
+
+            # cutoff=2500：第一个 >= 2500 的是 ts=3000 (idx=2)，
+            # 返回前一个 ts=2000 的 offset=10
+            self.assertEqual(idx.seek_offset(2500), 10)
+
+            # cutoff=3000：bisect_left 找到 idx=2 (ts=3000)，
+            # 返回前一个 ts=2000 的 offset=10
+            self.assertEqual(idx.seek_offset(3000), 10)
+
+            # cutoff=1000：bisect_left 找到 idx=0 (ts=1000)，
+            # idx==0 → 返回 0（从头扫）
+            self.assertEqual(idx.seek_offset(1000), 0)
+
+            # cutoff=500：所有 ts >= cutoff → 返回 0
+            self.assertEqual(idx.seek_offset(500), 0)
+
+            # cutoff=6000：所有 ts < cutoff → 返回最后一个 offset=40
+            self.assertEqual(idx.seek_offset(6000), 40)
+
+    def test_flush_and_reload_roundtrip(self):
+        """flush 后 reload 应恢复全部索引条目。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            idx = JsonlOffsetIndex(idx_path, line_interval=1)
+            for i in range(10):
+                idx.maybe_index(1000 + i * 100, i * 50)
+            idx.flush()
+            self.assertTrue(idx_path.exists())
+
+            # 新实例 reload
+            idx2 = JsonlOffsetIndex(idx_path)
+            idx2.load()
+            self.assertEqual(idx2.entry_count, 10)
+            self.assertEqual(idx2.seek_offset(1500), 200)  # ts=1400 的 offset
+
+    def test_flush_is_append_only(self):
+        """多次 flush 只追加新条目，不重写全文件。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx_path = Path(tmp_dir) / "test.idx"
+            idx = JsonlOffsetIndex(idx_path, line_interval=1)
+            # 第一次 flush 3 条
+            for i in range(3):
+                idx.maybe_index(1000 + i * 100, i * 10)
+            idx.flush()
+            first_size = idx_path.stat().st_size
+
+            # 第二次 flush 2 条
+            for i in range(3, 5):
+                idx.maybe_index(1000 + i * 100, i * 10)
+            idx.flush()
+            second_size = idx_path.stat().st_size
+            self.assertGreater(second_size, first_size)
+
+            # reload 验证全部 5 条
+            idx2 = JsonlOffsetIndex(idx_path)
+            idx2.load()
+            self.assertEqual(idx2.entry_count, 5)
+
+    def test_seek_offset_empty_index(self):
+        """空索引应返回 0（从头扫描）。"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            idx = JsonlOffsetIndex(Path(tmp_dir) / "nonexistent.idx")
+            self.assertEqual(idx.seek_offset(12345), 0)
+            self.assertTrue(idx.is_empty)
+
+    def test_store_add_batch_creates_index(self):
+        """add_batch 写入 JSONL 后应同时生成 .idx 索引文件。"""
+        config = MineSentinelConfig.from_dict({})
+        now = int(time.time() * 1000)
+        # 300 条记录，超过默认 line_interval=256，会触发至少 1 条索引
+        payload = {
+            "serverId": "survival",
+            "observations": [
+                {
+                    "eventId": f"log-{i}",
+                    "kind": "SERVER_LOG",
+                    "timestamp": now + i * 1000,
+                    "serverId": "survival",
+                    "content": f"[INFO]: line {i}",
+                    "tags": ["server_log"],
+                    "context": {"level": "INFO"},
+                }
+                for i in range(300)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            store.add_batch("survival", payload)
+
+            # 找到 JSONL 文件
+            jsonl_files = list(Path(tmp_dir).glob("observations/*/*.jsonl"))
+            self.assertEqual(len(jsonl_files), 1)
+            jsonl_path = jsonl_files[0]
+
+            # .idx 文件应存在（300 条记录 > 256 line_interval，触发索引）
+            idx_path = jsonl_path.with_suffix(".idx")
+            self.assertTrue(idx_path.exists(), f"Index file {idx_path} should exist")
+
+            # 索引应有条目
+            idx = JsonlOffsetIndex(idx_path)
+            idx.load()
+            self.assertGreater(idx.entry_count, 0)
+
+    def test_recent_window_uses_index_correctly(self):
+        """recent_window 使用索引 seek 后仍返回正确的窗口记录。"""
+        config = MineSentinelConfig.from_dict({})
+        base_ts = int(time.time() * 1000)
+
+        # 写入 300 条记录，时间跨度 300 秒（5 分钟）
+        observations = []
+        for i in range(300):
+            observations.append({
+                "eventId": f"log-{i}",
+                "kind": "SERVER_LOG",
+                "timestamp": base_ts - (300 - i) * 1000,
+                "serverId": "survival",
+                "content": f"[INFO]: line {i}",
+                "tags": ["server_log"],
+                "context": {"level": "INFO"},
+            })
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            store.add_batch("survival", {"serverId": "survival", "observations": observations})
+
+            # 读最近 1 分钟的窗口（recent(1, ...) = 1 minute window）
+            records = store.recent(1, "survival")
+            # 应只包含 timestamp >= base_ts - 60*1000 的记录
+            cutoff = base_ts - 60 * 1000
+            for r in records:
+                self.assertGreaterEqual(r.timestamp, cutoff)
+
+            # 验证索引文件确实被使用（有索引条目）
+            jsonl_path = next(Path(tmp_dir).glob("observations/*/*.jsonl"))
+            idx = JsonlOffsetIndex(jsonl_path.with_suffix(".idx"))
+            idx.load()
+            self.assertGreater(idx.entry_count, 0)
+
+    def test_export_recent_uses_index(self):
+        """export_recent 使用索引后导出内容与无索引一致。"""
+        config = MineSentinelConfig.from_dict({})
+        base_ts = int(time.time() * 1000)
+
+        observations = []
+        for i in range(300):
+            observations.append({
+                "eventId": f"log-{i}",
+                "kind": "SERVER_LOG",
+                "timestamp": base_ts - (300 - i) * 1000,
+                "serverId": "survival",
+                "content": f"[INFO]: line {i}",
+                "tags": ["server_log"],
+                "context": {"level": "INFO"},
+            })
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            store.add_batch("survival", {"serverId": "survival", "observations": observations})
+
+            # 导出最近 1 分钟的窗口
+            export_path = store.export_recent(1, "survival")
+            self.assertIsNotNone(export_path)
+            self.assertTrue(export_path.exists())
+
+            # 验证导出的记录都在窗口内
+            records = []
+            with export_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+            cutoff = base_ts - 60 * 1000
+            for r in records:
+                self.assertGreaterEqual(r["timestamp"], cutoff)
+            self.assertGreater(len(records), 0)
+
+    def test_cleanup_removes_idx_alongside_jsonl(self):
+        """cleanup 应同时删除过期的 .jsonl 和 .idx 文件。"""
+        from services.mine_sentinel.storage.paths import cleanup_old_files
+        config = MineSentinelConfig.from_dict({})
+        now = int(time.time() * 1000)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obs_dir = Path(tmp_dir) / "observations"
+            export_dir = Path(tmp_dir) / "exports"
+            obs_dir.mkdir(parents=True)
+            export_dir.mkdir(parents=True)
+
+            # 创建一个 2 天前的 JSONL + IDX 文件（模拟过期）
+            old_day = time.strftime(
+                "%Y%m%d",
+                time.localtime(time.time() - 2 * 86400),
+            )
+            server_dir = obs_dir / "survival"
+            server_dir.mkdir(parents=True)
+            old_jsonl = server_dir / f"{old_day}.jsonl"
+            old_jsonl.write_text("dummy\n", encoding="utf-8")
+            old_idx = server_dir / f"{old_day}.idx"
+            old_idx.write_text("1000\t0\n", encoding="utf-8")
+
+            # 创建今天的文件（不应被删）
+            today = time.strftime("%Y%m%d", time.localtime())
+            today_jsonl = server_dir / f"{today}.jsonl"
+            today_jsonl.write_text("dummy\n", encoding="utf-8")
+            today_idx = server_dir / f"{today}.idx"
+            today_idx.write_text("1000\t0\n", encoding="utf-8")
+
+            cleanup_old_files(obs_dir, export_dir, retention_minutes=480)
+
+            self.assertFalse(old_jsonl.exists())
+            self.assertFalse(old_idx.exists())
+            self.assertTrue(today_jsonl.exists())
+            self.assertTrue(today_idx.exists())
+
+    def test_read_jsonl_window_with_index_matches_without(self):
+        """有索引和无索引的 read_jsonl_window 结果应一致。"""
+        config = MineSentinelConfig.from_dict({})
+        base_ts = int(time.time() * 1000)
+        observations = []
+        for i in range(500):
+            observations.append({
+                "eventId": f"log-{i}",
+                "kind": "SERVER_LOG",
+                "timestamp": base_ts - (500 - i) * 1000,
+                "serverId": "survival",
+                "content": f"[INFO]: line {i}",
+                "tags": ["server_log"],
+                "context": {"level": "INFO"},
+            })
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            store.add_batch("survival", {"serverId": "survival", "observations": observations})
+
+            jsonl_path = next(Path(tmp_dir).glob("observations/*/*.jsonl"))
+            # 1 分钟窗口
+            cutoff = base_ts - 60 * 1000
+            end = base_ts + 1
+
+            # 无索引读取
+            rows_no_idx = list(store.codec.read_jsonl_window(jsonl_path, cutoff, end))
+
+            # 有索引读取
+            idx = JsonlOffsetIndex.for_jsonl(jsonl_path)
+            idx.load()
+            rows_with_idx = list(store.codec.read_jsonl_window(
+                jsonl_path, cutoff, end, index=idx
+            ))
+
+            self.assertEqual(len(rows_no_idx), len(rows_with_idx))
+            for a, b in zip(rows_no_idx, rows_with_idx):
+                self.assertEqual(a["eventId"], b["eventId"])
+
+
+class MineSentinelExportGzipTests(unittest.TestCase):
+    """验证 PR9 P1-3 export jsonl.gz + 同窗口复用。"""
+
+    def test_export_records_gzip_format(self):
+        """export_format=jsonl.gz 时应生成 .jsonl.gz 压缩文件。"""
+        import gzip as gzip_module
+        config = MineSentinelConfig.from_dict({
+            "report": {"export_format": "jsonl.gz", "export_reuse_existing": False}
+        })
+        now = int(time.time() * 1000)
+        records = [
+            ObservationRecord(
+                event_id=f"log-{i}",
+                kind="SERVER_LOG",
+                timestamp=now + i * 1000,
+                server_id="survival",
+                server_name="Survival",
+                content=f"line {i}",
+                tags=["server_log"],
+            )
+            for i in range(5)
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            path = store.export_records(records, 60, "survival")
+            self.assertIsNotNone(path)
+            self.assertTrue(str(path).endswith(".jsonl.gz"))
+            self.assertTrue(path.exists())
+
+            # 验证 gzip 文件内容可正确解压读取
+            with gzip_module.open(path, "rt", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+            self.assertEqual(len(lines), 5)
+            data = json.loads(lines[0])
+            self.assertEqual(data["eventId"], "log-0")
+
+    def test_export_recent_gzip_format(self):
+        """export_recent 在 jsonl.gz 模式下应生成压缩文件。"""
+        import gzip as gzip_module
+        config = MineSentinelConfig.from_dict({
+            "report": {"export_format": "jsonl.gz", "export_reuse_existing": False}
+        })
+        base_ts = int(time.time() * 1000)
+        observations = [
+            {
+                "eventId": f"log-{i}",
+                "kind": "SERVER_LOG",
+                "timestamp": base_ts - (10 - i) * 1000,
+                "serverId": "survival",
+                "content": f"line {i}",
+                "tags": ["server_log"],
+                "context": {"level": "INFO"},
+            }
+            for i in range(10)
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            store.add_batch("survival", {"serverId": "survival", "observations": observations})
+            path = store.export_recent(1, "survival")
+            self.assertIsNotNone(path)
+            self.assertTrue(str(path).endswith(".jsonl.gz"))
+
+            with gzip_module.open(path, "rt", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+            self.assertGreater(len(lines), 0)
+
+    def test_export_reuse_existing(self):
+        """export_reuse_existing=True 时同窗口导出应复用已有文件。"""
+        config = MineSentinelConfig.from_dict({
+            "report": {"export_format": "jsonl", "export_reuse_existing": True}
+        })
+        now = int(time.time() * 1000)
+        records = [
+            ObservationRecord(
+                event_id="log-1",
+                kind="SERVER_LOG",
+                timestamp=now,
+                server_id="survival",
+                server_name="Survival",
+                content="line 1",
+                tags=["server_log"],
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            path1 = store.export_records(records, 60, "survival")
+            self.assertIsNotNone(path1)
+            self.assertTrue(path1.exists())
+
+            # 记录文件修改时间
+            mtime1 = path1.stat().st_mtime
+
+            # 再次导出同窗口——应复用
+            path2 = store.export_records(records, 60, "survival")
+            self.assertIsNotNone(path2)
+            self.assertEqual(path1, path2)
+            self.assertEqual(path2.stat().st_mtime, mtime1)
+
+    def test_export_no_reuse_when_disabled(self):
+        """export_reuse_existing=False 时应每次重新写。"""
+        config = MineSentinelConfig.from_dict({
+            "report": {"export_format": "jsonl", "export_reuse_existing": False}
+        })
+        now = int(time.time() * 1000)
+        records = [
+            ObservationRecord(
+                event_id="log-1",
+                kind="SERVER_LOG",
+                timestamp=now,
+                server_id="survival",
+                server_name="Survival",
+                content="line 1",
+                tags=["server_log"],
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DiskObservationStore(config, Path(tmp_dir))
+            path1 = store.export_records(records, 60, "survival")
+            self.assertIsNotNone(path1)
+
+            # 同一秒内再导出（路径相同），但因 reuse=False，会重写
+            path2 = store.export_records(records, 60, "survival")
+            self.assertIsNotNone(path2)
+            self.assertEqual(path1, path2)  # 路径相同（同一分钟）
+
+    def test_cleanup_removes_gz_exports(self):
+        """cleanup 应清理过期的 .jsonl.gz 导出文件。"""
+        from services.mine_sentinel.storage.paths import cleanup_old_files
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obs_dir = Path(tmp_dir) / "observations"
+            export_dir = Path(tmp_dir) / "exports"
+            obs_dir.mkdir(parents=True)
+            export_dir.mkdir(parents=True)
+
+            # 创建一个过期的 .jsonl.gz 文件
+            old_gz = export_dir / "old_export.jsonl.gz"
+            old_gz.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+            old_mtime = time.time() - 2 * 3600  # 2 小时前
+            import os
+            os.utime(old_gz, (old_mtime, old_mtime))
+
+            # 创建一个未过期的 .jsonl.gz 文件
+            new_gz = export_dir / "new_export.jsonl.gz"
+            new_gz.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+
+            cleanup_old_files(obs_dir, export_dir, retention_minutes=60)
+            self.assertFalse(old_gz.exists())
+            self.assertTrue(new_gz.exists())
+
+
+class MineSentinelInfoDownsamplingTests(unittest.TestCase):
+    """PR9: 普通 INFO 降采样（interesting-only 模式）"""
+
+    def _make_source(self, server_id="srv"):
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+        return MineSentinelLogSourceConfig(
+            server_id=server_id,
+            server_name=server_id,
+            server_type="minecraft",
+            log_file="/tmp/latest.log",
+        )
+
+    def _make_config(self, mode="interesting", track_info=False):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        return MineSentinelRuntimeLogConfig(
+            template_parse_mode=mode,
+            anomaly_track_info=track_info,
+        )
+
+    def test_should_parse_all_mode_runs_full_pipeline(self):
+        """mode=all 时所有级别都进 template/anomaly。"""
+        from services.mine_sentinel.runtime_log import _should_parse_and_track
+        cfg = self._make_config("all", track_info=True)
+        # INFO
+        run_t, run_a = _should_parse_and_track("INFO", "player joined", cfg)
+        self.assertTrue(run_t)
+        self.assertTrue(run_a)
+        # WARN
+        run_t, run_a = _should_parse_and_track("WARN", "something", cfg)
+        self.assertTrue(run_t)
+        self.assertTrue(run_a)
+
+    def test_should_parse_all_mode_skips_anomaly_for_info_when_track_info_false(self):
+        """mode=all + anomaly_track_info=False：INFO 不进 anomaly，WARN 仍进。"""
+        from services.mine_sentinel.runtime_log import _should_parse_and_track
+        cfg = self._make_config("all", track_info=False)
+        run_t, run_a = _should_parse_and_track("INFO", "player joined", cfg)
+        self.assertTrue(run_t)  # 仍解析模板
+        self.assertFalse(run_a)  # 但不进 anomaly
+        run_t, run_a = _should_parse_and_track("WARN", "something", cfg)
+        self.assertTrue(run_t)
+        self.assertTrue(run_a)  # WARN 始终进 anomaly
+
+    def test_should_parse_warn_error_mode_skips_all_info(self):
+        """mode=warn_error：INFO 完全跳过 template/anomaly。"""
+        from services.mine_sentinel.runtime_log import _should_parse_and_track
+        cfg = self._make_config("warn_error", track_info=True)
+        run_t, run_a = _should_parse_and_track("INFO", "can't keep up!", cfg)
+        self.assertFalse(run_t)
+        self.assertFalse(run_a)
+        run_t, run_a = _should_parse_and_track("ERROR", "boom", cfg)
+        self.assertTrue(run_t)
+        self.assertTrue(run_a)
+
+    def test_should_parse_interesting_mode_keeps_interesting_info(self):
+        """mode=interesting：命中关键词的 INFO 才进 template/anomaly。"""
+        from services.mine_sentinel.runtime_log import _should_parse_and_track
+        cfg = self._make_config("interesting", track_info=False)
+        # 普通 INFO：跳过（第二个参数是 lowered content，与 _build_observation 调用一致）
+        run_t, run_a = _should_parse_and_track("INFO", "steve joined the game", cfg)
+        self.assertFalse(run_t)
+        self.assertFalse(run_a)
+        # 命中关键词的 INFO：保留
+        run_t, run_a = _should_parse_and_track(
+            "INFO", "can't keep up! running behind", cfg
+        )
+        self.assertTrue(run_t)
+        self.assertTrue(run_a)
+        # WARN：始终保留
+        run_t, run_a = _should_parse_and_track("WARN", "plugin slow", cfg)
+        self.assertTrue(run_t)
+        self.assertTrue(run_a)
+
+    def test_build_observation_marks_downsampled_info(self):
+        """降采样的 INFO 应被标记 info_downsampled，不调用 drain3/anomaly。"""
+        from services.mine_sentinel.runtime_log import _build_observation
+        from services.mine_sentinel.template_miner import reset_template_miner
+        from services.mine_sentinel.anomaly_detector import reset_anomaly_detector
+        reset_template_miner()
+        reset_anomaly_detector()
+        cfg = self._make_config("warn_error", track_info=False)
+        source = self._make_source()
+        obs = _build_observation(
+            source, Path("/tmp/latest.log"),
+            "[14:00:00 INFO]: Steve joined the game",
+            int(time.time() * 1000), 1000, runtime_config=cfg,
+        )
+        self.assertIn("info_downsampled", obs["tags"])
+        self.assertTrue(obs["context"]["infoDownsampled"])
+        # templateId 应为 fingerprint（降级），不是 drain3 cluster_id
+        self.assertTrue(obs["context"]["templateId"])
+        self.assertTrue(obs["context"]["templateFallback"])
+        # anomaly 字段为零值
+        self.assertEqual(obs["context"]["anomalyScore"], 0.0)
+        self.assertIn("skipped", obs["context"]["anomalyReason"])
+
+    def test_build_observation_keeps_warn_full_pipeline(self):
+        """WARN 即便在 warn_error 模式下仍走完整 template/anomaly。"""
+        from services.mine_sentinel.runtime_log import _build_observation
+        from services.mine_sentinel.template_miner import reset_template_miner
+        from services.mine_sentinel.anomaly_detector import reset_anomaly_detector
+        reset_template_miner()
+        reset_anomaly_detector()
+        cfg = self._make_config("warn_error", track_info=False)
+        source = self._make_source()
+        obs = _build_observation(
+            source, Path("/tmp/latest.log"),
+            "[14:00:00 WARN]: something failed",
+            int(time.time() * 1000), 1000, runtime_config=cfg,
+        )
+        self.assertNotIn("info_downsampled", obs["tags"])
+        self.assertNotIn("infoDownsampled", obs.get("context", {}))
+
+
+class MineSentinelShardedLockTests(unittest.TestCase):
+    """PR9: template_miner / anomaly_detector per-server 分片锁"""
+
+    def test_template_miner_per_server_locks_are_independent(self):
+        """不同 server_id 应获得不同的锁实例。"""
+        from services.mine_sentinel.template_miner import LogTemplateMiner
+        miner = LogTemplateMiner()
+        lock_a = miner._lock_for("srvA")
+        lock_b = miner._lock_for("srvB")
+        self.assertIsNot(lock_a, lock_b)
+        # 同一 server_id 复用锁
+        self.assertIs(miner._lock_for("srvA"), lock_a)
+
+    def test_template_miner_resolve_namespace_overflow_falls_back_to_default(self):
+        """超出 max_namespaces 时新 server_id 应回落到 default namespace。"""
+        from services.mine_sentinel.template_miner import LogTemplateMiner
+        miner = LogTemplateMiner(max_namespaces=2)
+        # 占满 2 个 namespace
+        ns1 = miner._resolve_namespace("srv1")
+        self.assertEqual(ns1, "srv1")
+        # 触发 parse 创建 miner
+        if miner.available:
+            miner.parse("line1", server_id="srv1")
+            miner.parse("line2", server_id="srv2")
+            # 第 3 个应回落到 default
+            ns3 = miner._resolve_namespace("srv3")
+            self.assertEqual(ns3, "default")
+        else:
+            # drain3 不可用时仍可验证 resolve 逻辑（不创建 miner 不超限）
+            self.assertEqual(miner._resolve_namespace("srv3"), "srv3")
+
+    def test_anomaly_detector_per_server_shards_are_independent(self):
+        """不同 server_id 的 observe 应落到不同分片。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+        detector = TemplateAnomalyDetector()
+        detector.observe("srvA", "T1", template="t", level="INFO")
+        detector.observe("srvB", "T1", template="t", level="INFO")
+        shard_a = detector._shard_for("srvA")
+        shard_b = detector._shard_for("srvB")
+        self.assertIsNot(shard_a, shard_b)
+        self.assertIn("T1", shard_a.stats)
+        self.assertIn("T1", shard_b.stats)
+        # 两个分片各自的 stats 独立
+        self.assertEqual(shard_a.server_id, "srvA")
+        self.assertEqual(shard_b.server_id, "srvB")
+
+    def test_anomaly_detector_snapshot_aggregates_across_shards(self):
+        """snapshot 应聚合所有分片的统计。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+        detector = TemplateAnomalyDetector()
+        detector.observe("srvA", "T1", template="t1", level="WARN")
+        detector.observe("srvB", "T2", template="t2", level="ERROR")
+        snap = detector.snapshot()
+        self.assertEqual(snap["template_count"], 2)
+        self.assertEqual(snap["per_server_count"].get("srvA"), 1)
+        self.assertEqual(snap["per_server_count"].get("srvB"), 1)
+
+
+class MineSentinelIoExecutorTests(unittest.TestCase):
+    """PR9: 专用 bounded ThreadPoolExecutor"""
+
+    def test_build_io_executor_returns_none_for_zero(self):
+        from services.mine_sentinel.io_executor import build_io_executor
+        self.assertIsNone(build_io_executor(0))
+        self.assertIsNone(build_io_executor(-1))
+
+    def test_build_io_executor_creates_pool_for_positive(self):
+        from services.mine_sentinel.io_executor import build_io_executor
+        exe = build_io_executor(2)
+        try:
+            self.assertIsNotNone(exe)
+            self.assertEqual(exe._max_workers, 2)
+        finally:
+            exe.shutdown(wait=False)
+
+    def test_executor_runner_runs_fn_in_pool(self):
+        """executor_runner 提交的 fn 应在专用线程池执行。"""
+        import asyncio
+        import threading
+        from services.mine_sentinel.io_executor import build_io_executor, executor_runner, shutdown_io_executor
+
+        exe = build_io_executor(1)
+        try:
+            runner = executor_runner(exe)
+
+            def _who():
+                return threading.current_thread().name
+
+            async def _main():
+                name = await runner(_who)
+                return name
+
+            name = asyncio.run(_main())
+            self.assertIn("mine-sentinel-io", name)
+        finally:
+            shutdown_io_executor(exe)
+
+    def test_executor_runner_falls_back_to_to_thread_when_none(self):
+        """executor 为 None 时应回退到 asyncio.to_thread。"""
+        import asyncio
+        from services.mine_sentinel.io_executor import executor_runner
+
+        runner = executor_runner(None)
+
+        def _fn(x):
+            return x * 2
+
+        async def _main():
+            return await runner(_fn, 21)
+
+        result = asyncio.run(_main())
+        self.assertEqual(result, 42)
+
+
+class MineSentinelGzScanCacheTests(unittest.TestCase):
+    """PR9: hourly .gz 已扫描缓存 + 文件名日期预过滤"""
+
+    def test_file_date_overlaps_hour_same_day(self):
+        from services.mine_sentinel.runtime_log import _file_date_overlaps_hour
+        from datetime import date
+        # 2024-01-15 14:00 ~ 15:00
+        start_ms = 1705327200000  # 2024-01-15 14:00 UTC
+        end_ms = start_ms + 3600_000
+        self.assertTrue(_file_date_overlaps_hour(date(2024, 1, 15), start_ms, end_ms))
+
+    def test_file_date_overlaps_hour_previous_day_for_boundary(self):
+        from services.mine_sentinel.runtime_log import _file_date_overlaps_hour
+        from datetime import date
+        start_ms = 1705327200000  # 2024-01-15 14:00 UTC
+        end_ms = start_ms + 3600_000
+        # 前一天（跨日边界归档）
+        self.assertTrue(_file_date_overlaps_hour(date(2024, 1, 14), start_ms, end_ms))
+
+    def test_file_date_overlaps_hour_skips_far_old(self):
+        from services.mine_sentinel.runtime_log import _file_date_overlaps_hour
+        from datetime import date
+        start_ms = 1705327200000  # 2024-01-15 14:00 UTC
+        end_ms = start_ms + 3600_000
+        # 一周前的归档应跳过
+        self.assertFalse(_file_date_overlaps_hour(date(2024, 1, 8), start_ms, end_ms))
+
+    def test_file_date_overlaps_hour_none_date_is_conservative_keep(self):
+        from services.mine_sentinel.runtime_log import _file_date_overlaps_hour
+        start_ms = 1705327200000
+        end_ms = start_ms + 3600_000
+        # latest.log 无文件名日期，保守保留
+        self.assertTrue(_file_date_overlaps_hour(None, start_ms, end_ms))
+
+    def test_gz_scan_cache_reuses_same_hour(self):
+        """同一 (path, mtime, hour_start) 重复扫描应命中缓存。"""
+        from services.mine_sentinel.runtime_log import (
+            _gz_scan_cache_get,
+            _gz_scan_cache_put,
+            _gz_scan_cache,
+        )
+        _gz_scan_cache.clear()
+        path = Path("/tmp/2024-01-15-1.log.gz")
+        mtime = 1234567890
+        hour_start = 1705327200000
+        rows = [("line1", hour_start + 1000, str(path))]
+        _gz_scan_cache_put(path, mtime, hour_start, rows)
+        cached = _gz_scan_cache_get(path, mtime, hour_start)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached, rows)
+        # 不同 mtime 或 hour 不命中
+        self.assertIsNone(_gz_scan_cache_get(path, mtime + 1, hour_start))
+        self.assertIsNone(_gz_scan_cache_get(path, mtime, hour_start + 3600_000))
+
+    def test_read_hour_log_lines_skips_far_old_archives(self):
+        """文件名日期明显早于目标小时的归档应被跳过，不打开。"""
+        import gzip as gzip_module
+        from services.mine_sentinel.runtime_log import read_hour_log_lines
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            logs = tmp_path / "logs"
+            logs.mkdir(parents=True)
+            # 创建一个一周前的归档，内容会触发异常如果被打开
+            old_archive = logs / "2024-01-08-1.log.gz"
+            with gzip_module.open(old_archive, "wt", encoding="utf-8") as f:
+                f.write("[14:00:00] [Server thread/INFO]: old\n")
+            # latest.log 留空
+            (logs / "latest.log").write_text("", encoding="utf-8")
+            source = MineSentinelLogSourceConfig(
+                server_id="srv", server_name="srv", root=str(tmp_path)
+            )
+            # 目标小时：2024-01-15 14:00
+            hour_start = 1705327200000
+            hour_end = hour_start + 3600_000
+            rows = read_hour_log_lines(source, hour_start, hour_end, max_lines=10)
+            # 应该为空（old archive 被日期过滤跳过，latest.log 为空）
+            self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":

@@ -57,8 +57,37 @@ class AnomalyResult:
     baseline: float
 
 
+class _Shard:
+    """单个 server_id 的异常检测分片。
+
+    PR9: 把原本全局共享的 _stats / _current_bucket / _observe_count 按 server_id
+    分片，每个分片有自己的锁，使多服/Velocity 场景下 observe() 真正并行。
+    """
+
+    __slots__ = (
+        "server_id",
+        "stats",
+        "current_bucket",
+        "observe_count",
+        "lock",
+    )
+
+    def __init__(self, server_id: str):
+        self.server_id = server_id
+        # template_id -> TemplateStat
+        self.stats: dict[str, TemplateStat] = {}
+        # template_id -> (bucket_index, count)
+        self.current_bucket: dict[str, tuple[int, int]] = {}
+        self.observe_count = 0
+        self.lock = threading.Lock()
+
+
 class TemplateAnomalyDetector:
     """模板计数突增检测器。
+
+    PR9 锁分片：``_shards`` 按 ``server_id`` 维护独立的 stats/bucket/锁，
+    不同服务器的 observe() 互不阻塞。snapshot/get_anomalies/flush_bucket
+    会按 server_id 排序依次获取各分片锁，聚合跨服视图。
 
     Parameters
     ----------
@@ -79,7 +108,7 @@ class TemplateAnomalyDetector:
     inactive_template_ttl_hours:
         超过此小时数未出现的模板被视为不活跃，会被清理（默认 24）。
     cleanup_interval:
-        每隔多少次 observe 触发一次清理（默认 200）。
+        每隔多少次 observe 触发一次清理（默认 200，按分片独立计数）。
     """
 
     def __init__(
@@ -94,7 +123,10 @@ class TemplateAnomalyDetector:
         inactive_template_ttl_hours: int = 24,
         cleanup_interval: int = 200,
     ):
-        self._lock = threading.Lock()
+        # PR9: per-server 分片。_shards_guard 仅保护 _shards 字典本身，
+        # 持有时间极短；observe() 在 _Shard.lock 下进行，互不阻塞。
+        self._shards_guard = threading.Lock()
+        self._shards: dict[str, _Shard] = {}
         self._bucket_seconds = max(1, bucket_seconds)
         self._ewma_alpha = max(0.01, min(1.0, ewma_alpha))
         self._spike_threshold = max(1.5, spike_threshold)
@@ -104,14 +136,18 @@ class TemplateAnomalyDetector:
         self._max_templates_per_server = max(1, max_templates_per_server)
         self._inactive_ttl_ms = max(1, inactive_template_ttl_hours) * 3600 * 1000
         self._cleanup_interval = max(1, cleanup_interval)
-        # (server_id, template_id) -> TemplateStat
-        self._stats: dict[tuple[str, str], TemplateStat] = {}
-        # 当前桶的计数：(server_id, template_id) -> (bucket_index, count)
-        self._current_bucket: dict[tuple[str, str], tuple[int, int]] = {}
-        # 清理统计
-        self._observe_count = 0
+        # 跨分片汇总的清理统计（仅在 _shards_guard 下读写，或 snapshot 聚合时读取）
         self._cleanup_count = 0
         self._last_cleanup_ms = 0
+
+    def _shard_for(self, server_id: str) -> _Shard:
+        """获取或创建指定 server_id 的分片。"""
+        with self._shards_guard:
+            shard = self._shards.get(server_id)
+            if shard is None:
+                shard = _Shard(server_id)
+                self._shards[server_id] = shard
+            return shard
 
     def observe(
         self,
@@ -121,14 +157,14 @@ class TemplateAnomalyDetector:
         level: str = "INFO",
         timestamp_ms: int | None = None,
     ) -> AnomalyResult:
-        """记录一条日志，更新统计并返回当前异常评估。"""
+        """记录一条日志，更新统计并返回当前异常评估。线程安全（per-server 锁）。"""
         if timestamp_ms is None:
             timestamp_ms = int(time.time() * 1000)
         bucket_index = timestamp_ms // (self._bucket_seconds * 1000)
-        key = (server_id, template_id)
+        shard = self._shard_for(server_id)
 
-        with self._lock:
-            stat = self._stats.get(key)
+        with shard.lock:
+            stat = shard.stats.get(template_id)
             if stat is None:
                 stat = TemplateStat(
                     server_id=server_id,
@@ -139,24 +175,24 @@ class TemplateAnomalyDetector:
                     last_seen_ms=timestamp_ms,
                     last_update_ms=timestamp_ms,
                 )
-                self._stats[key] = stat
+                shard.stats[template_id] = stat
                 # 新模板创建时检查 per-server 上限
-                self._enforce_max_templates(server_id, timestamp_ms)
+                self._enforce_max_templates(shard, timestamp_ms)
 
             # 桶切换：把上一个桶的计数写入滑动窗口并用它更新 EWMA，
             # 然后重置当前桶。注意：当前桶的 count 不更新 EWMA，
             # 否则突增桶会拉高自己的基线导致 ratio 不够。
-            bucket_state = self._current_bucket.get(key)
+            bucket_state = shard.current_bucket.get(template_id)
             current_count = 0
             if bucket_state is None or bucket_state[0] != bucket_index:
                 if bucket_state is not None and bucket_state[1] > 0:
                     self._update_ewma(stat, bucket_state[1])
                     stat.window.append(bucket_state[1])
                 current_count = 1
-                self._current_bucket[key] = (bucket_index, current_count)
+                shard.current_bucket[template_id] = (bucket_index, current_count)
             else:
                 current_count = bucket_state[1] + 1
-                self._current_bucket[key] = (bucket_index, current_count)
+                shard.current_bucket[template_id] = (bucket_index, current_count)
 
             stat.total_count += 1
             stat.last_seen_ms = timestamp_ms
@@ -164,10 +200,10 @@ class TemplateAnomalyDetector:
                 stat.template = template
             stat.level = level
 
-            # 周期性清理不活跃模板，防止长期运行状态膨胀
-            self._observe_count += 1
-            if self._observe_count % self._cleanup_interval == 0:
-                self._cleanup_inactive(timestamp_ms)
+            # 周期性清理不活跃模板，防止长期运行状态膨胀（按分片独立计数）
+            shard.observe_count += 1
+            if shard.observe_count % self._cleanup_interval == 0:
+                self._cleanup_inactive(shard, timestamp_ms)
 
             return self._evaluate(stat, current_count, timestamp_ms)
 
@@ -244,93 +280,109 @@ class TemplateAnomalyDetector:
             idx = len(sorted_vals) - 1
         return float(sorted_vals[idx])
 
-    def _cleanup_inactive(self, now_ms: int):
-        """清理超过 TTL 未活跃的模板，防止长期运行状态膨胀。"""
+    def _cleanup_inactive(self, shard: _Shard, now_ms: int):
+        """清理分片内超过 TTL 未活跃的模板，防止长期运行状态膨胀。"""
         cutoff = now_ms - self._inactive_ttl_ms
         expired_keys = [
-            key for key, stat in self._stats.items()
+            template_id
+            for template_id, stat in shard.stats.items()
             if stat.last_seen_ms < cutoff
         ]
-        for key in expired_keys:
-            self._stats.pop(key, None)
-            self._current_bucket.pop(key, None)
+        for template_id in expired_keys:
+            shard.stats.pop(template_id, None)
+            shard.current_bucket.pop(template_id, None)
         if expired_keys:
             self._cleanup_count += len(expired_keys)
             self._last_cleanup_ms = now_ms
 
-    def _enforce_max_templates(self, server_id: str, now_ms: int):
-        """当某 server 的模板数超过上限时，淘汰最久未见的。"""
-        server_stats = [
-            (key, stat) for key, stat in self._stats.items()
-            if stat.server_id == server_id
-        ]
-        if len(server_stats) <= self._max_templates_per_server:
+    def _enforce_max_templates(self, shard: _Shard, now_ms: int):
+        """当分片内模板数超过上限时，淘汰最久未见的。"""
+        if len(shard.stats) <= self._max_templates_per_server:
             return
         # 按 last_seen_ms 升序，淘汰最旧的
-        server_stats.sort(key=lambda x: x[1].last_seen_ms)
-        evict_count = len(server_stats) - self._max_templates_per_server
-        for key, _ in server_stats[:evict_count]:
-            self._stats.pop(key, None)
-            self._current_bucket.pop(key, None)
+        sorted_items = sorted(shard.stats.items(), key=lambda x: x[1].last_seen_ms)
+        evict_count = len(sorted_items) - self._max_templates_per_server
+        for template_id, _ in sorted_items[:evict_count]:
+            shard.stats.pop(template_id, None)
+            shard.current_bucket.pop(template_id, None)
         self._cleanup_count += evict_count
         self._last_cleanup_ms = now_ms
 
+    def _iter_shards_sorted(self) -> list[tuple[str, _Shard]]:
+        """返回按 server_id 排序的分片列表（snapshot/aggregate 用，避免死锁）。"""
+        with self._shards_guard:
+            return sorted(self._shards.items())
+
     def get_anomalies(self, min_score: float = 0.5) -> list[TemplateStat]:
         """返回当前所有异常模板（score >= min_score）。"""
-        with self._lock:
-            return [
-                stat
-                for stat in self._stats.values()
-                if stat.last_anomaly_score >= min_score
-            ]
+        result: list[TemplateStat] = []
+        for _, shard in self._iter_shards_sorted():
+            with shard.lock:
+                result.extend(
+                    stat
+                    for stat in shard.stats.values()
+                    if stat.last_anomaly_score >= min_score
+                )
+        return result
 
     def snapshot(self) -> dict[str, Any]:
         """返回所有模板统计快照，用于 LLM 证据和报告。"""
-        with self._lock:
-            # 按 server_id 统计模板数
-            per_server: dict[str, int] = {}
-            for stat in self._stats.values():
-                per_server[stat.server_id] = per_server.get(stat.server_id, 0) + 1
-            return {
-                "template_count": len(self._stats),
-                "per_server_count": per_server,
-                "cleanup_count": self._cleanup_count,
-                "last_cleanup_ms": self._last_cleanup_ms,
-                "anomalies": [
-                    {
-                        "server_id": s.server_id,
-                        "template_id": s.template_id,
-                        "template": s.template,
-                        "level": s.level,
-                        "total_count": s.total_count,
-                        "ewma_count": round(s.ewma_count, 2),
-                        "current_score": round(s.last_anomaly_score, 3),
-                        "reason": s.last_anomaly_reason,
-                        "first_seen_ms": s.first_seen_ms,
-                        "last_seen_ms": s.last_seen_ms,
-                    }
-                    for s in sorted(
-                        self._stats.values(),
-                        key=lambda x: x.last_anomaly_score,
-                        reverse=True,
-                    )[:20]
-                ],
-            }
+        per_server: dict[str, int] = {}
+        total_count = 0
+        all_stats: list[TemplateStat] = []
+        for server_id, shard in self._iter_shards_sorted():
+            with shard.lock:
+                shard_stats = list(shard.stats.values())
+            per_server[server_id] = len(shard_stats)
+            total_count += len(shard_stats)
+            all_stats.extend(shard_stats)
+        return {
+            "template_count": total_count,
+            "per_server_count": per_server,
+            "cleanup_count": self._cleanup_count,
+            "last_cleanup_ms": self._last_cleanup_ms,
+            "anomalies": [
+                {
+                    "server_id": s.server_id,
+                    "template_id": s.template_id,
+                    "template": s.template,
+                    "level": s.level,
+                    "total_count": s.total_count,
+                    "ewma_count": round(s.ewma_count, 2),
+                    "current_score": round(s.last_anomaly_score, 3),
+                    "reason": s.last_anomaly_reason,
+                    "first_seen_ms": s.first_seen_ms,
+                    "last_seen_ms": s.last_seen_ms,
+                }
+                for s in sorted(
+                    all_stats,
+                    key=lambda x: x.last_anomaly_score,
+                    reverse=True,
+                )[:20]
+            ],
+        }
 
     def flush_bucket(self, server_id: str | None = None, now_ms: int | None = None):
         """手动把当前桶计数写入滑动窗口（用于 hourly 切换或周期报告前）。"""
         if now_ms is None:
             now_ms = int(time.time() * 1000)
         bucket_index = now_ms // (self._bucket_seconds * 1000)
-        with self._lock:
-            for key, state in list(self._current_bucket.items()):
-                if server_id and key[0] != server_id:
-                    continue
-                if state[0] != bucket_index and state[1] > 0:
-                    stat = self._stats.get(key)
-                    if stat:
-                        stat.window.append(state[1])
-                    self._current_bucket[key] = (bucket_index, 0)
+        if server_id is not None:
+            shard = self._shard_for(server_id)
+            with shard.lock:
+                self._flush_shard_bucket(shard, bucket_index)
+            return
+        for _, shard in self._iter_shards_sorted():
+            with shard.lock:
+                self._flush_shard_bucket(shard, bucket_index)
+
+    def _flush_shard_bucket(self, shard: _Shard, bucket_index: int):
+        for template_id, state in list(shard.current_bucket.items()):
+            if state[0] != bucket_index and state[1] > 0:
+                stat = shard.stats.get(template_id)
+                if stat:
+                    stat.window.append(state[1])
+                shard.current_bucket[template_id] = (bucket_index, 0)
 
 
 # 全局单例

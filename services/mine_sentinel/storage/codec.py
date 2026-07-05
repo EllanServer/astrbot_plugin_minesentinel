@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - 纯 Python 降级路径
     _HAS_RUST = False
 
 from ..models import MineSentinelConfig, ObservationRecord
+from .offset_index import JsonlOffsetIndex
 
 _JSON_DUMPS = json.dumps
 _JSON_LOADS = json.loads
@@ -137,17 +138,29 @@ class ObservationRecordCodec:
         path: Path,
         cutoff_ms: int,
         end_ms: int | None = None,
+        index: JsonlOffsetIndex | None = None,
     ):
         """Yield JSONL rows whose timestamp falls in [cutoff_ms, end_ms).
 
         假设 JSONL 文件按 timestamp 单调递增写入（tailer 保证）。
         ``end_ms`` 是右开边界：``ts == end_ms`` 的行不包含在窗口内，
         与注释语义一致。
+
+        当传入 ``index`` 时，先通过索引二分查找 ``cutoff_ms`` 附近的
+        byte offset 再 ``seek``，避免从文件开头顺序扫描。索引是可选的：
+        无索引时退化为全量扫描，行为与原来一致。
         """
+        start_offset = 0
+        if index is not None:
+            start_offset = index.seek_offset(cutoff_ms)
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
+            # 用二进制模式打开，以便在 text mode 下也能 seek 到任意 byte offset。
+            # 不带索引时 start_offset==0，等价于从头读。
+            with path.open("rb") as handle:
+                if start_offset > 0:
+                    handle.seek(start_offset)
+                for raw_line in handle:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     try:
