@@ -574,6 +574,42 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         self.assertEqual(len(r1), 1)  # 首条直接放行
         self.assertEqual(len(r2), 0)  # 第二条被合并（30s < summary_interval=60s）
 
+    def test_anomaly_detector_detects_spike(self):
+        """异常检测器应当识别模板计数突增。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+
+        detector = TemplateAnomalyDetector(
+            bucket_seconds=1, ewma_alpha=0.3,
+            spike_threshold=2.5, min_baseline_count=3,
+        )
+        # 先积累基线（低计数）
+        for i in range(5):
+            detector.observe("srv", "T1", template="<*> connection reset",
+                             level="WARN", timestamp_ms=i * 1000)
+        # 突增：短时间内大量同类日志
+        # 20 条分布在两个 bucket（5xxx 和 6xxx），各 10 条。
+        # 第一个突增 bucket（5xxx）在累计到 ~5 条时超过 baseline*spike_threshold，
+        # 异常发生在 spike_results[4:10]；第二个 bucket 的 baseline 已被第一个
+        # bucket 拉高（EWMA 在 bucket 切换时更新），因此检测整个 spike 阶段即可。
+        spike_results = []
+        for i in range(20):
+            r = detector.observe("srv", "T1", template="<*> connection reset",
+                                 level="WARN", timestamp_ms=5000 + i * 100)
+            spike_results.append(r)
+        # 突增阶段应当出现异常告警
+        self.assertTrue(any(r.is_anomaly for r in spike_results))
+        self.assertTrue(any(r.score >= 0.5 for r in spike_results))
+
+    def test_anomaly_detector_marks_new_template(self):
+        """新模板首次出现应当有 novelty 分数。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+
+        detector = TemplateAnomalyDetector()
+        r = detector.observe("srv", "NEW_TPL", template="first time seen",
+                             level="INFO", timestamp_ms=1000)
+        self.assertGreater(r.score, 0.0)
+        self.assertIn("new_template", r.reason)
+
 
 class MineSentinelRulesTests(unittest.TestCase):
     """Tests for the refactored rules engine: network/plugin categories and critical direct alert."""
@@ -1099,6 +1135,32 @@ class MineSentinelRulesTests(unittest.TestCase):
         for key in ("chat_review", "player_feedback", "community_ops"):
             self.assertIn(key, report["categories"])
             self.assertIsInstance(report["categories"][key], list)
+
+    # --- PR3: 异常分数提级 severity ---
+    def test_severity_promoted_by_anomaly_score(self):
+        """异常分数 >= 0.6 应当把 severity 至少提升到 high。"""
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        # 构造一条普通 WARN 日志，但带高异常分数
+        record = self._make_record(
+            "[14:00 WARN]: connection reset by peer",
+            level="WARN",
+            context={"anomalyScore": 0.7, "anomalyReason": "ewma_spike: ratio=4.0"},
+        )
+        report = builder.build([record], window_minutes=60)
+        self.assertEqual(report["max_severity"], "high")
+
+    def test_severity_critical_for_extreme_anomaly(self):
+        """异常分数 >= 0.8 应当直接提级 critical。"""
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[14:00 WARN]: connection reset",
+            level="WARN",
+            context={"anomalyScore": 0.9, "anomalyReason": "ewma_spike: ratio=8.0"},
+        )
+        report = builder.build([record], window_minutes=60)
+        self.assertEqual(report["max_severity"], "critical")
 
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):

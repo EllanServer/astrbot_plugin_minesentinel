@@ -17,6 +17,7 @@ from astrbot.api import logger
 
 from .models import MineSentinelLogSourceConfig, MineSentinelRuntimeLogConfig
 from .template_miner import get_template_miner
+from .anomaly_detector import get_anomaly_detector
 
 
 BatchHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
@@ -753,6 +754,14 @@ def _build_observation(
     parsed = get_template_miner().parse(content)
     template_id = parsed.template_id
     template = parsed.template
+    # 异常检测：基于模板计数突增（EWMA + 分位数）
+    anomaly = get_anomaly_detector().observe(
+        server_id=source.server_id or "minecraft",
+        template_id=template_id,
+        template=template,
+        level=level,
+        timestamp_ms=timestamp_ms,
+    )
     digest = hashlib.sha1(
         f"{source.server_id}:{timestamp_ms}:{fingerprint}:{log_file.name}".encode("utf-8")
     ).hexdigest()[:20]
@@ -772,6 +781,8 @@ def _build_observation(
         tags.append("warning")
     if parsed.is_new_template:
         tags.append("new_template")
+    if anomaly.is_anomaly:
+        tags.append("anomaly_spike")
     context = {
         "source": "astrbot_runtime_log",
         "logFile": str(log_file),
@@ -782,6 +793,10 @@ def _build_observation(
         "templateId": template_id,
         "template": template,
         "templateSize": parsed.cluster_size,
+        "anomalyScore": round(anomaly.score, 3),
+        "anomalyReason": anomaly.reason,
+        "anomalyBaseline": round(anomaly.baseline, 2),
+        "anomalyCurrentCount": anomaly.current_count,
     }
     if parsed.params:
         context["templateParams"] = parsed.params[:8]

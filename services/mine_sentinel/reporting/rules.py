@@ -554,6 +554,26 @@ class HeuristicReportBuilder:
     def _severity(self, group: list[ObservationRecord]) -> str:
         text = " ".join(self._record_text(record) for record in group)
         n = len(group)
+        # 异常分数提级：模板计数突增（EWMA + 分位数）达到高分直接提级
+        max_anomaly = 0.0
+        for record in group:
+            ctx = record.context or {}
+            try:
+                score = float(ctx.get("anomalyScore") or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            if score > max_anomaly:
+                max_anomaly = score
+        if max_anomaly >= 0.8:
+            return "critical"
+        if max_anomaly >= 0.6:
+            # 异常突增至少 high（除非其他规则已判 critical）
+            base = self._severity_by_rules(text, n)
+            return "critical" if base == "critical" else "high"
+        return self._severity_by_rules(text, n)
+
+    def _severity_by_rules(self, text: str, n: int) -> str:
+        """关键词 + 计数驱动的 severity 判定（不含异常分数提级）。"""
         # critical: 崩溃 / OOM / watchdog / 服务停止 / 代理大面积不可用
         if any(marker in text for marker in CRITICAL_MARKERS):
             return "critical"
