@@ -145,7 +145,11 @@ class _SourceState:
     log_file: Path
     position: int = 0
     partial: str = ""  # 兼容字段：仅在无 backlog 时表示未闭合行；新代码用 partial_line
-    partial_line: str = ""  # 未闭合的最后一行（不含换行符）
+    # PR9 hotfix v5: partial_line 改为 bytes-level，保留未闭合的尾部
+    # bytes（可能切断在 UTF-8 多字节字符中间），下一轮读取时与新 bytes
+    # 拼接后用增量 UTF-8 解码器解码。避免 errors="replace" 把半个
+    # 中文字符替换成 U+FFFD，污染日志证据。
+    partial_line: bytes = b""  # 未闭合的尾部 bytes（未解码）
     backlog: deque[str] = field(default_factory=deque)  # 完整行积压队列
     last_timestamp_ms: int = 0
     missing_logged: bool = False
@@ -426,12 +430,17 @@ class MineSentinelRuntimeLogTailer:
         if size < state.position:
             # 日志轮转：旧文件被截断/重命名，新文件从头开始。
             # PR9 hotfix: 不要直接清空 backlog——未处理的旧行应继续被 drain。
-            # partial_line 是旧文件最后一条未闭合的行，轮转意味着旧文件已 EOF，
-            # 把它作为完整行追加到 backlog（避免与新文件首行拼接产生垃圾）。
+            # partial_line 是旧文件最后一条未闭合的行（bytes），轮转意味着
+            # 旧文件已 EOF，把它解码为完整行追加到 backlog（避免与新文件首行
+            # 拼接产生垃圾）。PR9 hotfix v5: partial_line 是 bytes，需先解码。
             had_pending = bool(state.backlog) or bool(state.partial_line)
             if state.partial_line:
-                state.backlog.append(state.partial_line)
-                state.partial_line = ""
+                # 轮转时旧文件已 EOF，残留 bytes 视为完整行；用 errors="replace"
+                # 兜底（理论上正常路径下 partial_line 已是完整 UTF-8 序列）。
+                state.backlog.append(
+                    state.partial_line.decode("utf-8", errors="replace")
+                )
+                state.partial_line = b""
                 state.partial = ""
             await self._backfill_source(
                 state,
@@ -642,12 +651,12 @@ def _file_size(path: Path) -> int | None:
 def _read_appended_lines(
     path: Path,
     position: int,
-    partial_line: str,
+    partial_line: bytes,
     backlog: deque[str],
     max_bytes: int,
     max_lines: int,
     max_line_length: int,
-) -> tuple[list[str], int, str, deque[str], int]:
+) -> tuple[list[str], int, bytes, deque[str], int]:
     """Read appended bytes from ``path`` and split into lines.
 
     Returns ``(lines, new_position, next_partial_line, next_backlog, dropped_count)``.
@@ -657,12 +666,21 @@ def _read_appended_lines(
     1. 优先从 backlog 弹出 ``max_lines`` 行处理；
     2. backlog 不够时再读文件追加新行；
     3. 新读出来超过 ``max_lines`` 的完整行 append 到 backlog 末尾；
-    4. ``partial_line`` 只保存未闭合的一行，不再混用完整 backlog。
+    4. ``partial_line`` 只保存未闭合的一行的尾部 bytes（未解码）。
+
+    PR9 hotfix v5: ``partial_line`` 是 bytes-level。读取的 ``data`` 是
+    bytes，与 ``partial_line`` 拼接后用 ``codecs.getincrementaldecoder``
+    增量解码：当 bytes 切断在 UTF-8 多字节字符中间时，增量解码器返回
+    已解码的前缀，未消费的尾部 bytes 保留在 decoder 内部 buffer，
+    通过 ``decoder.buffer`` 取出存入 ``next_partial_line``，下一轮再拼接。
+    避免 ``errors="replace"`` 把半个中文字符替换成 U+FFFD 污染证据。
 
     只有当 backlog 累积超过 ``max_lines * 4`` 行时，才丢弃最旧的行并报告
     ``dropped_count``。相比旧 str partial 方案，避免了大 burst 时反复
     split/join 的 O(n) 字符串复制开销。
     """
+    import codecs
+
     max_backlog_lines = max(1, max_lines * 4)
 
     # 第一步：先从 backlog 取 max_lines 行
@@ -695,14 +713,28 @@ def _read_appended_lines(
         # 无新数据：可能 backlog 还剩一些（少于 max_lines），本轮就处理这些
         return lines, new_position, partial_line, backlog, 0
 
-    text = data.decode("utf-8", errors="replace")
-    if partial_line:
-        text = partial_line + text
+    # PR9 hotfix v5: bytes-level 增量 UTF-8 解码。
+    # 把上一轮残留的 partial_line bytes 与本轮新读到的 bytes 拼接，
+    # 用 IncrementalDecoder 解码。strict 模式：若拼接后仍切断在多字节
+    # 字符中间，decoder.decode(raw, final=False) 返回已解码的前缀，
+    # 未消费的尾部 bytes 保留在 decoder.buffer 中。
+    # 若存在非法 UTF-8 字节序列（不是切断，而是真的损坏），strict 会
+    # 抛 UnicodeDecodeError，此时回退 errors="replace" 解码全量。
+    raw = partial_line + data
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    try:
+        text = decoder.decode(raw, final=False)
+        truncated_bytes = decoder.buffer  # 切断在多字节字符中间的尾部
+    except UnicodeDecodeError:
+        # 真正的 UTF-8 损坏（非切断），回退 replace 模式，buffer 清空。
+        text = raw.decode("utf-8", errors="replace")
+        truncated_bytes = b""
 
     parts = text.splitlines(keepends=True)
-    next_partial_line = ""
     if parts and not parts[-1].endswith(("\n", "\r")):
-        next_partial_line = parts.pop()
+        next_partial_str = parts.pop()
+    else:
+        next_partial_str = ""
 
     new_lines = [_truncate(part.rstrip("\r\n"), max_line_length) for part in parts if part.strip()]
 
@@ -721,9 +753,20 @@ def _read_appended_lines(
                 break
             backlog.popleft()
 
-    # 裁剪过长的 partial_line
-    if next_partial_line and len(next_partial_line) > max_line_length * 2:
-        next_partial_line = next_partial_line[-max_line_length:]
+    # 计算 next_partial_line（bytes）：
+    # - next_partial_str：已解码但未闭合的完整行（无换行）
+    # - truncated_bytes：切断在多字节字符中间的尾部（decoder 未消费）
+    # 两者可能同时存在：text 末尾是完整行 + 切断的字符尾部。
+    # 拼接顺序：next_partial_str 编码 + truncated_bytes。
+    if next_partial_str or truncated_bytes:
+        next_partial_line = next_partial_str.encode("utf-8") + truncated_bytes
+        # 裁剪过长的 partial_line（按 bytes 长度，避免跨轮堆积超长缓冲）。
+        # 注意：按 bytes 切片可能再次切断 UTF-8，但下一轮的 IncrementalDecoder
+        # 会把切断的尾部作为新的 truncated_bytes 保留，不会污染。
+        if len(next_partial_line) > max_line_length * 6:
+            next_partial_line = next_partial_line[-(max_line_length * 4) :]
+    else:
+        next_partial_line = b""
 
     return lines, new_position, next_partial_line, backlog, dropped_count
 

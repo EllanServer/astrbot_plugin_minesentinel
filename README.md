@@ -58,6 +58,35 @@ python -c "import mine_sentinel_rs; print('rust core enabled')"
 
 不需要在目标机器本地编译 Rust。如果 `import mine_sentinel_rs` 失败，插件照常工作，只是日志里不会出现 "rust core enabled"。
 
+## 升级注意事项（从旧版本升级）
+
+PR9 hotfix 之后的版本给 JSONL 偏移索引（`.idx`）引入了逐行 `_last_seen_ts` 单调性保证，并在文件头写入 `#monotonic` / `#trust_legacy` 标记，使 `read_jsonl_window` 能安全地按时间戳二分 seek，避免全量扫描。
+
+**旧版本生成的 `.idx` 没有这些标记，也不保证逐行单调**（尤其是回扫、跨天、日志轮转混写场景）。当前版本默认 `trust_legacy_index: true`（性能优先），会把无 `#trust_legacy` 头的旧 `.idx` 当作可信直接 seek，**极端情况下可能漏掉部分窗口日志**。
+
+升级后建议二选一：
+
+1. **删除旧 `.idx`，让新版本重建**（推荐，最简单）：
+
+   ```bash
+   # 默认存储路径，按需替换为实际 storage_dir
+   find services/mine_sentinel/.cache/observations -name '*.idx' -delete
+   ```
+
+   删除后下一次读取/写入会用新格式重建索引，后续 `.idx` 始终可信，不受 `trust_legacy_index` 影响。
+
+2. **保留旧 `.idx`，但启用保守模式**（适合不想重建索引、且磁盘上有大量历史 `.jsonl` 的用户）：
+
+   ```yaml
+   mine_sentinel:
+     storage:
+       trust_legacy_index: false
+   ```
+
+   此时旧 `.idx` 会被视为非单调，`read_jsonl_window` 退化为全量扫描，保证不漏日志但性能下降。新写入的 `.idx` 始终可信，不受此开关影响。
+
+如果不确定旧 `.idx` 的来源，优先选方案 1。
+
 ## 命令
 
 - `/mc help`：查看 MineSentinel 审计命令。

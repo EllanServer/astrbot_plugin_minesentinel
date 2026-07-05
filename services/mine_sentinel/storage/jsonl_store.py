@@ -196,10 +196,14 @@ class DiskObservationStore:
         window_minutes: int,
         server_id: str | None = None,
         label: str = "",
+        end_ms: int | None = None,
     ) -> Path | None:
         if not records:
             return None
-        now = int(time.time())
+        # PR9 hotfix v5: 用毫秒级时间戳，配合 window_export_stem 的毫秒级精度。
+        # end_ms 可选：周期报告 retry 时传固定的 scheduled_window_end_ms 使
+        # 多次重试命中同一文件名以复用；手动 report now 不传，用当前时间。
+        now = int(time.time() * 1000) if end_ms is None else end_ms
         suffix = self._export_suffix()
         path = export_path(
             self.export_dir, window_minutes, server_id, label, now, suffix=suffix
@@ -228,8 +232,9 @@ class DiskObservationStore:
         # 当前时刻写入的记录不应被排除。
         end_ms = int(now_ts * 1000) + 1
         suffix = self._export_suffix()
+        # PR9 hotfix v5: 传毫秒级 end_ms 给 export_path，配合毫秒级文件名精度。
         path = export_path(
-            self.export_dir, window_minutes, server_id, label, now_ts, suffix=suffix
+            self.export_dir, window_minutes, server_id, label, end_ms, suffix=suffix
         )
 
         # 同窗口复用：如果文件已存在且复用开启，直接返回

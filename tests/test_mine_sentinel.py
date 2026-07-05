@@ -557,12 +557,12 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             # 写入 10 行，max_lines=3 → 本轮处理前 3 行，剩余 7 行存入 backlog
             path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
             lines, position, partial_line, backlog, dropped = _read_appended_lines(
-                path, 0, "", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
+                path, 0, b"", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines), 3)
             self.assertEqual(dropped, 0)  # 不丢弃，推迟到下一轮
             self.assertEqual(len(backlog), 7)  # backlog 有 7 行
-            self.assertEqual(partial_line, "")  # 无未闭合行
+            self.assertEqual(partial_line, b"")  # 无未闭合行
             self.assertGreater(position, 0)
             # 本轮处理前 3 行
             self.assertEqual(lines[0], "line 0")
@@ -578,7 +578,7 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
             # 第一轮：处理前 3 行，剩余 7 行存入 backlog
             lines1, position, partial1, backlog1, dropped1 = _read_appended_lines(
-                path, 0, "", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
+                path, 0, b"", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines1), 3)
             self.assertEqual(dropped1, 0)
@@ -606,7 +606,7 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             self.assertEqual(len(lines4), 1)
             self.assertEqual(lines4[0], "line 9")
             self.assertEqual(len(backlog4), 0)
-            self.assertEqual(partial4, "")
+            self.assertEqual(partial4, b"")
 
     def test_read_appended_lines_drops_when_backlog_exceeds_limit(self):
         """backlog 超过 max_lines*4 时才丢弃最旧的行。"""
@@ -616,7 +616,7 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             # max_lines=3 → backlog 上限 12 行；写 20 行
             path.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
             lines, position, partial_line, backlog, dropped = _read_appended_lines(
-                path, 0, "", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
+                path, 0, b"", deque(), max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines), 3)
             # 20 - 3(processed) - 12(backlog) = 5 dropped
@@ -634,12 +634,12 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             path = Path(tmp) / "ok.log"
             path.write_text("a\nb\n")
             lines, _position, partial_line, backlog, dropped = _read_appended_lines(
-                path, 0, "", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
+                path, 0, b"", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
             )
             self.assertEqual(lines, ["a", "b"])
             self.assertEqual(dropped, 0)
             self.assertEqual(len(backlog), 0)
-            self.assertEqual(partial_line, "")
+            self.assertEqual(partial_line, b"")
 
     def test_read_appended_lines_preserves_partial_line_across_polls(self):
         """未闭合的 partial_line 应跨轮保留，与文件新数据拼接。"""
@@ -649,11 +649,11 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             # 写入不完整的一行（无换行符）
             path.write_text("incomplete line without newline")
             lines1, position1, partial1, backlog1, dropped1 = _read_appended_lines(
-                path, 0, "", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
+                path, 0, b"", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
             )
             # 无完整行，全部进 partial_line
             self.assertEqual(len(lines1), 0)
-            self.assertEqual(partial1, "incomplete line without newline")
+            self.assertEqual(partial1, b"incomplete line without newline")
             self.assertEqual(len(backlog1), 0)
             # 追加换行符使之成为完整行
             with path.open("a") as f:
@@ -662,7 +662,73 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
                 path, position1, partial1, backlog1, max_bytes=65536, max_lines=10, max_line_length=1000
             )
             self.assertEqual(lines2, ["incomplete line without newline", "second line"])
-            self.assertEqual(partial2, "")
+            self.assertEqual(partial2, b"")
+            self.assertEqual(len(backlog2), 0)
+
+    def test_read_appended_lines_preserves_partial_line_across_polls(self):
+        """未闭合的 partial_line 应跨轮保留，与文件新数据拼接。"""
+        from collections import deque
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial.log"
+            # 写入不完整的一行（无换行符）
+            path.write_text("incomplete line without newline")
+            lines1, position1, partial1, backlog1, dropped1 = _read_appended_lines(
+                path, 0, b"", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            # 无完整行，全部进 partial_line
+            self.assertEqual(len(lines1), 0)
+            self.assertEqual(partial1, b"incomplete line without newline")
+            self.assertEqual(len(backlog1), 0)
+            # 追加换行符使之成为完整行
+            with path.open("a") as f:
+                f.write("\nsecond line\n")
+            lines2, position2, partial2, backlog2, dropped2 = _read_appended_lines(
+                path, position1, partial1, backlog1, max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            self.assertEqual(lines2, ["incomplete line without newline", "second line"])
+            self.assertEqual(partial2, b"")
+            self.assertEqual(len(backlog2), 0)
+
+    def test_read_appended_lines_handles_utf8_multibyte_split_across_polls(self):
+        """PR9 hotfix v5: 中文 UTF-8 多字节字符被 max_bytes 切断时，
+        partial_line 应保留未消费的 bytes，下一轮拼接后正确解码，
+        不应出现 U+FFFD 替换字符污染日志证据。"""
+        from collections import deque
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chinese.log"
+            # 一行中文日志，UTF-8 编码后每字 3 字节。
+            # "玩家进入服务器：EllanServer" = 11 个中文字符 + 半角 ASCII
+            full_line = "玩家进入服务器：EllanServer\n"
+            full_bytes = full_line.encode("utf-8")
+            # 切断在第 5 个中文字符之后（"玩家进入服" = 15 bytes），
+            # 切断点正好在多字节字符边界前（第 5 个字符完整，第 6 个字符还没开始）
+            # 改成切断在第 5 个字符中间：切在 byte 14（第 5 个字符的第 2 字节）
+            cut_at = 14  # 切在 "务" 字的中间（bytes 15-17 是 "务"）
+            first_chunk = full_bytes[:cut_at]
+            rest_chunk = full_bytes[cut_at:]
+            # 写入第一段（无换行，且切断在多字节字符中间）
+            with path.open("wb") as f:
+                f.write(first_chunk)
+            # 第一轮：读到切断的 bytes，partial_line 应保留未消费的尾部
+            lines1, position1, partial1, backlog1, dropped1 = _read_appended_lines(
+                path, 0, b"", deque(), max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            # 无完整行（无换行），lines 应为空
+            self.assertEqual(len(lines1), 0)
+            # partial1 应是非空 bytes（包含已解码的 "玩家进入" + 切断的 "服" 字前 2 bytes）
+            self.assertGreater(len(partial1), 0)
+            self.assertEqual(len(backlog1), 0)
+            # 追加剩余 bytes（含换行符）
+            with path.open("ab") as f:
+                f.write(rest_chunk)
+            # 第二轮：partial1 与新 bytes 拼接，应正确解码出完整中文行
+            lines2, position2, partial2, backlog2, dropped2 = _read_appended_lines(
+                path, position1, partial1, backlog1, max_bytes=65536, max_lines=10, max_line_length=1000
+            )
+            # 应该解码出完整的中文行，无 U+FFFD
+            self.assertEqual(len(lines2), 1)
+            self.assertEqual(lines2[0], "玩家进入服务器：EllanServer")
+            self.assertEqual(partial2, b"")
             self.assertEqual(len(backlog2), 0)
 
     def test_build_hour_observations_respects_max_line_length(self):
@@ -2841,15 +2907,18 @@ class MineSentinelExportGzipTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = DiskObservationStore(config, Path(tmp_dir))
-            path1 = store.export_records(records, 60, "survival")
+            # PR9 hotfix v5: 传固定 end_ms 模拟周期报告 retry（同窗口复用）。
+            # 手动 report now 不传 end_ms，用当前时间，每次生成不同文件名。
+            fixed_end_ms = int(time.time() * 1000)
+            path1 = store.export_records(records, 60, "survival", end_ms=fixed_end_ms)
             self.assertIsNotNone(path1)
             self.assertTrue(path1.exists())
 
             # 记录文件修改时间
             mtime1 = path1.stat().st_mtime
 
-            # 再次导出同窗口——应复用
-            path2 = store.export_records(records, 60, "survival")
+            # 再次导出同窗口（相同 end_ms）——应复用
+            path2 = store.export_records(records, 60, "survival", end_ms=fixed_end_ms)
             self.assertIsNotNone(path2)
             self.assertEqual(path1, path2)
             self.assertEqual(path2.stat().st_mtime, mtime1)
@@ -2873,13 +2942,34 @@ class MineSentinelExportGzipTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = DiskObservationStore(config, Path(tmp_dir))
-            path1 = store.export_records(records, 60, "survival")
+            # PR9 hotfix v5: 传固定 end_ms 使两次调用生成相同路径（毫秒级精度下，
+            # 不传 end_ms 会因当前时间不同而生成不同文件名，无法验证 reuse 行为）。
+            fixed_end_ms = int(time.time() * 1000)
+            path1 = store.export_records(records, 60, "survival", end_ms=fixed_end_ms)
             self.assertIsNotNone(path1)
+            self.assertTrue(path1.exists())
+            original_content = path1.read_text(encoding="utf-8")
+            self.assertIn("line 1", original_content)
 
-            # 同一秒内再导出（路径相同），但因 reuse=False，会重写
-            path2 = store.export_records(records, 60, "survival")
+            # 用不同记录再导出同窗口（相同 end_ms）——路径相同，但因 reuse=False，
+            # 文件应被重写而不是复用旧内容。
+            records2 = [
+                ObservationRecord(
+                    event_id="log-2",
+                    kind="SERVER_LOG",
+                    timestamp=now,
+                    server_id="survival",
+                    server_name="Survival",
+                    content="line 2 rewritten",
+                    tags=["server_log"],
+                )
+            ]
+            path2 = store.export_records(records2, 60, "survival", end_ms=fixed_end_ms)
             self.assertIsNotNone(path2)
-            self.assertEqual(path1, path2)  # 路径相同（同一分钟）
+            self.assertEqual(path1, path2)  # 路径相同（相同 end_ms）
+            rewritten_content = path2.read_text(encoding="utf-8")
+            self.assertIn("line 2 rewritten", rewritten_content)
+            self.assertNotIn("line 1", rewritten_content)  # 旧内容已被覆盖
 
     def test_cleanup_removes_gz_exports(self):
         """cleanup 应清理过期的 .jsonl.gz 导出文件。"""
@@ -3679,19 +3769,19 @@ class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
         ad_mod._global_detector = None
 
     def test_export_filename_includes_second_precision_end_timestamp(self):
-        """同分钟内两次 export 应生成不同文件名（end_timestamp 不同）。"""
+        """PR9 hotfix v5: 同秒内两次 export 应生成不同文件名（毫秒级 end_timestamp 不同）。"""
         from services.mine_sentinel.storage.paths import export_path
         with tempfile.TemporaryDirectory() as tmp_dir:
             export_dir = Path(tmp_dir) / "exports"
             export_dir.mkdir()
-            # 同一分钟内，相隔 5 秒
-            p1 = export_path(export_dir, 30, "srv", now=1700000000)
-            p2 = export_path(export_dir, 30, "srv", now=1700000005)
-            # 文件名应不同（_t{timestamp} 后缀不同）
+            # 同一秒内，相隔 5 毫秒（毫秒级精度）
+            p1 = export_path(export_dir, 30, "srv", now=1700000000000)
+            p2 = export_path(export_dir, 30, "srv", now=1700000000005)
+            # 文件名应不同（_t{ms_timestamp} 后缀不同）
             self.assertNotEqual(p1.name, p2.name)
-            # 都应包含 _t 前缀的秒级 timestamp
-            self.assertIn("_t1700000000", p1.name)
-            self.assertIn("_t1700000005", p2.name)
+            # 都应包含 _t 前缀的毫秒级 timestamp
+            self.assertIn("_t1700000000000", p1.name)
+            self.assertIn("_t1700000000005", p2.name)
 
     def test_export_reuse_still_works_for_identical_window(self):
         """完全相同窗口的 export 仍应复用（export_reuse_existing 有效）。"""
@@ -3699,10 +3789,24 @@ class MineSentinelPr9HotfixV3Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             export_dir = Path(tmp_dir) / "exports"
             export_dir.mkdir()
-            # 完全相同的 now
-            p1 = export_path(export_dir, 30, "srv", now=1700000000)
-            p2 = export_path(export_dir, 30, "srv", now=1700000000)
+            # 完全相同的 now（毫秒级）
+            p1 = export_path(export_dir, 30, "srv", now=1700000000000)
+            p2 = export_path(export_dir, 30, "srv", now=1700000000000)
             self.assertEqual(p1.name, p2.name)
+
+    def test_export_path_accepts_second_or_ms_timestamp(self):
+        """PR9 hotfix v5: export_path 接受秒级或毫秒级 now，内部统一转毫秒。"""
+        from services.mine_sentinel.storage.paths import export_path
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            export_dir = Path(tmp_dir) / "exports"
+            export_dir.mkdir()
+            # 秒级（< 10^12）→ 自动 *1000
+            p_sec = export_path(export_dir, 30, "srv", now=1700000000)
+            # 毫秒级（>= 10^12）
+            p_ms = export_path(export_dir, 30, "srv", now=1700000000000)
+            # 两者应生成相同文件名
+            self.assertEqual(p_sec.name, p_ms.name)
+            self.assertIn("_t1700000000000", p_sec.name)
 
     def test_flush_bucket_updates_ewma(self):
         """flush_bucket 后 stat.ewma_count 应 > 0，与 window 一致。"""
