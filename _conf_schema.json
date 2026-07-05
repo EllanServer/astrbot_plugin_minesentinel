@@ -15,7 +15,7 @@
       },
       "retention_minutes": {
         "type": "int",
-        "description": "Observation 保留分钟数，建议不小于报告窗口",
+        "description": "Observation 保留分钟数，建议不小于报告窗口。注意：observation 按天分片（YYYYMMDD.jsonl），清理粒度为天，当天文件会保留到跨天后才删；retention_minutes 仅决定哪一天的文件可删",
         "default": 480
       },
       "runtime_log": {
@@ -141,7 +141,7 @@
           },
           "retention_minutes": {
             "type": "int",
-            "description": "硬盘 observation 保留分钟数",
+            "description": "硬盘 observation 保留分钟数。注意：清理粒度为天（按 YYYYMMDD 文件名），当天文件会保留到跨天后才删；若需小时级保留请后续改为 hourly shard",
             "default": 480
           },
           "cleanup_interval_seconds": {
@@ -233,7 +233,7 @@
           },
           "export_reuse_existing": {
             "type": "bool",
-            "description": "同窗口同分钟的导出文件已存在时直接复用，避免重复写",
+            "description": "完全相同导出路径存在时直接复用，避免重复写。文件名含窗口结束秒级时间戳，同分钟内连续 /mc report now 会生成不同文件名不会误复用；本开关主要对周期报告重试（同一 scheduled window end）有效",
             "default": true
           },
           "include_evidence_samples": {

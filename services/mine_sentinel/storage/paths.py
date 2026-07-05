@@ -25,9 +25,13 @@ def export_path(
 ) -> Path:
     """Generate a deterministic export file path for the given window.
 
-    The stem encodes (start_day, start_time, end_day, end_time, server_id),
-    rounded to the minute. Two exports for the same window/server within
-    the same minute produce the same path, enabling ``export_reuse_existing``.
+    The stem encodes (start_day, start_time, end_day, end_time, server_id)
+    plus a second-precision ``_t{end_timestamp}`` suffix. Two exports with
+    the *exact same* ``end_timestamp`` produce the same path, enabling
+    ``export_reuse_existing`` for periodic-report retries. Two manual
+    ``/mc report now`` issued seconds apart will have different
+    ``end_timestamp`` and thus different paths, avoiding accidental reuse
+    of a stale attachment.
 
     PR9 hotfix: ``label`` 非空时**始终**加入文件名，不再依赖基础路径是否
     已存在。之前的行为会导致同窗口内第一次带 label 的导出生成无 label
@@ -92,6 +96,11 @@ def cleanup_old_files(
     export_dir: Path,
     retention_minutes: int,
 ):
+    # 注意：observation 按天分片（YYYYMMDD.jsonl），清理粒度为天。
+    # 当天的文件永远不会被删（path.stem < cutoff_day 不成立），
+    # 即使 retention_minutes=60，当天文件也会保留到跨天后才删。
+    # export 文件按 mtime 清理，粒度为秒，不受此限制。
+    # 后续若需小时级 observation 保留，应改为 hourly shard（YYYYMMDD_HH.jsonl）。
     cutoff_day = time.strftime(
         "%Y%m%d",
         time.localtime(time.time() - retention_minutes * 60),
