@@ -32,9 +32,11 @@ class AIReportNormalizer:
     ) -> dict[str, Any]:
         result = dict(fallback)
         result.update({key: value for key, value in data.items() if key in result})
-        categories = result.get("categories")
-        if not isinstance(categories, dict):
-            categories = fallback["categories"]
+        ai_categories = data.get("categories")
+        if not isinstance(ai_categories, dict):
+            ai_categories = {}
+        fallback_categories = fallback.get("categories") or {}
+        categories = {}
         for key in (
             "daily",
             "complaint",
@@ -50,9 +52,19 @@ class AIReportNormalizer:
             "cross_server",
             "suggestion",
         ):
-            if not isinstance(categories.get(key), list):
+            fallback_items = fallback_categories.get(key) or []
+            ai_items = ai_categories.get(key)
+            if fallback_items and isinstance(ai_items, list):
+                categories[key] = ai_items
+            elif isinstance(fallback_items, list):
+                categories[key] = fallback_items
+            else:
                 categories[key] = []
         result["categories"] = categories
+        if not fallback.get("vulcan_alerts"):
+            result["vulcan_alerts"] = fallback.get("vulcan_alerts", {})
+        if not fallback.get("chat_topics"):
+            result["chat_topics"] = fallback.get("chat_topics", {})
         self.normalize_issues(result, fallback)
         if not isinstance(result.get("ops_notes"), list):
             result["ops_notes"] = fallback["ops_notes"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import time
 from contextlib import ExitStack
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +223,7 @@ class DiskObservationStore:
         window_minutes: int,
         server_id: str | None = None,
         label: str = "",
+        predicate: Callable[[ObservationRecord], bool] | None = None,
     ) -> Path | None:
         if not self.config.enabled or not self.config.storage.enabled:
             return None
@@ -260,6 +262,8 @@ class DiskObservationStore:
                             continue
                         key = self.codec.dedupe_key(record)
                         if seen.seen_or_add(key):
+                            continue
+                        if predicate is not None and not predicate(record):
                             continue
                         handle.write(self.codec.json_line(record))
                         handle.write("\n")

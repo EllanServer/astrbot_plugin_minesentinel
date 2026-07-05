@@ -47,8 +47,9 @@ class MineSentinelReportArtifacts:
         )
         self._append_window_metadata(report, window_minutes)
         self._append_bounded_window_note(report, window_data)
+        export_records = self.reporter.rules.filter_records_for_report(records)
         export_path = await self.export_report_records(
-            records,
+            export_records,
             window_minutes,
             server_id,
             umo,
@@ -81,6 +82,7 @@ class MineSentinelReportArtifacts:
                     window_minutes,
                     server_id,
                     label,
+                    self.reporter.rules.record_allowed_for_report,
                 )
             return await self.thread_runner(
                 self.disk_store.export_records,

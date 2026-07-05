@@ -38,7 +38,7 @@ class AIReportPromptBuilder:
             for record in self.sample_for_ai(records, fallback)
         ]
         anomaly_evidence = self.anomaly_evidence(records)
-        chat_topics = fallback.get("chat_topics") or {}
+        chat_topics = self.compact_chat_topics(fallback.get("chat_topics") or {})
         vulcan_alerts = fallback.get("vulcan_alerts") or []
         return self.fit_prompt(
             window_minutes,
@@ -123,7 +123,7 @@ class AIReportPromptBuilder:
             "categories(daily,complaint,bug,network,plugin,economy,community,chat_review,"
             "player_feedback,community_ops,moderation,cross_server,suggestion),"
             "issues(category,tag,incident_index,severity,affected_locations,issue_terms,"
-            "evidence_count,signal_count,suggested_action),"
+            "evidence_count,signal_count,ops_categories,ops_subtypes,ops_impacts,suggested_action),"
             "chat_summary,vulcan_alerts,ops_notes。"
             "异常检测已由模板解析（Drain3）+ EWMA/分位数突增检测 + 关键词规则完成，"
             "你的职责是解释异常证据、判断可能原因、给出排查建议，而不是重新检测异常。"
@@ -138,9 +138,24 @@ class AIReportPromptBuilder:
             "其余行是同服/同后端前后文。"
             "抽样观察里的 context 是来源、日志文件、日志级别、世界/维度和后端服线索，"
             "只能辅助判断前因后果；"
+            "context.opsClassification 是确定性运维日志分类，字段包括 level、category、subtype、"
+            "severity、impact、needs_admin；log level 不是事件类型，ERROR/WARN/INFO 只能作为严重度"
+            "和候选性线索，真实事件类型必须优先使用 category/subtype/impact。"
+            "INFO 默认只作上下文；WARN 是候选日志；ERROR 不自动等于 critical，只有崩溃、watchdog、"
+            "世界或玩家数据保存失败、磁盘满、数据库不可用、核心插件加载失败、复制物品/经济漏洞、"
+            "权限提升等才应判为 critical。"
+            "服务器指标观察不要单独列事件，只能在玩家聊天反馈或同时间运维异常里作为指标观察引用。"
+            "同一服务器、同一世界/后端、同一 3 到 5 分钟内的玩家异常反馈、WARN/ERROR 运维日志"
+            "和指标观察应优先合并为同一个 incident。"
             "原始样本只用于补措辞，不代表全部记录。"
             "这些 JSON 字段会被组装为 QQ 群五段式总结："
-            "整体情况、运行日志与事件总结、异常/投诉识别、风险提醒、建议处理；"
+            "一、整体情况；二、重点事件总结；三、聊天与社区观察；四、玩家问题/投诉识别；五、风险提醒与建议处理。"
+            "必须区分待处理事故和低风险观察：插件/数据库/网络/经济/权限确认/外挂举报等需要管理员看的内容进入事故与事件；"
+            "普通社区运营日志、正常问答、短时间无意义重复聊天进入聊天与社区观察，不计入重点事件数量。"
+            "不只是聊天，运行、插件、网络、经济、反作弊、社区管理等所有类别都必须按同一套事故证据结构输出；"
+            "每个 incident 必须能精准映射到 time_range、incident_title、incident_summary、players、labels、"
+            "2 到 4 条关键证据、metrics_summary、judgement、recommended_action。"
+            "server_metrics 不要单独作为事件列出，只能作为对应事故的指标观察引用；"
             "不要臆测、改写或输出 QQ/UMO/session target；目标会话解析由 AstrBot 插件处理；"
             "请让 summary、incident_findings、categories 和 suggested_action 面向管理员群可读，"
             "保留日志级别、时间线索、上下文结论和人工处理建议。"
@@ -153,12 +168,22 @@ class AIReportPromptBuilder:
             "生成运行日志与事件相关内容时必须按事故聚合，而不是按问题类别拆分："
             "同一服务器、同一世界或后端、同一 3 到 5 分钟窗口内的多条异常日志，"
             "应优先合并为一个 incident，并在该 incident 内列出多个标签和影响面；"
-            "不要把卡顿/延迟、连接失败、传送异常、插件异常等类别各自写成独立事件，"
+            "不要把卡顿/延迟、掉线/回档、传送异常、经济/商店异常、插件异常、后端同步异常等类别各自写成独立事件，"
             "除非它们发生在不同时间、不同服务器/后端或明显属于不同事故；"
             "incident_index 只能表示真实事故序号，同一批上下文不要重复输出多个 事件 #1；"
             "每个事故最多保留 2 到 4 条关键证据，避免在多个事件中重复粘贴同一批上下文；"
             "如果窗口内只有一个明显异常时间点，应说明其他时间段未发现明显持续异常。"
+            "建议处理必须去重并按优先级组织：先处理可能影响全服稳定性的事项，"
+            "例如内存、GC、插件阻塞、后端连通性；再处理玩家资产相关事项，"
+            "例如商店扣款、经济流水、背包同步、物品复制；最后处理需要证据复核的事项，"
+            "例如飞行、外挂、破坏举报。"
+            "不要把没有共同时间窗或共同作用域的内容硬合并，也不要把整段聊天泛化为违规。"
             "聊天热点总结：输入里的 chat_topics 是预计算的聊天统计。行为判断基于玩家上下文："
+            "其中 classified_messages/admin_messages 已按消息类别、问题标签、风险等级三层预分类，"
+            "字段包括 primary_category、labels、severity、needs_admin；"
+            "category_counts、label_counts、severity_counts 只能帮助你判断集中趋势，不要把统计项单独列成事件。"
+            "聊天分类是给事件聚合用的，不是最终事件本身；同一时间窗、同一服务器/世界内的卡顿、掉线、传送、"
+            "商店扣款、背包同步等反馈应合并为一个集中异常反馈事件，并在 labels 中保留所有相关问题。"
             "单条关键词命中只是'线索'(reason=hint)，同一玩家在窗口内多次命中同类关键词"
             "（如反复发链接、反复发代练广告）才是'行为'(reason=abuse)，刷屏是'行为'(reason=flood)。"
             "你必须在 chat_summary 字段输出面向管理员的聊天热点归纳："
@@ -301,6 +326,32 @@ class AIReportPromptBuilder:
                 for note in (fallback.get("ops_notes") or [])[:8]
             ],
         }
+
+    @staticmethod
+    def compact_chat_topics(chat_topics: dict[str, Any]) -> dict[str, Any]:
+        if not chat_topics:
+            return {}
+        compact = dict(chat_topics)
+        for key in ("classified_messages", "admin_messages", "review_evidence"):
+            items = list(compact.get(key) or [])[:12]
+            compact[key] = [
+                {
+                    item_key: (
+                        truncate(str(value), 180)
+                        if isinstance(value, str)
+                        else value
+                    )
+                    for item_key, value in dict(item).items()
+                    if item_key != "context_messages"
+                }
+                for item in items
+            ]
+        for key in ("sample_messages",):
+            compact[key] = [
+                truncate(str(item), 180)
+                for item in (compact.get(key) or [])[:8]
+            ]
+        return compact
 
     def timeline_chunks(
         self,

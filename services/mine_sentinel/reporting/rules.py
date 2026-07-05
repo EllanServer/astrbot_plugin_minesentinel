@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import lru_cache
 from typing import Any
 
@@ -421,6 +421,633 @@ def _keys_match(text: str, keys: tuple[str, ...]) -> bool:
     return any(key in text for key in keys if not _is_word_key(key))
 
 
+def _is_plugin_inventory_text(raw_content: str) -> bool:
+    text = raw_content.strip().lower()
+    return (
+        text.startswith("- ")
+        and text.count(", ") >= 8
+        and text.count("(") >= 8
+        and text.count(")") >= 8
+    )
+
+
+def _is_benign_mechanical_record(raw_content: str, text: str, level: str) -> bool:
+    if _is_plugin_inventory_text(raw_content):
+        return True
+    info_markers = (
+        "environment: environment[sessionhost=",
+        "loaded library ",
+        "loading dependency ",
+        "loaded dependency ",
+        "successfully registered internal expansion",
+        "registered channel:",
+        "got request to register class ",
+        "request_create_item",
+        "premium version found",
+        "thanks for your support",
+        "loading server plugin ",
+        "enabling server plugin ",
+        "enabling vulcan",
+        "starting vulcan",
+        "registering vulcan hook",
+        "bstats enabled",
+        "found. enabling hook",
+        "registering integration ",
+        "event action commands into memory",
+        "playtime reward records into memory",
+        "playtime rewards into memory",
+        "loading rewards",
+        "rewards have been loaded",
+        "total rewards file successfully loaded",
+        "start completed",
+        "paper: using java compression from velocity",
+        "paper: using java cipher from velocity",
+        "network season sync enabled",
+        "synchronized customcrops season",
+        "this plugin is running in proxy mode",
+        "you have to put the same config.yml",
+        "|     proxy mode    |",
+        "initializing bungeecord",
+        "proxy server detected in the database",
+        "(<proxy>/plugins/",
+        "server permissions file permissions.yml is empty, ignoring it",
+        "registered vault permission & chat hook",
+        "wepif: vault detected! using vault for permissions",
+        "registered permissions provider:",
+        "vaultpermissions found. (loaded: true)",
+        "registered extension: permission groups (vault)",
+        "[ok] permission manager test",
+        "selected permission provider:",
+        "log actions is enabled. actions will be logged",
+        "lp user ${player} permission",
+        "place the premium jar downloaded",
+        "found 1 duplicates in database. same name, different uuid",
+        "[vault] [permission] superpermissions loaded as backup permission system",
+        "loading internal permission managers",
+        "初始化经济与权限支持",
+        "找到权限插件",
+        "no materials whitelisted",
+        "permission plugin: luckperms",
+        "integrated luckperms for offline permission lookups",
+        "enabling anticheatobfuscator",
+        "anticheatobfuscator is enabling",
+        "anticheatobfuscator enabled",
+        "registered fake commands:",
+        "issued server command: /redpacket session create",
+        "connecting to redis server ",
+    )
+    if level in {"info", ""} and "using " in text and " based io" in text:
+        return True
+    if level in {"info", ""} and "loaded (" in text and " into memory" in text:
+        return True
+    if level in {"info", ""} and "keepalive response" in text and "out-of-order" in text:
+        return True
+    if level in {"info", ""} and any(marker in text for marker in info_markers):
+        return True
+    warn_markers = (
+        "****************************",
+        "you are running this server as an administrative or root user",
+        "you are opening yourself up to potential risks when doing this",
+        "madelinemiller.dev/blog/root-minecraft-server",
+        "duplicated blocked protocol version",
+        "whilst this makes it possible to use velocity",
+        "docs.papermc.io/velocity/security",
+        "update available",
+        "a new version of ",
+        "no translation for key:",
+    )
+    if level in {"warn", "warning"} and "legacy plugin " in text and " does not specify an api-version" in text:
+        return True
+    if level in {"warn", "warning"} and "hikariconfig" in text and "idletimeout is close to or more than maxlifetime" in text:
+        return True
+    return level in {"warn", "warning"} and any(marker in text for marker in warn_markers)
+
+
+CHAT_CATEGORY_PRIORITY = {
+    "普通交流": 10,
+    "建设协作": 20,
+    "管理请求": 30,
+    "性能与连接异常": 50,
+    "数据与插件异常": 55,
+    "经济与物品": 60,
+    "违规与安全风险": 70,
+}
+
+CHAT_LABEL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("普通交流", "问候", ("你好", "早安", "早上好", "晚上好", "晚安", "hello", "hi", "哈喽")),
+    ("普通交流", "玩笑", ("哈哈", "hhh", "笑死", "绷", "乐", "草")),
+    ("普通交流", "组队", ("组队", "一起", "谁来", "带我", "下矿", "打副本", "一起玩")),
+    ("普通交流", "路线/坐标交流", ("坐标", "路线", "在哪", "哪里", "怎么去", "新手村", "主城", "/home", "/spawn")),
+    ("普通交流", "新手提问", ("新手", "萌新", "怎么", "如何", "谁能带", "不会", "教程")),
+    ("普通交流", "规则询问", ("规则", "允许", "可以吗", "能不能", "可不可以")),
+    ("普通交流", "交易讨论", ("交易", "换", "卖", "买", "收购")),
+
+    ("建设协作", "建筑规划", ("建筑", "规划", "设计", "地基", "房子", "扩建")),
+    ("建设协作", "新手村扩建", ("新手村扩建", "扩建新手村")),
+    ("建设协作", "主城建设", ("主城", "城墙", "广场")),
+    ("建设协作", "道路/灯光/告示牌", ("道路", "路灯", "灯光", "告示牌", "路牌")),
+    ("建设协作", "公共设施", ("公共设施", "公共农场", "公共矿洞", "公共箱子")),
+    ("建设协作", "红石机器", ("红石", "机器", "自动机")),
+    ("建设协作", "刷怪塔", ("刷怪塔", "刷怪场")),
+
+    ("管理请求", "管理员求助", ("管理员", "管理", "op", "服主", "查一下", "处理一下", "帮忙看", "求助")),
+    ("管理请求", "权限请求", ("给权限", "开权限", "申请权限", "权限请求")),
+    ("管理请求", "投诉", ("投诉", "申诉", "不公平")),
+    ("管理请求", "举报", ("举报", "疑似外挂", "疑似飞行", "疑似透视", "有人开挂", "有人破坏", "有人偷")),
+    ("管理请求", "处罚申诉", ("解封", "申诉", "误封", "处罚")),
+    ("管理请求", "证据提交", ("视频", "录像", "录屏", "证据", "截图")),
+    ("管理请求", "物品找回", ("找回", "补偿", "返还")),
+
+    ("性能与连接异常", "卡顿/延迟", ("卡顿", "延迟", "好卡", "很卡", "卡死", "lag", "lagging")),
+    ("性能与连接异常", "TPS/MSPT 反馈", ("tps", "mspt")),
+    ("性能与连接异常", "掉线", ("掉线", "又掉线", "老掉线", "断开连接", "连接断开", "disconnect")),
+    ("性能与连接异常", "进服异常", ("进不去", "进服", "连不上", "连接失败")),
+    ("性能与连接异常", "跨服异常", ("跨服", "切服", "转服", "后端")),
+    ("性能与连接异常", "传送异常", ("传送", "/tp", "tp ", "home 后", "/home 后", "回城失败")),
+    ("性能与连接异常", "虚空/卡位置", ("虚空", "卡位置", "卡住", "卡在原地")),
+    ("性能与连接异常", "回档", ("回档", "回滚", "rollback")),
+
+    ("数据与插件异常", "背包不同步", ("背包不同步", "背包没同步", "背包不对", "物品不同步")),
+    ("数据与插件异常", "血量/状态不同步", ("血量", "状态不同步", "状态没同步", "等级不同步")),
+    ("数据与插件异常", "世界切换异常", ("切换世界", "换世界", "世界切换")),
+    ("数据与插件异常", "命令异常", ("命令用不了", "指令用不了", "命令异常", "指令异常")),
+    ("数据与插件异常", "权限异常", ("没权限", "没有权限", "权限不够", "权限异常")),
+    ("数据与插件异常", "插件功能异常", ("插件异常", "插件坏", "插件用不了", "功能坏了", "功能异常", "不能用")),
+    ("数据与插件异常", "区块加载异常", ("区块", "加载不出来", "区块加载")),
+
+    ("经济与物品", "商店异常", ("商店异常", "商店坏", "商店用不了", "商店扣", "shop error", "quickshop")),
+    ("经济与物品", "金币异常", ("金币异常", "金币没了", "余额不对", "扣了金币", "money bug", "balance bug")),
+    ("经济与物品", "扣款未到账", ("扣钱", "扣款", "扣了", "没到账", "未到账")),
+    ("经济与物品", "物品未发放", ("没给物品", "没有给我物品", "物品未发放", "没发", "未发放")),
+    ("经济与物品", "交易纠纷", ("交易纠纷", "交易没给", "骗交易", "被骗")),
+    ("经济与物品", "公共箱子争议", ("公共箱子", "箱子被动", "公共矿洞")),
+    ("经济与物品", "物品丢失", ("物品丢了", "东西没了", "物品丢失")),
+    ("经济与物品", "疑似偷窃", ("偷东西", "偷了", "偷窃")),
+    ("经济与物品", "复制物品", ("复制物品", "刷物品", "dupe")),
+    ("经济与物品", "经济漏洞", ("经济漏洞", "刷钱", "无限金币")),
+
+    ("违规与安全风险", "辱骂", ("辱骂", "骂人", "脏话", "profanity", "insult")),
+    ("违规与安全风险", "人身攻击", ("人身攻击", "攻击别人")),
+    ("违规与安全风险", "引战", ("引战", "带节奏")),
+    ("违规与安全风险", "刷屏", ("刷屏",)),
+    ("违规与安全风险", "广告", ("广告", "discord.gg", "加群", "加微信", "加qq")),
+    ("违规与安全风险", "诈骗", ("诈骗", "被骗", "骗钱")),
+    ("违规与安全风险", "恶意拉人", ("拉人", "拉去别的服")),
+    ("违规与安全风险", "外挂举报", ("外挂", "开挂", "cheat", "hack")),
+    ("违规与安全风险", "飞行举报", ("飞行", "fly", "飞天")),
+    ("违规与安全风险", "透视/Xray", ("透视", "xray", "矿透")),
+    ("违规与安全风险", "自动挖矿", ("自动挖矿", "矿机")),
+    ("违规与安全风险", "恶意破坏", ("恶意破坏", "破坏建筑", "拆家")),
+    ("违规与安全风险", "熊服", ("熊服", "熊孩子")),
+    ("违规与安全风险", "利用漏洞", ("利用 bug", "利用bug", "漏洞")),
+    ("违规与安全风险", "权限滥用", ("权限滥用", "op滥用")),
+    ("违规与安全风险", "威胁服务器", ("威胁服务器", "炸服", "打服")),
+)
+CHAT_LABEL_CATEGORIES = {
+    label: category for category, label, _ in CHAT_LABEL_RULES
+}
+CHAT_LABEL_CATEGORIES["闲聊"] = "普通交流"
+
+CHAT_CRITICAL_LABELS = {
+    "复制物品",
+    "经济漏洞",
+    "恶意破坏",
+    "熊服",
+    "利用漏洞",
+    "权限滥用",
+    "威胁服务器",
+}
+CHAT_HIGH_LABELS = {
+    "掉线",
+    "传送异常",
+    "虚空/卡位置",
+    "回档",
+    "背包不同步",
+    "血量/状态不同步",
+    "世界切换异常",
+    "商店异常",
+    "金币异常",
+    "扣款未到账",
+    "物品未发放",
+    "物品丢失",
+    "疑似偷窃",
+    "诈骗",
+    "外挂举报",
+    "飞行举报",
+    "透视/Xray",
+    "自动挖矿",
+}
+CHAT_MEDIUM_CATEGORIES = {"管理请求", "性能与连接异常", "数据与插件异常", "经济与物品", "违规与安全风险"}
+CHAT_CHAT_REVIEW_LABELS = {"辱骂", "人身攻击", "引战", "刷屏", "广告", "诈骗", "恶意拉人"}
+CHAT_COMMUNITY_LABELS = {
+    "外挂举报",
+    "飞行举报",
+    "透视/Xray",
+    "自动挖矿",
+    "恶意破坏",
+    "熊服",
+    "利用漏洞",
+    "复制物品",
+    "权限滥用",
+    "威胁服务器",
+    "疑似偷窃",
+}
+
+OPS_ISSUE_LEVELS = {"warn", "warning", "error", "severe", "fatal"}
+OPS_SEVERITY_RANK = {"info": 0, **SEVERITY_RANK}
+OPS_DEFAULT_IMPACT = "需要结合聊天反馈、服务器指标和同时间日志判断影响范围。"
+OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
+    {
+        "category": "启动与关闭",
+        "subtype": "服务崩溃/看门狗",
+        "markers": (
+            "watchdog",
+            "server stopped responding",
+            "a single server tick took",
+            "crash report",
+            "crash-reports",
+            "exception in server tick loop",
+            "崩溃",
+        ),
+        "severity": "critical",
+        "impact": "可能导致服务器不可用或被强制终止。",
+        "report_categories": ("bug",),
+    },
+    {
+        "category": "性能与资源",
+        "subtype": "内存/GC 风险",
+        "markers": (
+            "outofmemoryerror",
+            "out of memory",
+            "java heap space",
+            "gc overhead",
+            "内存溢出",
+        ),
+        "severity": "critical",
+        "impact": "可能导致卡顿、掉线、数据写入失败或服务崩溃。",
+        "report_categories": ("complaint", "bug"),
+    },
+    {
+        "category": "数据库与存储",
+        "subtype": "磁盘空间不足",
+        "markers": (
+            "no space left on device",
+            "disk full",
+            "not enough space",
+            "磁盘空间不足",
+            "磁盘满",
+        ),
+        "severity": "critical",
+        "impact": "可能导致存档、玩家数据、经济流水或插件数据写入失败。",
+        "report_categories": ("bug",),
+    },
+    {
+        "category": "数据库与存储",
+        "subtype": "玩家/世界数据保存失败",
+        "markers": (
+            "failed to save player data",
+            "could not save player data",
+            "failed to save chunk",
+            "could not save chunk",
+            "failed to write player",
+            "save failed",
+            "保存失败",
+        ),
+        "severity": "critical",
+        "impact": "可能造成玩家资产、背包、位置或世界区块数据丢失。",
+        "report_categories": ("bug", "economy"),
+    },
+    {
+        "category": "数据库与存储",
+        "subtype": "数据库超时",
+        "markers": (
+            "sqltimeoutexception",
+            "database timeout",
+            "sql timeout",
+            "timed out waiting for connection",
+            "connection is not available",
+            "hikaripool",
+            "hikari pool",
+        ),
+        "severity": "high",
+        "impact": "可能影响插件状态、玩家数据、商店交易或经济流水同步。",
+        "report_categories": ("bug", "economy"),
+    },
+    {
+        "category": "数据库与存储",
+        "subtype": "数据库连接异常",
+        "markers": (
+            "communications link failure",
+            "jdbcconnectionexception",
+            "database is locked",
+            "too many connections",
+            "could not connect to database",
+            "failed to connect to database",
+            "mysql",
+            "mariadb",
+            "sqlite",
+            "jdbc",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "可能导致依赖数据库的插件读写失败或状态不同步。",
+        "report_categories": ("bug", "economy"),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "插件加载/启用失败",
+        "markers": (
+            "could not load plugin",
+            "could not enable",
+            "failed to load plugin",
+            "failed to enable",
+            "error occurred while enabling",
+            "unknown dependency",
+            "missing dependency",
+            "invalid plugin.yml",
+            "加载失败",
+            "启用失败",
+            "依赖缺失",
+        ),
+        "severity": "high",
+        "impact": "可能导致相关玩法、权限、经济或同步功能不可用。",
+        "report_categories": ("plugin", "bug"),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "配置解析异常",
+        "markers": (
+            "failed to load config",
+            "could not load config",
+            "invalid configuration",
+            "configuration error",
+            "mapping values are not allowed",
+            "yaml",
+            "toml",
+            "json parse",
+            "配置解析",
+            "配置错误",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "可能导致插件以默认配置运行、功能关闭或部分指令异常。",
+        "report_categories": ("plugin", "bug"),
+    },
+    {
+        "category": "传送与位置",
+        "subtype": "传送/位置异常",
+        "markers": (
+            "playerteleportevent",
+            "entityteleportevent",
+            "teleportcause",
+            "moved too quickly",
+            "moved wrongly",
+            "fell out of the world",
+            "illegal position",
+            "传送",
+            "虚空",
+            "卡位置",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "可能导致玩家卡位、掉入虚空、传送失败或跨世界状态不同步。",
+        "report_categories": ("complaint", "plugin", "bug"),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "插件运行异常",
+        "markers": (
+            "could not pass event",
+            "eventexception",
+            "generated an exception",
+            "task",
+            "nullpointerexception",
+            "illegalargumentexception",
+            "nosuchmethoderror",
+            "classnotfoundexception",
+            "cannot invoke",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "可能导致对应插件功能失败，并触发玩家侧传送、经济、权限或同步异常。",
+        "report_categories": ("bug",),
+    },
+    {
+        "category": "性能与资源",
+        "subtype": "主线程卡顿/MSPT 异常",
+        "markers": (
+            "can't keep up",
+            "server is overloaded",
+            "tick took",
+            "mspt",
+            "tps",
+            "overloaded",
+            "卡顿",
+            "延迟",
+        ),
+        "severity": "medium",
+        "impact": "可能造成玩家延迟、传送迟滞、区块加载慢或超时掉线。",
+        "report_categories": ("complaint",),
+    },
+    {
+        "category": "网络与代理",
+        "subtype": "网络连接异常",
+        "markers": (
+            "connection reset",
+            "connection refused",
+            "connection timed out",
+            "read timed out",
+            "broken pipe",
+            "socketexception",
+            "io.netty",
+            "netty",
+            "连接超时",
+            "连接失败",
+            "断开连接",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "可能导致玩家掉线、进服失败或代理到后端通信不稳定。",
+        "report_categories": ("network",),
+    },
+    {
+        "category": "网络与代理",
+        "subtype": "代理/后端转发异常",
+        "markers": (
+            "velocity",
+            "bungeecord",
+            "forwarding secret",
+            "player-info-forwarding",
+            "ip forwarding",
+            "backend server",
+            "server switch",
+            "转发",
+            "后端",
+            "跨服",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "可能导致跨服失败、身份转发错误、登录异常或后端不可达。",
+        "report_categories": ("cross_server", "network"),
+    },
+    {
+        "category": "玩家会话与登录",
+        "subtype": "登录/认证异常",
+        "markers": (
+            "authentication servers are down",
+            "failed to verify username",
+            "profile lookup failed",
+            "login failed",
+            "not authenticated",
+            "whitelist",
+            "session",
+            "认证失败",
+            "登录失败",
+            "白名单",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "可能导致玩家无法进服或身份、UUID、权限状态异常。",
+        "report_categories": ("moderation", "network"),
+    },
+    {
+        "category": "世界与区块",
+        "subtype": "世界/区块异常",
+        "markers": (
+            "failed to load chunk",
+            "could not load chunk",
+            "chunk error",
+            "corrupt chunk",
+            "regionfile",
+            "region file",
+            "world save",
+            "entity ticking",
+            "区块",
+            "世界保存",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "可能导致区块加载失败、实体异常、回档或局部世界数据损坏。",
+        "report_categories": ("bug", "complaint"),
+    },
+    {
+        "category": "经济与资产",
+        "subtype": "经济/商店异常",
+        "markers": (
+            "vault",
+            "quickshop",
+            "economy",
+            "transaction",
+            "balance",
+            "money",
+            "shop",
+            "auction",
+            "market",
+            "商店",
+            "经济",
+            "金币",
+            "余额",
+        ),
+        "requires_issue_level": True,
+        "severity": "high",
+        "impact": "可能影响扣款、发货、余额、交易流水或玩家资产一致性。",
+        "report_categories": ("economy",),
+    },
+    {
+        "category": "经济与资产",
+        "subtype": "复制物品/经济漏洞",
+        "markers": (
+            "dupe",
+            "duplication",
+            "duplicate item",
+            "economy exploit",
+            "刷物品",
+            "复制物品",
+            "经济漏洞",
+            "刷钱",
+        ),
+        "severity": "critical",
+        "impact": "可能影响全服经济、公平性和玩家资产，需要立即复核证据。",
+        "report_categories": ("economy", "community"),
+    },
+    {
+        "category": "权限与命令",
+        "subtype": "权限/命令异常",
+        "markers": (
+            "permission denied",
+            "no permission",
+            "lacks permission",
+            "unknown command",
+            "command exception",
+            "issued server command",
+            "没有权限",
+            "权限不足",
+            "命令异常",
+            "指令异常",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "可能导致玩家或管理员无法执行关键命令，或权限组状态不一致。",
+        "report_categories": ("moderation", "plugin"),
+    },
+    {
+        "category": "安全与反作弊",
+        "subtype": "反作弊/违规风险",
+        "markers": (
+            "anticheat",
+            "anti-cheat",
+            "vulcan",
+            "failed fly",
+            "failed speed",
+            "xray",
+            "killaura",
+            "cheat",
+            "hack",
+            "反作弊",
+            "外挂",
+            "飞行",
+            "透视",
+        ),
+        "requires_issue_level": True,
+        "severity": "medium",
+        "impact": "需要人工复核玩家、触发规则、VL/证据和上下文，避免误判。",
+        "report_categories": ("community",),
+    },
+    {
+        "category": "备份与恢复",
+        "subtype": "备份/恢复异常",
+        "markers": (
+            "backup failed",
+            "restore failed",
+            "rollback failed",
+            "failed to backup",
+            "failed to restore",
+            "备份失败",
+            "恢复失败",
+            "回滚失败",
+        ),
+        "severity": "high",
+        "impact": "可能影响事故恢复能力或导致回档、数据恢复不可用。",
+        "report_categories": ("bug",),
+    },
+)
+OPS_CATEGORY_REPORT_MAP: dict[str, tuple[str, ...]] = {
+    "启动与关闭": ("bug",),
+    "性能与资源": ("complaint",),
+    "插件与模组": ("plugin", "bug"),
+    "玩家会话与登录": ("network", "moderation"),
+    "网络与代理": ("network", "cross_server"),
+    "世界与区块": ("bug", "complaint"),
+    "传送与位置": ("complaint", "plugin", "bug"),
+    "数据库与存储": ("bug", "economy"),
+    "经济与资产": ("economy",),
+    "权限与命令": ("moderation", "plugin"),
+    "安全与反作弊": ("community",),
+    "备份与恢复": ("bug",),
+    "指标观察": (),
+}
+
+
 def _format_timestamp(ts_ms: int) -> str:
     """把毫秒时间戳格式化为 HH:MM:SS（本地时间），用于 Vulcan 告警呈现。"""
     if not ts_ms:
@@ -438,6 +1065,292 @@ class HeuristicReportBuilder:
         # 预计算当前生效的分类优先级列表（应用 category_enabled / category_whitelist）。
         # daily 始终兜底，永远保留在末尾。
         self._active_priority: tuple[str, ...] = self._compute_active_priority()
+
+    @staticmethod
+    def _append_unique(values: list[str], value: str):
+        value = str(value or "").strip()
+        if value and value not in values:
+            values.append(value)
+
+    def _annotate_chat_classification(self, record: ObservationRecord) -> dict[str, Any]:
+        if "chat_message" not in (record.tags or []):
+            return {}
+        ctx = record.context or {}
+        existing = ctx.get("chatClassification")
+        if isinstance(existing, dict) and existing.get("primary_category"):
+            return existing
+        classification = self._classify_chat_message(record)
+        ctx["chatClassification"] = classification
+        record.context = ctx
+        return classification
+
+    def _classify_chat_message(self, record: ObservationRecord) -> dict[str, Any]:
+        ctx = record.context or {}
+        message = str(ctx.get("chatMessage") or record.content or "").strip()
+        text = message.lower()
+        labels: list[str] = []
+        categories: list[str] = []
+
+        for category, label, markers in CHAT_LABEL_RULES:
+            if _keys_match(text, markers):
+                self._append_unique(labels, label)
+                self._append_unique(categories, category)
+
+        if not labels:
+            labels.append("闲聊")
+            categories.append("普通交流")
+
+        primary_category = max(
+            categories,
+            key=lambda category: CHAT_CATEGORY_PRIORITY.get(category, 0),
+        )
+        severity = self._chat_severity(primary_category, labels, text)
+        needs_admin = (
+            severity in {"medium", "high", "critical"}
+            or primary_category in {"管理请求", "性能与连接异常", "数据与插件异常", "经济与物品", "违规与安全风险"}
+        )
+        return {
+            "primary_category": primary_category,
+            "labels": labels,
+            "severity": severity,
+            "needs_admin": needs_admin,
+        }
+
+    def _annotate_ops_classification(self, record: ObservationRecord) -> dict[str, Any]:
+        if record.kind != "SERVER_LOG" or "chat_message" in (record.tags or []):
+            return {}
+        ctx = record.context or {}
+        existing = ctx.get("opsClassification")
+        if isinstance(existing, dict) and existing.get("category"):
+            return existing
+        classification = self._classify_ops_log(record)
+        if classification:
+            ctx["opsClassification"] = classification
+            record.context = ctx
+        return classification
+
+    @classmethod
+    def _classify_ops_log(cls, record: ObservationRecord) -> dict[str, Any]:
+        ctx = record.context or {}
+        level = cls._normalized_level(str(ctx.get("level") or ""))
+        text = cls._record_text(record)
+        raw_content = str(record.content or "").lstrip().lower()
+
+        if _is_benign_mechanical_record(raw_content, text, level):
+            return cls._ops_classification(
+                level=level or "info",
+                category="启动与关闭",
+                subtype="机械/生命周期噪声",
+                severity="info" if level not in {"warn", "warning"} else "low",
+                impact="已识别为常规生命周期、插件更新或配置提示日志，仅作上下文。",
+                needs_admin=False,
+                report_categories=(),
+            )
+
+        if "server_metrics" in (record.tags or []) or _keys_match(
+            text,
+            ("server_metrics", "metrics", "tps", "mspt", "memory", "heap", "gc", "在线人数"),
+        ):
+            return cls._ops_classification(
+                level=level,
+                category="指标观察",
+                subtype="服务器指标观察",
+                severity="info",
+                impact="只能作为同时间事故的指标旁证，不单独构成聊天或运行事件。",
+                needs_admin=False,
+                report_categories=(),
+            )
+
+        for rule in OPS_LOG_RULES:
+            if not cls._ops_rule_matches(rule, text, level):
+                continue
+            severity = str(rule.get("severity") or cls._ops_default_severity(level))
+            if level == "fatal":
+                severity = "critical"
+            elif level == "severe" and OPS_SEVERITY_RANK.get(severity, 0) < OPS_SEVERITY_RANK["high"]:
+                severity = "high"
+            needs_admin = bool(
+                rule.get(
+                    "needs_admin",
+                    OPS_SEVERITY_RANK.get(severity, 0) >= OPS_SEVERITY_RANK["medium"]
+                    or level in {"error", "severe", "fatal"},
+                )
+            )
+            return cls._ops_classification(
+                level=level,
+                category=str(rule.get("category") or ""),
+                subtype=str(rule.get("subtype") or ""),
+                severity=severity,
+                impact=str(rule.get("impact") or OPS_DEFAULT_IMPACT),
+                needs_admin=needs_admin,
+                report_categories=tuple(rule.get("report_categories") or ()),
+            )
+
+        if level in {"fatal", "severe"}:
+            return cls._ops_classification(
+                level=level,
+                category="启动与关闭",
+                subtype="严重运行错误",
+                severity="critical" if level == "fatal" else "high",
+                impact="日志级别显示严重运行错误，但仍需结合堆栈和上下文确认真实事件类型。",
+                needs_admin=True,
+                report_categories=("bug",),
+            )
+        if level == "error":
+            return cls._ops_classification(
+                level=level,
+                category="插件与模组",
+                subtype="未归因运行错误",
+                severity="medium",
+                impact="ERROR 仅说明该条日志严重度偏高，根因仍需结合堆栈、插件名和玩家反馈确认。",
+                needs_admin=True,
+                report_categories=("bug",),
+            )
+        if level in {"warn", "warning"}:
+            return cls._ops_classification(
+                level=level,
+                category="插件与模组",
+                subtype="未归因运行警告",
+                severity="low",
+                impact="WARN 是候选线索；未命中具体运维类型时只作上下文观察。",
+                needs_admin=False,
+                report_categories=("bug",),
+            )
+        return cls._ops_classification(
+            level=level or "info",
+            category="启动与关闭",
+            subtype="常规运行信息",
+            severity="info",
+            impact="INFO 日志默认仅作为上下文，不单独构成事件。",
+            needs_admin=False,
+            report_categories=(),
+        )
+
+    @staticmethod
+    def _ops_rule_matches(rule: dict[str, Any], text: str, level: str) -> bool:
+        if rule.get("requires_issue_level") and level not in OPS_ISSUE_LEVELS:
+            return False
+        negative_markers = tuple(str(marker).lower() for marker in rule.get("negative_markers") or ())
+        if negative_markers and any(marker in text for marker in negative_markers):
+            return False
+        all_markers = tuple(str(marker).lower() for marker in rule.get("all_markers") or ())
+        if all_markers and not all(marker in text for marker in all_markers):
+            return False
+        markers = tuple(str(marker).lower() for marker in rule.get("markers") or ())
+        return bool(markers) and _keys_match(text, markers)
+
+    @staticmethod
+    def _ops_classification(
+        *,
+        level: str,
+        category: str,
+        subtype: str,
+        severity: str,
+        impact: str,
+        needs_admin: bool,
+        report_categories: tuple[str, ...],
+    ) -> dict[str, Any]:
+        return {
+            "level": (level or "info").upper(),
+            "category": category,
+            "subtype": subtype,
+            "severity": severity,
+            "impact": impact,
+            "needs_admin": needs_admin,
+            "report_categories": list(report_categories),
+        }
+
+    @staticmethod
+    def _ops_default_severity(level: str) -> str:
+        if level == "fatal":
+            return "critical"
+        if level == "severe":
+            return "high"
+        if level == "error":
+            return "medium"
+        if level in {"warn", "warning"}:
+            return "low"
+        return "info"
+
+    @staticmethod
+    def _normalized_level(level: str) -> str:
+        normalized = str(level or "").strip().lower()
+        if normalized == "warning":
+            return "warn"
+        return normalized
+
+    @staticmethod
+    def _chat_severity(primary_category: str, labels: list[str], text: str) -> str:
+        label_set = set(labels)
+        if label_set & CHAT_CRITICAL_LABELS:
+            return "critical"
+        if (
+            ("全服" in text or "所有人" in text or "大规模" in text)
+            and label_set & {"掉线", "卡顿/延迟", "进服异常", "跨服异常"}
+        ):
+            return "critical"
+        if label_set & CHAT_HIGH_LABELS:
+            return "high"
+        if primary_category in CHAT_MEDIUM_CATEGORIES:
+            return "medium"
+        if primary_category == "建设协作" or labels != ["闲聊"]:
+            return "low"
+        return "info"
+
+    @staticmethod
+    def _chat_category_matches(chat_info: dict[str, Any], category: str) -> bool:
+        if not chat_info:
+            return False
+        primary = str(chat_info.get("primary_category") or "")
+        labels = set(str(label) for label in (chat_info.get("labels") or []))
+        if category == "chat_review":
+            # Single-message chat-review labels are evidence hints only. Actual
+            # chat_review issues still require player-level behavior tags
+            # (chat_flood/chat_abuse) so one-off links/jokes are not overjudged.
+            return False
+        if category == "community":
+            return bool(labels & CHAT_COMMUNITY_LABELS)
+        if category == "community_ops":
+            return False
+        if category == "player_feedback":
+            return primary == "管理请求"
+        if category == "economy":
+            return primary == "经济与物品" and not (labels & CHAT_COMMUNITY_LABELS)
+        if category == "network":
+            return bool(labels & {"掉线", "进服异常"})
+        if category == "cross_server":
+            return "跨服异常" in labels
+        if category == "complaint":
+            return bool(labels & {"卡顿/延迟", "TPS/MSPT 反馈", "传送异常", "虚空/卡位置", "回档"})
+        if category == "moderation":
+            return "权限异常" in labels
+        if category == "plugin":
+            return "插件功能异常" in labels
+        if category == "bug":
+            return bool(labels & {"背包不同步", "血量/状态不同步", "世界切换异常", "命令异常", "区块加载异常"})
+        return False
+
+    @staticmethod
+    def _ops_category_matches(ops_info: dict[str, Any], category: str) -> bool:
+        if not ops_info:
+            return False
+        if str(ops_info.get("category") or "") == "指标观察":
+            return False
+        severity = str(ops_info.get("severity") or "info").lower()
+        needs_admin = bool(ops_info.get("needs_admin"))
+        if not needs_admin and OPS_SEVERITY_RANK.get(severity, 0) < OPS_SEVERITY_RANK["medium"]:
+            return False
+        report_categories = tuple(
+            str(item)
+            for item in (ops_info.get("report_categories") or ())
+            if str(item)
+        )
+        if not report_categories:
+            report_categories = OPS_CATEGORY_REPORT_MAP.get(
+                str(ops_info.get("category") or ""),
+                (),
+            )
+        return category in report_categories
 
     def _compute_active_priority(self) -> tuple[str, ...]:
         """根据 runtime_log.category_enabled / category_whitelist 计算生效分类。"""
@@ -458,13 +1371,92 @@ class HeuristicReportBuilder:
         active.append("daily")
         return tuple(active)
 
+    def _category_active(self, category: str) -> bool:
+        """Return whether a category-specific analysis surface is enabled."""
+        if category == "daily":
+            return True
+        return category in self._active_priority
+
+    def filter_records_for_report(
+        self,
+        records: list[ObservationRecord],
+    ) -> list[ObservationRecord]:
+        """Return SERVER_LOG records that pass category gating."""
+        log_records, _, _ = self._prepare_log_records(records)
+        return log_records
+
+    def record_allowed_for_report(self, record: ObservationRecord) -> bool:
+        """Return whether one record is admitted by category gating."""
+        if record.kind != "SERVER_LOG":
+            return False
+        return self._category_active(self._classify_for_gate(record))
+
+    def _prepare_log_records(
+        self,
+        records: list[ObservationRecord],
+    ) -> tuple[
+        list[ObservationRecord],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        log_records = [record for record in records if record.kind == "SERVER_LOG"]
+        for record in log_records:
+            self._annotate_chat_classification(record)
+            self._annotate_ops_classification(record)
+
+        # Aggregate chat-review behavior is a category-specific detector. Run it
+        # only while that category is admitted, then gate records before any
+        # report surfaces, counters, or AI evidence are built.
+        if self._category_active("chat_review"):
+            flood_events = self._detect_and_tag_floods(log_records)
+            abuse_events = self._detect_and_tag_abuse(log_records)
+        else:
+            flood_events = []
+            abuse_events = []
+
+        admitted = [
+            record for record in log_records
+            if self.record_allowed_for_report(record)
+        ]
+        return admitted, flood_events, abuse_events
+
+    def _classify_for_gate(self, record: ObservationRecord) -> str:
+        """Classify with the full priority list before category filtering."""
+        if "daily_noise" in record.tags:
+            return "daily"
+        if "chat_flood" in record.tags or "chat_abuse" in record.tags:
+            return "chat_review"
+
+        text = self._record_text(record)
+        chat_info = self._annotate_chat_classification(record)
+        ops_info = self._annotate_ops_classification(record)
+        for category in CLASSIFY_PRIORITY:
+            if category == "daily":
+                continue
+            if category == "chat_review":
+                if self._chat_category_matches(chat_info, "chat_review") or self._detect_chat_review_hits(record):
+                    return "chat_review"
+                continue
+            if self._chat_category_matches(chat_info, category):
+                return category
+            if self._ops_category_matches(ops_info, category):
+                return category
+            if self._category_matches(record, category, text):
+                return category
+
+        # Chat records are their own summary surface. If chat_review is closed,
+        # ordinary chat should not leak into daily summaries or AI samples.
+        if "chat_message" in (record.tags or []):
+            return "chat_review"
+        return "daily"
+
     def build(
         self,
         records: list[ObservationRecord],
         window_minutes: int,
         server_id: str | None = None,
     ) -> dict[str, Any]:
-        log_records = [record for record in records if record.kind == "SERVER_LOG"]
+        log_records, flood_events, abuse_events = self._prepare_log_records(records)
         servers = sorted({record.server_id for record in log_records if record.server_id})
         server_names = sorted(
             {
@@ -477,15 +1469,6 @@ class HeuristicReportBuilder:
         categories: dict[str, list[str]] = {key: [] for key in CATEGORY_KEYS}
         buckets: dict[tuple[str, str], list[ObservationRecord]] = defaultdict(list)
 
-        # PR10 v2: 玩家级刷屏检测——在分类前跑，给参与刷屏的记录打 chat_flood 标签，
-        # 这样 classify() 能把它们强制归入 chat_review。
-        # 刷屏是聚合行为（同一ID短时间大量重复/相似消息），不能靠单条形态识别。
-        flood_events = self._detect_and_tag_floods(log_records)
-        # PR10 v3: 玩家级重复违规检测——同一玩家在窗口内多次命中同类 chat_review
-        # 关键词（如反复发链接、反复发代练广告）视为"行为"，打 chat_abuse 标签。
-        # 单次命中只是"线索"，不强制 chat_review；重复命中才是"行为"。
-        abuse_events = self._detect_and_tag_abuse(log_records)
-
         for record in log_records:
             category = self.classify(record)
             tag = self.tag(record)
@@ -495,16 +1478,79 @@ class HeuristicReportBuilder:
             categories.setdefault(category, [])
             categories[category].append(self._category_line(tag, group))
 
+        chat_topics = self._build_chat_topics(log_records, flood_events, abuse_events)
+        vulcan_alerts = self._build_vulcan_alerts(log_records)
+
         issues = []
         max_severity_rank = 0
         for (category, tag), group in sorted(
             buckets.items(), key=lambda item: len(item[1]), reverse=True
         ):
             severity = self._severity(group)
+            chat_infos = [
+                (record.context or {}).get("chatClassification")
+                for record in group
+                if isinstance((record.context or {}).get("chatClassification"), dict)
+            ]
+            ops_infos = [
+                (record.context or {}).get("opsClassification")
+                for record in group
+                if isinstance((record.context or {}).get("opsClassification"), dict)
+            ]
+            chat_labels: list[str] = []
+            chat_primary_categories: list[str] = []
+            chat_severity = ""
+            ops_categories: list[str] = []
+            ops_subtypes: list[str] = []
+            ops_impacts: list[str] = []
+            ops_severity = ""
+            for info in chat_infos:
+                for label in info.get("labels") or []:
+                    label = str(label)
+                    label_category = CHAT_LABEL_CATEGORIES.get(label, "")
+                    if label_category in {"普通交流", "建设协作"}:
+                        continue
+                    if category == "chat_review" and label not in CHAT_CHAT_REVIEW_LABELS:
+                        continue
+                    self._append_unique(chat_labels, label)
+                self._append_unique(
+                    chat_primary_categories,
+                    str(info.get("primary_category") or ""),
+                )
+                info_severity = str(info.get("severity") or "")
+                if SEVERITY_RANK.get(info_severity, 0) > SEVERITY_RANK.get(chat_severity, 0):
+                    chat_severity = info_severity
+            for info in ops_infos:
+                info_severity = str(info.get("severity") or "")
+                if (
+                    str(info.get("category") or "") == "指标观察"
+                    or (
+                        not bool(info.get("needs_admin"))
+                        and OPS_SEVERITY_RANK.get(info_severity, 0) < OPS_SEVERITY_RANK["medium"]
+                    )
+                ):
+                    continue
+                self._append_unique(ops_categories, str(info.get("category") or ""))
+                self._append_unique(ops_subtypes, str(info.get("subtype") or ""))
+                self._append_unique(ops_impacts, str(info.get("impact") or ""))
+                if OPS_SEVERITY_RANK.get(info_severity, 0) > OPS_SEVERITY_RANK.get(ops_severity, 0):
+                    ops_severity = info_severity
+            if SEVERITY_RANK.get(chat_severity, 0) > SEVERITY_RANK.get(severity, 0):
+                severity = chat_severity
+            if SEVERITY_RANK.get(ops_severity, 0) > SEVERITY_RANK.get(severity, 0):
+                severity = ops_severity
+            if severity == "low" and category in {
+                "chat_review",
+                "community",
+                "community_ops",
+                "moderation",
+                "player_feedback",
+            }:
+                severity = "medium"
             severity_rank = SEVERITY_RANK.get(severity, 0)
             if severity_rank > max_severity_rank:
                 max_severity_rank = severity_rank
-            if category == "daily" and severity == "low":
+            if category == "daily" or severity == "low":
                 continue
             affected = sorted({record.server_id for record in group if record.server_id})
             backends = sorted(
@@ -515,10 +1561,45 @@ class HeuristicReportBuilder:
                 item.evidence_text()
                 for item in group[: self.config.report.max_evidence_samples]
             ]
+            players: list[str] = []
+            if category == "chat_review":
+                chat_samples = self._chat_issue_evidence_samples(
+                    chat_topics,
+                    self.config.report.max_evidence_samples,
+                )
+                if chat_samples:
+                    samples = chat_samples
+                players = self._chat_issue_players(chat_topics)
+                if any("chat_flood" in (record.tags or []) for record in group):
+                    self._append_unique(chat_labels, "刷屏")
+                if any("chat_abuse" in (record.tags or []) for record in group):
+                    for info in chat_infos:
+                        for label in info.get("labels") or []:
+                            if str(label) in CHAT_CHAT_REVIEW_LABELS:
+                                self._append_unique(chat_labels, str(label))
+            else:
+                players = sorted(
+                    {
+                        str((record.context or {}).get("chatPlayer") or "").strip()
+                        for record in group
+                        if (record.context or {}).get("chatPlayer")
+                    }
+                )
             timestamps = [record.timestamp for record in group if record.timestamp]
             should_alert = self._should_alert(
                 severity, len(group), affected, backends, category, group
             )
+            suggested_action = self._suggest_action(category, tag, severity)
+            if category == "chat_review":
+                suggested_action = self._chat_issue_action(chat_topics)
+            ops_action = self._ops_issue_action(ops_categories, ops_subtypes, category, tag, severity)
+            if ops_action:
+                suggested_action = ops_action
+            issue_terms = self._issue_terms(group)
+            for label in chat_labels:
+                self._append_unique(issue_terms, label)
+            for subtype in ops_subtypes:
+                self._append_unique(issue_terms, subtype)
             issues.append(
                 {
                     "category": category,
@@ -530,17 +1611,24 @@ class HeuristicReportBuilder:
                     "affected_locations": locations,
                     "affected_locations_text": format_locations(locations),
                     "evidence_count": len(group),
-                    "unique_players": 0,
-                    "players": [],
-                    "players_text": "无",
+                    "unique_players": len(players),
+                    "players": players,
+                    "players_text": ", ".join(players) if players else "无",
                     "first_seen_ts": min(timestamps) if timestamps else 0,
                     "last_seen_ts": max(timestamps) if timestamps else 0,
                     "evidence_samples": (
                         samples if self.config.report.include_evidence_samples else []
                     ),
                     "signal_count": len(group),
-                    "issue_terms": self._issue_terms(group),
-                    "suggested_action": self._suggest_action(category, tag, severity),
+                    "issue_terms": issue_terms,
+                    "chat_labels": chat_labels,
+                    "chat_primary_categories": chat_primary_categories,
+                    "chat_severity": chat_severity,
+                    "ops_categories": ops_categories,
+                    "ops_subtypes": ops_subtypes,
+                    "ops_impacts": ops_impacts,
+                    "ops_severity": ops_severity,
+                    "suggested_action": suggested_action,
                     "should_alert": should_alert,
                 }
             )
@@ -556,17 +1644,20 @@ class HeuristicReportBuilder:
         ) if max_severity_rank else "low"
         any_alert = any(issue["should_alert"] for issue in issues)
         ops_notes, counters = self._ops_notes(log_records, issues, max_severity, any_alert)
+        window_timestamps = [record.timestamp for record in log_records if record.timestamp]
+        window_start_ts = min(window_timestamps) if window_timestamps else 0
+        window_end_ts = max(window_timestamps) if window_timestamps else 0
 
         # PR10: 聊天热点总结 + Vulcan 反作弊结构化告警
-        chat_topics = self._build_chat_topics(log_records, flood_events, abuse_events)
-        vulcan_alerts = self._build_vulcan_alerts(log_records)
-
         return {
             "summary": (
                 f"最近 {window_minutes} 分钟收到 {len(log_records)} 条 "
                 "Minecraft 运行日志观察。"
             ),
             "time_window": f"最近 {window_minutes} 分钟",
+            "window_start_ts": window_start_ts,
+            "window_end_ts": window_end_ts,
+            "_window_minutes": window_minutes,
             "servers": servers if not server_id else [server_id],
             "server_names": server_names,
             "proxy_ids": proxy_ids,
@@ -597,19 +1688,203 @@ class HeuristicReportBuilder:
             if "chat_flood" in record.tags or "chat_abuse" in record.tags:
                 return "chat_review"
         text = self._record_text(record)
+        chat_info = self._annotate_chat_classification(record)
+        ops_info = self._annotate_ops_classification(record)
         # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
-        # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
+        # daily 兜底。真正的关闭/白名单过滤在 _prepare_log_records 入口完成；
+        # 这里仅对已准入记录按当前启用优先级做后备分类。
         # 注意：chat_review 不再靠单条关键词命中触发——避免"玩家偶尔发一条链接"
         # 被误判为聊天审查违规。关键词命中只在 review_evidence 里作为"线索"呈现。
         for category in self._active_priority:
             if category == "daily":
                 continue
             if category == "chat_review":
+                if self._chat_category_matches(chat_info, "chat_review"):
+                    return category
                 continue  # 行为标签已在上面处理；单条关键词不再触发
-            keys = CATEGORY_KEYS.get(category, ())
-            if _keys_match(text, keys):
+            if self._chat_category_matches(chat_info, category):
+                return category
+            if self._ops_category_matches(ops_info, category):
+                return category
+            if self._category_matches(record, category, text):
                 return category
         return "daily"
+
+    @staticmethod
+    def _category_matches(
+        record: ObservationRecord,
+        category: str,
+        text: str | None = None,
+    ) -> bool:
+        text = text if text is not None else HeuristicReportBuilder._record_text(record)
+        tags = record.tags or []
+        keys = CATEGORY_KEYS.get(category, ())
+        raw_content = str(record.content or "").lstrip().lower()
+        stack_trace_line = raw_content.startswith("at ") or raw_content.startswith(
+            "caused by:"
+        )
+        level = str((record.context or {}).get("level") or "").lower()
+
+        if category != "daily" and _is_benign_mechanical_record(raw_content, text, level):
+            return False
+
+        ops_info = (record.context or {}).get("opsClassification")
+        if isinstance(ops_info, dict) and ops_info.get("subtype"):
+            ops_category = str(ops_info.get("category") or "")
+            if ops_category == "数据库与存储" and category in {"complaint", "network", "cross_server", "player_feedback"}:
+                return False
+            if (
+                category == "community_ops"
+                and ops_category in {"插件与模组", "传送与位置", "数据库与存储", "网络与代理", "世界与区块"}
+                and _keys_match(text, ("could not pass event", "eventexception", "playerteleportevent"))
+            ):
+                return False
+
+        if stack_trace_line and category in {
+            "complaint",
+            "network",
+            "cross_server",
+            "moderation",
+            "economy",
+            "community",
+            "community_ops",
+            "player_feedback",
+        }:
+            return False
+
+        if category == "community":
+            if "anticheat_vulcan" in tags:
+                return True
+            if "issued server command: /fly" in text:
+                return False
+            strong_markers = (
+                "ban", "banned", "kick", "kicked", "mute", "muted",
+                "grief", "cheat", "cheating", "anticheat", "anti-cheat",
+                "xray", "kill aura", "killaura", "vulcan",
+                "封禁", "禁言", "踢出", "作弊", "外挂",
+            )
+            if _keys_match(text, strong_markers):
+                return True
+            soft_markers = ("fly", "speed", "reach", "violation", "vl")
+            anti_cheat_context = (
+                "anticheat" in text
+                or "anti-cheat" in text
+                or "vulcan" in text
+                or "flagged" in text
+                or "failed" in text
+            )
+            return anti_cheat_context and _keys_match(text, soft_markers)
+
+        if category == "community_ops":
+            prism_maintenance = (
+                "prism" in text
+                and (
+                    "activityquery" in text
+                    or "purge" in text
+                    or "purged" in text
+                    or "activity records" in text
+                )
+            )
+            if prism_maintenance:
+                return False
+            ops_markers = (
+                "event", "activity", "announcement", "notice", "reward",
+                "vote", "poll", "rank", "season", "competition",
+                "运营", "活动", "公告", "通知", "奖励", "投票",
+                "赛季", "比赛", "招募",
+            )
+            if _keys_match(text, ops_markers):
+                return True
+            broad_social_markers = ("discord", "qq group", "community", "群", "社区")
+            has_social_surface = _keys_match(text, broad_social_markers)
+            has_ops_context = _keys_match(
+                text,
+                (
+                    "announcement", "notice", "event", "reward", "vote",
+                    "poll", "season", "competition", "rank",
+                    "公告", "通知", "活动", "奖励", "投票", "赛季", "比赛",
+                ),
+            )
+            return has_social_surface and has_ops_context
+
+        if category == "network":
+            if "lost connection: flying is not enabled" in text:
+                return False
+
+        if category == "complaint":
+            if "if this lead to server tps drop" in text:
+                return False
+            hikari_connection_pool = (
+                ("hikari" in text or "poolbase" in text)
+                and "failed to validate connection" in text
+            )
+            if hikari_connection_pool:
+                return False
+
+        if category == "moderation":
+            if ("uuid='" in text or "uuid=" in text) and not _keys_match(
+                text,
+                (
+                    "uuid of player", "permission", "permissions", "auth",
+                    "login", "logged in", "logged out", "session",
+                    "premium", "whitelist", "没有权限", "权限",
+                ),
+            ):
+                return False
+
+        if category == "bug":
+            if level in {"info", ""}:
+                info_safe_noise = ("失败", "警告", "failed", "failure", "warn", "warning")
+                strong_info_bug = (
+                    "error", "exception", "stacktrace", "traceback",
+                    "nullpointerexception", "illegalargumentexception",
+                    "classnotfoundexception", "nosuchmethoderror",
+                    "unsupportedoperationexception", "cannot invoke",
+                )
+                if any(marker in text for marker in info_safe_noise) and not any(
+                    marker in text for marker in strong_info_bug
+                ):
+                    return False
+
+        if category == "plugin":
+            if "update here:" in text or "update available" in text:
+                return False
+            if level in {"info", ""} and not any(
+                marker in text
+                for marker in (
+                    "could not load", "could not enable", "failed", "failure",
+                    "error", "exception", "depend", "dependency",
+                    "softdepend", "加载失败", "启用失败", "依赖",
+                )
+            ):
+                return False
+
+        if category == "player_feedback":
+            if "chat_message" in tags and _keys_match(
+                text,
+                ("没权限", "没有权限", "权限不够", "进不去", "过不去"),
+            ):
+                return True
+            strong_feedback = (
+                "suggest", "suggestion", "feedback", "feature request",
+                "proposal", "建议", "反馈", "加个", "新增", "优化", "改进",
+            )
+            if _keys_match(text, strong_feedback):
+                return True
+            soft_feedback = (
+                "idea", "request", "wish", "hope",
+                "想法", "希望", "能不能", "可不可以",
+            )
+            product_context = (
+                "feature", "server", "plugin", "shop", "map", "玩法",
+                "功能", "服务器", "插件", "商店", "地图", "副本",
+                "加", "改", "优化",
+            )
+            return _keys_match(text, soft_feedback) and _keys_match(
+                text, product_context
+            )
+
+        return _keys_match(text, keys)
 
     # --- Tag --------------------------------------------------------------
     def tag(self, record: ObservationRecord) -> str:
@@ -701,7 +1976,7 @@ class HeuristicReportBuilder:
         if any(marker in text for marker in ERROR_MARKERS):
             return "high" if n >= 2 else "medium"
         # high: 性能问题重复出现 >=3
-        if any(marker in text for marker in PERFORMANCE_MARKERS):
+        if _keys_match(text, PERFORMANCE_MARKERS):
             if n >= 3:
                 return "high"
             return "medium" if n >= 1 else "low"
@@ -723,7 +1998,18 @@ class HeuristicReportBuilder:
         if any(marker in text for marker in WARN_MARKERS):
             return "medium" if n >= 2 else "low"
         # medium: 权限/登录/网络异常
-        if _keys_match(text, CATEGORY_KEYS["moderation"]):
+        entity_uuid_only = (
+            ("uuid='" in text or "uuid=" in text)
+            and not _keys_match(
+                text,
+                (
+                    "uuid of player", "permission", "permissions", "auth",
+                    "login", "logged in", "logged out", "session",
+                    "premium", "whitelist", "没有权限", "权限",
+                ),
+            )
+        )
+        if _keys_match(text, CATEGORY_KEYS["moderation"]) and not entity_uuid_only:
             return "medium" if n >= 1 else "low"
         return "low"
 
@@ -841,6 +2127,46 @@ class HeuristicReportBuilder:
             return "继续观察同类 WARN/ERROR 是否扩大，并保留样本用于后续排查。"
         return "持续观察，无需立即处理。"
 
+    @staticmethod
+    def _ops_issue_action(
+        ops_categories: list[str],
+        ops_subtypes: list[str],
+        category: str,
+        tag: str,
+        severity: str,
+    ) -> str:
+        categories = set(ops_categories)
+        subtypes = set(ops_subtypes)
+        if "数据库与存储" in categories:
+            if "磁盘空间不足" in subtypes:
+                return "立即检查磁盘剩余空间、日志/备份占用和数据库目录；确认玩家数据、世界存档、经济流水是否写入成功。"
+            if "玩家/世界数据保存失败" in subtypes:
+                return "按证据时间核对玩家 data、world/region 存档、备份状态和插件写入日志，必要时先冻结补偿或回档判断。"
+            return "检查 Hikari/JDBC 连接池、数据库可用性、慢查询、最大连接数和磁盘 I/O；若涉及玩家资产，同步核对经济流水和背包数据。"
+        if "经济与资产" in categories:
+            return "按玩家和时间核对 Vault/经济插件、商店插件、数据库交易流水、余额变更和物品发放记录，再决定是否补偿。"
+        if "传送与位置" in categories:
+            return "核对传送插件、跨世界加载、后端转发和玩家位置保存；重点复现证据时间点的 /home、/tp、换世界流程。"
+        if "网络与代理" in categories:
+            return "检查代理到后端的连通性、端口、防火墙、Velocity/Bungee 转发配置、forwarding secret 和后端在线状态。"
+        if "性能与资源" in categories:
+            return "优先检查 TPS/MSPT、GC、内存、实体/红石压力、区块加载和插件耗时，并对照玩家卡顿/掉线反馈的时间点。"
+        if "插件与模组" in categories:
+            return "定位证据中的插件名、事件名或任务名，检查插件版本、依赖、配置和最近更新；先处理影响玩家流程的报错插件。"
+        if "世界与区块" in categories:
+            return "检查对应世界、region/chunk 文件、实体 ticking 日志和最近保存/回档记录；必要时从备份恢复局部区块。"
+        if "权限与命令" in categories:
+            return "核对权限组、命令来源、登录/UUID 模式和代理转发配置，确认是否只影响个别玩家或管理命令。"
+        if "玩家会话与登录" in categories:
+            return "核对认证服务、白名单、登录插件、UUID 模式和代理转发；统计是否集中影响同一时间段或同一后端。"
+        if "安全与反作弊" in categories:
+            return "人工复核玩家 UUID、VL/检查类型、触发时间和原始上下文；只处理证据能对应到的玩家与行为。"
+        if "备份与恢复" in categories:
+            return "检查备份任务日志、目标目录、可用空间和最近一次可恢复快照，确认事故恢复能力是否受影响。"
+        if "启动与关闭" in categories and severity in {"high", "critical"}:
+            return "检查崩溃报告、watchdog 首条堆栈、最近插件/配置变更和重启记录，先确认是否需要回滚或临时下线问题插件。"
+        return ""
+
     # --- 运维备注（增强版）------------------------------------------------
     def _ops_notes(
         self,
@@ -889,11 +2215,11 @@ class HeuristicReportBuilder:
                 counters["network"] += 1
             if _keys_match(text, PLUGIN_MARKERS):
                 counters["plugin"] += 1
-            if _keys_match(text, CHAT_REVIEW_MARKERS):
+            if self._category_active("chat_review") and _keys_match(text, CHAT_REVIEW_MARKERS):
                 counters["chat_review"] += 1
-            if _keys_match(text, PLAYER_FEEDBACK_MARKERS):
+            if self._category_active("player_feedback") and self._category_matches(record, "player_feedback", text):
                 counters["player_feedback"] += 1
-            if _keys_match(text, COMMUNITY_OPS_MARKERS):
+            if self._category_active("community_ops") and self._category_matches(record, "community_ops", text):
                 counters["community_ops"] += 1
 
         affected_servers_set: set[str] = set()
@@ -985,7 +2311,7 @@ class HeuristicReportBuilder:
 
         三类刷屏：
         1. high_frequency: 60 秒内同一玩家发送 >=5 条消息
-        2. repeat_content: 5 分钟内同一玩家发送 >=3 条相同/高度相似消息
+        2. repeat_content: 5 分钟内同一玩家发送 >=5 条相同/高度相似消息
         3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息
 
         返回 flood_events 列表（用于 chat_topics.flood_players 呈现给 LLM）。
@@ -1120,6 +2446,11 @@ class HeuristicReportBuilder:
                 "top_players": [],
                 "top_keywords": [],
                 "sample_messages": [],
+                "category_counts": {},
+                "label_counts": {},
+                "severity_counts": {},
+                "classified_messages": [],
+                "admin_messages": [],
                 "flood_players": [],
                 "abuse_players": [],
                 "review_evidence": [],
@@ -1174,13 +2505,65 @@ class HeuristicReportBuilder:
             if len(sample_messages) >= max_samples:
                 break
 
+        category_counts: Counter[str] = Counter()
+        label_counts: Counter[str] = Counter()
+        severity_counts: Counter[str] = Counter()
+        classified_messages: list[dict[str, Any]] = []
+        admin_messages: list[dict[str, Any]] = []
+        classified_limit = max(10, max_samples * 4)
+        admin_limit = max(10, max_samples * 4)
+        for record in sorted(chat_records, key=lambda item: item.timestamp or 0):
+            ctx = record.context or {}
+            chat_info = self._annotate_chat_classification(record)
+            primary = str(chat_info.get("primary_category") or "普通交流")
+            severity = str(chat_info.get("severity") or "info")
+            labels = [str(label) for label in (chat_info.get("labels") or []) if str(label)]
+            category_counts[primary] += 1
+            severity_counts[severity] += 1
+            for label in labels:
+                label_counts[label] += 1
+            item = {
+                "time_text": _format_timestamp(record.timestamp) if record.timestamp else "",
+                "server_id": record.server_id or "",
+                "player": str(ctx.get("chatPlayer") or "").strip(),
+                "message": str(ctx.get("chatMessage") or record.content).strip()[:200],
+                "primary_category": primary,
+                "labels": labels,
+                "severity": severity,
+                "needs_admin": bool(chat_info.get("needs_admin")),
+            }
+            if item["needs_admin"] and len(admin_messages) < admin_limit:
+                admin_messages.append(item)
+            if (
+                len(classified_messages) < classified_limit
+                and (
+                    item["needs_admin"]
+                    or severity != "info"
+                    or len(classified_messages) < max_samples
+                )
+            ):
+                classified_messages.append(item)
+
         # PR10 v2: 刷屏玩家结构化呈现——把 flood_events 转成 LLM 友好格式
-        flood_players = self._format_flood_players(flood_events or [])
+        review_enabled = self._category_active("chat_review")
+        flood_players = (
+            self._format_flood_players(flood_events or [])
+            if review_enabled
+            else []
+        )
         # PR10 v3: 重复违规玩家结构化呈现——同一玩家多次命中同类关键词
-        abuse_players = self._format_abuse_players(abuse_events or [])
+        abuse_players = (
+            self._format_abuse_players(abuse_events or [])
+            if review_enabled
+            else []
+        )
 
         # PR10 v3: 聊天审查证据——基于玩家上下文（行为 + 线索）
-        review_evidence = self._build_chat_review_evidence(chat_records, max_samples=10)
+        review_evidence = (
+            self._build_chat_review_evidence(chat_records, max_samples=10)
+            if review_enabled
+            else []
+        )
 
         return {
             "total_messages": len(chat_records),
@@ -1188,6 +2571,11 @@ class HeuristicReportBuilder:
             "top_players": top_players,
             "top_keywords": top_keywords,
             "sample_messages": sample_messages,
+            "category_counts": dict(category_counts.most_common()),
+            "label_counts": dict(label_counts.most_common(30)),
+            "severity_counts": dict(severity_counts.most_common()),
+            "classified_messages": classified_messages,
+            "admin_messages": admin_messages,
             "flood_players": flood_players,
             "abuse_players": abuse_players,
             "review_evidence": review_evidence,
@@ -1308,6 +2696,187 @@ class HeuristicReportBuilder:
         result.sort(key=lambda x: x["total_hits"], reverse=True)
         return result
 
+    @staticmethod
+    def _chat_issue_players(chat_topics: dict[str, Any]) -> list[str]:
+        players: list[str] = []
+        seen: set[str] = set()
+        for key in ("flood_players", "abuse_players", "review_evidence"):
+            for item in chat_topics.get(key) or []:
+                player = str((item or {}).get("player") or "").strip()
+                if player and player not in seen:
+                    seen.add(player)
+                    players.append(player)
+        return players
+
+    @staticmethod
+    def _chat_context_items(
+        target: ObservationRecord,
+        records: list[ObservationRecord],
+        before: int = 2,
+        after: int = 2,
+    ) -> list[dict[str, Any]]:
+        try:
+            index = next(
+                i for i, record in enumerate(records)
+                if record is target or record.event_id == target.event_id
+            )
+        except StopIteration:
+            index = -1
+        if index < 0:
+            window = [target]
+        else:
+            start = max(0, index - before)
+            end = min(len(records), index + after + 1)
+            window = records[start:end]
+        items: list[dict[str, Any]] = []
+        for record in window:
+            ctx = record.context or {}
+            items.append(
+                {
+                    "hit": record is target or record.event_id == target.event_id,
+                    "time_text": _format_timestamp(record.timestamp) if record.timestamp else "",
+                    "player": str(ctx.get("chatPlayer") or "").strip(),
+                    "message": str(ctx.get("chatMessage") or record.content).strip()[:160],
+                }
+            )
+        return items
+
+    @staticmethod
+    def _format_chat_context(items: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for item in items:
+            prefix = ">" if item.get("hit") else ""
+            time_text = str(item.get("time_text") or "").strip()
+            player = str(item.get("player") or "").strip() or "unknown"
+            message = str(item.get("message") or "").strip()
+            if not message:
+                continue
+            parts.append(f"{prefix}{time_text} <{player}> {message}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _chat_issue_action(chat_topics: dict[str, Any]) -> str:
+        actions: list[str] = []
+        type_labels = {
+            "repeat_content": "重复发送相同内容",
+            "meaningless": "连续发送无意义内容",
+            "high_frequency": "短时间高频发言",
+        }
+        for item in chat_topics.get("flood_players") or []:
+            player = str((item or {}).get("player") or "").strip()
+            time_range = str((item or {}).get("time_range") or "").strip()
+            flood_types = [
+                type_labels.get(str(kind), str(kind))
+                for kind in ((item or {}).get("flood_types") or [])
+            ]
+            samples = [str(s).strip() for s in ((item or {}).get("samples") or []) if str(s).strip()]
+            sample = samples[0] if samples else ""
+            total = int((item or {}).get("total_messages") or 0)
+            if player:
+                actions.append(
+                    f"{player} {time_range or '该窗口'} {','.join(flood_types) or '触发聊天审查'}"
+                    f"（{total} 条，样本：{sample or '见引用上下文'}）"
+                )
+            if len(actions) >= 4:
+                break
+        for item in chat_topics.get("abuse_players") or []:
+            if len(actions) >= 4:
+                break
+            player = str((item or {}).get("player") or "").strip()
+            categories = ",".join(str(v) for v in ((item or {}).get("abuse_categories") or []))
+            samples = [str(s).strip() for s in ((item or {}).get("samples") or []) if str(s).strip()]
+            if player:
+                actions.append(
+                    f"{player} 多次命中 {categories or '聊天审查'}（样本：{samples[0] if samples else '见引用上下文'}）"
+                )
+        if not actions:
+            return (
+                "按引用上下文逐条复核聊天原文、玩家、时间点和频道来源；只处理证据中列出的玩家与消息，不把整段聊天泛化为违规。"
+            )
+        return (
+            "按玩家逐项判定：" + "；".join(actions)
+            + "。先看引用上下文判断是玩笑/正常点名还是刷屏、骚扰、广告或隐私泄露；只处理列出的玩家与时间段，不把整段聊天泛化为违规。"
+        )
+
+    @staticmethod
+    def _chat_issue_evidence_samples(
+        chat_topics: dict[str, Any],
+        limit: int,
+    ) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(line: str) -> None:
+            clean = re.sub(r"\s+", " ", str(line or "")).strip()
+            if not clean or clean in seen or len(out) >= limit:
+                return
+            seen.add(clean)
+            out.append(clean[:240])
+
+        review_items = list(chat_topics.get("review_evidence") or [])
+        emitted_review: set[tuple[str, str, str]] = set()
+
+        def add_review(item: dict[str, Any]) -> None:
+            player = str((item or {}).get("player") or "").strip()
+            time_text = str((item or {}).get("time_text") or "").strip()
+            message = str((item or {}).get("message") or "").strip()
+            key = (player, time_text, message)
+            if key in emitted_review:
+                return
+            emitted_review.add(key)
+            reason = str((item or {}).get("reason") or "review").strip()
+            context = HeuristicReportBuilder._format_chat_context(
+                list((item or {}).get("context_messages") or [])
+            )
+            if context:
+                add(f"[chat {reason}] {context}")
+            else:
+                add(f"[chat {reason} {time_text}] <{player}> {message}")
+
+        for item in chat_topics.get("flood_players") or []:
+            player = str((item or {}).get("player") or "").strip()
+            for review_item in review_items:
+                if str((review_item or {}).get("player") or "").strip() == player:
+                    add_review(review_item)
+                    break
+
+        if out and len(out) >= min(limit, len(chat_topics.get("flood_players") or [])):
+            return out[:limit]
+
+        for item in review_items:
+            add_review(item)
+
+        for item in chat_topics.get("flood_players") or []:
+            player = str((item or {}).get("player") or "").strip()
+            types = ", ".join(str(v) for v in ((item or {}).get("flood_types") or []))
+            time_range = str((item or {}).get("time_range") or "").strip()
+            samples = (item or {}).get("samples") or []
+            if not samples:
+                for event in (item or {}).get("events") or []:
+                    samples.extend((event or {}).get("samples") or [])
+            for sample in samples[:3]:
+                add(f"[chat flood {types} {time_range}] <{player}> {sample}")
+
+        for item in chat_topics.get("abuse_players") or []:
+            player = str((item or {}).get("player") or "").strip()
+            categories = ", ".join(
+                str(v) for v in ((item or {}).get("abuse_categories") or [])
+            )
+            for sample in ((item or {}).get("samples") or [])[:3]:
+                add(f"[chat review {categories}] <{player}> {sample}")
+
+        for item in chat_topics.get("review_evidence") or []:
+            player = str((item or {}).get("player") or "").strip()
+            time_text = str((item or {}).get("time_text") or "").strip()
+            reason = str((item or {}).get("reason") or "review").strip()
+            message = str((item or {}).get("message") or "").strip()
+            add(f"[chat {reason} {time_text}] <{player}> {message}")
+
+        if not out:
+            for sample in chat_topics.get("sample_messages") or []:
+                add(f"[chat sample] {sample}")
+        return out
+
     def _build_chat_review_evidence(
         self, chat_records: list[ObservationRecord], max_samples: int = 10
     ) -> list[dict[str, Any]]:
@@ -1337,6 +2906,7 @@ class HeuristicReportBuilder:
         - time_text: HH:MM:SS 时间
         """
         # 第一步：按玩家聚合聊天记录，统计每个玩家的行为上下文
+        all_records_sorted = sorted(chat_records, key=lambda r: r.timestamp or 0)
         player_records: dict[str, list[ObservationRecord]] = defaultdict(list)
         for record in chat_records:
             ctx = record.context or {}
@@ -1395,6 +2965,10 @@ class HeuristicReportBuilder:
                         "hit_keys": hit_keys[:5],
                         "hit_category": category if category != "flood" else "",
                         "time_text": time_text,
+                        "context_messages": self._chat_context_items(
+                            record,
+                            all_records_sorted,
+                        ),
                     })
                     if len(evidence) >= max_samples:
                         return evidence
@@ -1509,7 +3083,10 @@ class HeuristicReportBuilder:
 
         Vulcan 检测关闭时返回空字典。
         """
-        if not self.config.runtime_log.vulcan_detect_enabled:
+        if (
+            not self.config.runtime_log.vulcan_detect_enabled
+            or not self._category_active("community")
+        ):
             return {}
         vulcan_records = [
             record for record in records if "anticheat_vulcan" in record.tags
