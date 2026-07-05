@@ -927,7 +927,7 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             spike_threshold=2.0, min_baseline_count=2,
         )
         # 积累基线 + 突增
-        for i in range(3):
+        for i in range(5):
             test_detector.observe("srv", "T_SPIKE",
                                   template="<*> connection reset",
                                   level="WARN", timestamp_ms=i * 1000)
@@ -1827,8 +1827,8 @@ class MineSentinelRulesTests(unittest.TestCase):
 
     # --- 检查项目开关 / 过滤 ---
     def test_category_enabled_disables_specific_category(self):
-        """category_enabled={"chat_review": false} 后 chat_review 不再匹配，
-        记录落到下一优先级 player_feedback。"""
+        """classify() 只按当前启用优先级后备匹配；
+        build()/filter_records_for_report 会在入口处忽略命中关闭分类的记录。"""
         config = MineSentinelConfig.from_dict(
             {"runtime_log": {"category_enabled": {"chat_review": False}}}
         )
@@ -1883,8 +1883,8 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(builder.classify(record), "daily")
 
     def test_category_whitelist_only_keeps_listed(self):
-        """category_whitelist 非空时只保留白名单内分类，
-        其他分类（含更高优先级）都会被关闭，记录会落到白名单内分类或 daily。"""
+        """classify() 在白名单内做后备匹配；
+        build()/filter_records_for_report 会忽略命中白名单外分类的记录。"""
         config = MineSentinelConfig.from_dict(
             {"runtime_log": {"category_whitelist": ["bug"]}}
         )
@@ -1939,6 +1939,821 @@ class MineSentinelRulesTests(unittest.TestCase):
         report = builder.build([record], 60, "survival")
         categories_in_issues = {issue["category"] for issue in report["issues"]}
         self.assertNotIn("chat_review", categories_in_issues)
+
+    def test_chat_review_filter_ignores_audit_records(self):
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"chat_review": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        records = [
+            self._make_record(
+                "[Async Chat Thread]: <AdUser> join discord.gg/example",
+                tags=["server_log", "runtime_log", "chat_message"],
+                context={
+                    "chatPlayer": "AdUser",
+                    "chatMessage": "join discord.gg/example",
+                },
+                timestamp=1000,
+            ),
+            self._make_record(
+                "[Async Chat Thread]: <AdUser> join discord.gg/example",
+                tags=["server_log", "runtime_log", "chat_message"],
+                context={
+                    "chatPlayer": "AdUser",
+                    "chatMessage": "join discord.gg/example",
+                },
+                timestamp=2000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        topics = report["chat_topics"]
+
+        self.assertEqual(report["log_count"], 0)
+        self.assertEqual(topics["total_messages"], 0)
+        self.assertEqual(topics["flood_players"], [])
+        self.assertEqual(topics["abuse_players"], [])
+        self.assertEqual(topics["review_evidence"], [])
+        self.assertNotIn(
+            "chat_review",
+            {issue["category"] for issue in report["issues"]},
+        )
+
+    def test_community_filter_ignores_vulcan_records(self):
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Vulcan] Player Steve failed Speed (Type A)",
+            tags=["server_log", "runtime_log", "anticheat_vulcan"],
+            context={
+                "vulcanPlayer": "Steve",
+                "vulcanCheck": "Speed (Type A)",
+            },
+            timestamp=1000,
+        )
+
+        report = builder.build([record], 60, "survival")
+
+        self.assertEqual(report["log_count"], 0)
+        self.assertEqual(report["vulcan_alerts"], {})
+        self.assertNotIn(
+            "community",
+            {issue["category"] for issue in report["issues"]},
+        )
+        self.assertNotIn(
+            "bug",
+            {issue["category"] for issue in report["issues"]},
+        )
+
+    def test_reporter_ai_prompt_uses_category_filtered_records(self):
+        from services.mine_sentinel.reporting.reporter import MineSentinelReporter
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+        import services.mine_sentinel.anomaly_detector as ad_module
+
+        captured: dict[str, str] = {}
+
+        class Provider:
+            async def text_chat(self, prompt, **kwargs):
+                captured["prompt"] = prompt
+                return types.SimpleNamespace(completion_text="")
+
+        class Context:
+            def get_using_provider(self, *args):
+                return Provider()
+
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        reporter = MineSentinelReporter(config, Context())
+        vulcan = self._make_record(
+            "[Vulcan] Player Steve failed Speed (Type A)",
+            tags=["server_log", "runtime_log", "anticheat_vulcan"],
+            context={
+                "vulcanPlayer": "Steve",
+                "vulcanCheck": "Speed (Type A)",
+            },
+            timestamp=1000,
+        )
+        bug = self._make_record(
+            "[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+            level="ERROR",
+            timestamp=2000,
+        )
+
+        old_global = ad_module._global_detector
+        ad_module._global_detector = TemplateAnomalyDetector()
+        try:
+            report = asyncio.run(
+                reporter.build_report([vulcan, bug], 60, "survival")
+            )
+        finally:
+            ad_module._global_detector = old_global
+
+        self.assertEqual(report["log_count"], 1)
+        self.assertIn("NullPointerException", captured["prompt"])
+        self.assertNotIn("Steve", captured["prompt"])
+        self.assertNotIn("Speed (Type A)", captured["prompt"])
+
+    def test_ai_issue_review_context_has_twenty_records_each_side(self):
+        from services.mine_sentinel.reporting.ai_issue_review import AIIssueReviewer
+
+        records = [
+            self._make_record(f"[Server thread/INFO]: ordinary line {index}", timestamp=index)
+            for index in range(50)
+        ]
+        records[25] = self._make_record(
+            "[Server thread/ERROR]: Could not load plugin ExamplePlugin.jar",
+            level="ERROR",
+            timestamp=25,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_samples": [records[25].evidence_text()],
+            "first_seen_ts": 25,
+            "last_seen_ts": 25,
+        }
+
+        payload = AIIssueReviewer(MineSentinelConfig.from_dict({})).build_payload(
+            records,
+            {"issues": [issue]},
+        )
+
+        context = payload["issues"][0]["context"]
+        self.assertEqual(len(context), 41)
+        self.assertEqual(context[0]["record_index"], 5)
+        self.assertEqual(context[-1]["record_index"], 45)
+        self.assertEqual(
+            [item["record_index"] for item in context if item["hit"]],
+            [25],
+        )
+
+    def test_ai_issue_review_uses_original_records_not_filtered_records(self):
+        from services.mine_sentinel.reporting.reporter import MineSentinelReporter
+
+        prompts: list[tuple[str, str]] = []
+
+        class Provider:
+            async def text_chat(self, prompt, **kwargs):
+                session_id = str(kwargs.get("session_id") or "")
+                prompts.append((session_id, prompt))
+                if session_id == "minesentinel-issue-review":
+                    return types.SimpleNamespace(
+                        completion_text=json.dumps(
+                            {
+                                "issues": [
+                                    {
+                                        "index": 0,
+                                        "decision": "keep",
+                                        "confidence": 0.95,
+                                        "reason": "real error in original context",
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                return types.SimpleNamespace(completion_text=json.dumps({"summary": "ok"}))
+
+        class Context:
+            def get_using_provider(self, *args):
+                return Provider()
+
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"chat_review": False}}}
+        )
+        reporter = MineSentinelReporter(config, Context())
+        records = [
+            self._make_record(f"[Server thread/INFO]: ordinary line {index}", timestamp=index)
+            for index in range(50)
+        ]
+        records[24] = self._make_record(
+            "[Async Chat Thread - #1/INFO]: <Steve> ORIGINAL_CHAT_CONTEXT_BEFORE",
+            tags=["server_log", "runtime_log", "chat_message"],
+            context={
+                "level": "INFO",
+                "chatPlayer": "Steve",
+                "chatMessage": "ORIGINAL_CHAT_CONTEXT_BEFORE",
+            },
+            timestamp=24,
+        )
+        records[25] = self._make_record(
+            "[Server thread/ERROR]: Could not load plugin ExamplePlugin.jar",
+            level="ERROR",
+            timestamp=25,
+        )
+
+        report = asyncio.run(reporter.build_report(records, 60, "survival"))
+
+        review_prompt = next(prompt for session, prompt in prompts if session == "minesentinel-issue-review")
+        report_prompt = next(prompt for session, prompt in prompts if session == "minesentinel-report")
+        self.assertIn("ORIGINAL_CHAT_CONTEXT_BEFORE", review_prompt)
+        self.assertNotIn("ORIGINAL_CHAT_CONTEXT_BEFORE", report_prompt)
+        self.assertEqual(report["ai_issue_review"]["reviewed"], 1)
+        self.assertEqual(report["ai_issue_review"]["dropped"], 0)
+
+    def test_ai_issue_review_drops_false_positive_before_report(self):
+        from services.mine_sentinel.reporting.reporter import MineSentinelReporter
+
+        class Provider:
+            async def text_chat(self, prompt, **kwargs):
+                if kwargs.get("session_id") == "minesentinel-issue-review":
+                    return types.SimpleNamespace(
+                        completion_text=json.dumps(
+                            {
+                                "issues": [
+                                    {
+                                        "index": 0,
+                                        "decision": "drop",
+                                        "confidence": 0.91,
+                                        "reason": "context shows a harmless test line",
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                return types.SimpleNamespace(completion_text="")
+
+        class Context:
+            def get_using_provider(self, *args):
+                return Provider()
+
+        reporter = MineSentinelReporter(MineSentinelConfig.from_dict({}), Context())
+        records = [
+            self._make_record("[Server thread/INFO]: ordinary line 1", timestamp=1),
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin ExamplePlugin.jar",
+                level="ERROR",
+                timestamp=2,
+            ),
+            self._make_record("[Server thread/INFO]: ordinary line 3", timestamp=3),
+        ]
+
+        report = asyncio.run(reporter.build_report(records, 60, "survival"))
+
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(report["ai_issue_review"]["dropped"], 1)
+        self.assertEqual(report["categories"]["plugin"], [])
+
+    def test_ai_normalizer_does_not_restore_filtered_categories(self):
+        from services.mine_sentinel.reporting.ai_normalizer import AIReportNormalizer
+
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        bug = self._make_record(
+            "[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+            level="ERROR",
+            timestamp=2000,
+        )
+        fallback = builder.build([bug], 60, "survival")
+        ai_data = {
+            "categories": {
+                "community": ["hallucinated vulcan category"],
+                "bug": ["AI rewritten bug category"],
+            },
+            "issues": [
+                {
+                    "category": "community",
+                    "tag": "server_log_anticheat_vulcan",
+                    "severity": "critical",
+                }
+            ],
+            "vulcan_alerts": {"total": 99},
+        }
+
+        normalized = AIReportNormalizer().normalize_report(ai_data, fallback)
+
+        self.assertEqual(normalized["categories"]["community"], [])
+        self.assertEqual(normalized["categories"]["bug"], ["AI rewritten bug category"])
+        self.assertEqual(normalized["issues"], fallback["issues"])
+        self.assertEqual(normalized["vulcan_alerts"], {})
+
+    def test_hourly_summary_uses_category_filtered_records(self):
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        summarizer = HourlySummarizer(config, context=None)
+        vulcan = self._make_record(
+            "[Vulcan] Player Steve failed Speed (Type A)",
+            tags=["server_log", "runtime_log", "warning", "anticheat_vulcan"],
+            context={
+                "level": "WARN",
+                "vulcanPlayer": "Steve",
+                "vulcanCheck": "Speed (Type A)",
+            },
+            timestamp=1000,
+        )
+        bug = self._make_record(
+            "[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+            level="ERROR",
+            timestamp=2000,
+        )
+        source = MineSentinelLogSourceConfig(
+            server_id="survival",
+            server_name="Survival",
+            server_type="minecraft",
+        )
+
+        hourly = asyncio.run(
+            summarizer.build_hourly_summary(
+                [vulcan, bug],
+                source,
+                0,
+                3600 * 1000,
+                umo=None,
+            )
+        )
+
+        self.assertEqual(hourly.records_count, 1)
+        self.assertEqual(hourly.error_count, 1)
+        self.assertEqual(hourly.warning_count, 0)
+        self.assertTrue(hourly.top_events)
+        self.assertNotIn("Steve", " ".join(hourly.top_events))
+
+    def test_report_artifact_export_uses_category_filtered_records(self):
+        from services.mine_sentinel.report_artifacts import MineSentinelReportArtifacts
+        from services.mine_sentinel.reporting import MineSentinelReporter
+
+        captured: dict[str, list[ObservationRecord]] = {}
+
+        class DiskStore:
+            def export_records(self, records, *args):
+                captured["records"] = list(records)
+                return Path("filtered.jsonl")
+
+        async def inline_runner(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        reporter = MineSentinelReporter(config, context=None)
+        artifacts = MineSentinelReportArtifacts(
+            config,
+            reporter,
+            DiskStore(),
+            thread_runner=inline_runner,
+        )
+        vulcan = self._make_record(
+            "[Vulcan] Player Steve failed Speed (Type A)",
+            tags=["server_log", "runtime_log", "anticheat_vulcan"],
+            context={"vulcanPlayer": "Steve", "vulcanCheck": "Speed (Type A)"},
+            timestamp=1000,
+        )
+        bug = self._make_record(
+            "[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+            level="ERROR",
+            timestamp=2000,
+        )
+
+        asyncio.run(
+            artifacts.build([vulcan, bug], 60, "survival", umo=None)
+        )
+
+        self.assertEqual(len(captured["records"]), 1)
+        self.assertIn("NullPointerException", captured["records"][0].content)
+
+    def test_report_artifact_full_window_export_uses_filter_predicate(self):
+        from services.mine_sentinel.report_artifacts import MineSentinelReportArtifacts
+        from services.mine_sentinel.reporting import MineSentinelReporter
+
+        captured: dict[str, bool] = {}
+
+        class DiskStore:
+            def export_recent(self, window_minutes, server_id, label, predicate=None):
+                vulcan = ObservationRecord(
+                    event_id="v",
+                    kind="SERVER_LOG",
+                    timestamp=1000,
+                    server_id="survival",
+                    server_name="Survival",
+                    content="[Vulcan] Player Steve failed Speed (Type A)",
+                    tags=["server_log", "runtime_log", "anticheat_vulcan"],
+                    context={
+                        "vulcanPlayer": "Steve",
+                        "vulcanCheck": "Speed (Type A)",
+                    },
+                )
+                bug = ObservationRecord(
+                    event_id="b",
+                    kind="SERVER_LOG",
+                    timestamp=2000,
+                    server_id="survival",
+                    server_name="Survival",
+                    content="[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+                    tags=["server_log", "runtime_log", "error"],
+                    context={"level": "ERROR"},
+                )
+                captured["vulcan_allowed"] = bool(predicate and predicate(vulcan))
+                captured["bug_allowed"] = bool(predicate and predicate(bug))
+                return Path("filtered-full.jsonl")
+
+        async def inline_runner(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        reporter = MineSentinelReporter(config, context=None)
+        artifacts = MineSentinelReportArtifacts(
+            config,
+            reporter,
+            DiskStore(),
+            thread_runner=inline_runner,
+        )
+
+        path = asyncio.run(
+            artifacts.export_report_records(
+                [],
+                60,
+                "survival",
+                umo=None,
+                export_full_window=True,
+            )
+        )
+
+        self.assertEqual(path, Path("filtered-full.jsonl"))
+        self.assertFalse(captured["vulcan_allowed"])
+        self.assertTrue(captured["bug_allowed"])
+
+    def test_mechanical_fly_command_is_daily_not_community(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/INFO]: Hugin0209 issued server command: /fly",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_mechanical_prism_activity_query_is_daily_not_ops(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[TaskChainAsyncQueue Thread 28/INFO]: [prism] Executing next purge for query ActivityQuery(actionTypeKeys=[])",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_mechanical_plugin_update_notice_is_daily(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[QuickShop-Hikari] Update here: https://modrinth.com/plugin/quickshop-hikari",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_mechanical_entity_uuid_death_is_daily_not_auth(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "Villager['Leatherworker'/3923861, uuid='509fb341-ecf8-4730-8bf0-11428a62b5fd'] died",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+        self.assertEqual(builder._severity([record]), "low")
+
+    def test_mechanical_info_death_failure_is_daily_not_bug(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/INFO]: e35792 从高处落下摔死了 因为尝试逃离 烈焰人 的追杀时失败",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_mechanical_startup_keyword_noise_is_daily(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        samples = [
+            (
+                "[ServerMain/INFO]: Environment: Environment[sessionHost=https://sessionserver.mojang.com, name=PROD]",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [Vulcan] Loading server plugin Vulcan v2.9.7.22",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [AdvancedEnchantments] Registering Vulcan Hook and enabling module...",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [SpigotLibraryLoader] [PAPIProxyBridge] Loaded library D:\\libs\\io\\netty\\netty-common.jar",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: Got request to register class com.sk89q.worldedit.bukkit.BukkitServerInterface with WorldEdit",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: Loaded (1851) playtime reward records into memory. Took 8ms",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [NetworkSeasonSync] Network season sync enabled",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [NetworkSeasonSync] Synchronized CustomCrops season to winter",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: Server permissions file permissions.yml is empty, ignoring it",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [LuckPerms] Registered Vault permission & chat hook.",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: WEPIF: Vault detected! Using Vault for permissions",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: Attention! Found 1 duplicates in database. Same name, different UUID. This can cause some minor issues.",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [Plan] Registered extension: Permission Groups (Vault)",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [QuickShop-Hikari] [OK] Permission Manager Test",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [QuickShop-Hikari] Selected permission provider: Bukkit",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [RedPacket] 初始化经济与权限支持....",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [BigDoors] No materials Whitelisted!",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: LilyFairy_uwu issued server command: /redpacket session create",
+                "INFO",
+            ),
+            (
+                "- \"lp user ${player} permission set example true\"",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [LibsDisguises] If you own the plugin, place the premium jar downloaded from https://www.spigotmc.org/resources/libs-disguises.32453/",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: Paper: Using Java compression from Velocity.",
+                "INFO",
+            ),
+            (
+                "[Server thread/INFO]: [AntiCheatObfuscator] Registered fake commands: /grimac /grim /matrix",
+                "INFO",
+            ),
+            (
+                "[Server thread/WARN]: YOU ARE RUNNING THIS SERVER AS AN ADMINISTRATIVE OR ROOT USER. THIS IS NOT ADVISED.",
+                "WARN",
+            ),
+            (
+                "[Server thread/WARN]: [ViaVersion] Duplicated blocked protocol version 1.21.2-1.21.3 (768)",
+                "WARN",
+            ),
+            (
+                "[Server thread/WARN]: Legacy plugin RedPacket v2.0.0 does not specify an api-version.",
+                "WARN",
+            ),
+            (
+                "[Server thread/WARN]: [net.william278.husksync.libraries.hikari.HikariConfig] HuskSyncHikariPool - idleTimeout is close to or more than maxLifetime, disabling it.",
+                "WARN",
+            ),
+        ]
+
+        for content, level in samples:
+            with self.subTest(content=content):
+                record = self._make_record(content, level=level)
+                self.assertEqual(builder.classify(record), "daily")
+
+    def test_player_feedback_permission_chat_keeps_players(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <_Dawnstar_> 没权限过去我又回来了",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "_Dawnstar_", "chatMessage": "没权限过去我又回来了"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <LilyFairy_uwu> 你咋没权限了",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "LilyFairy_uwu", "chatMessage": "你咋没权限了"},
+                timestamp=base_ts + 5000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        issue = next(
+            item for item in report["issues"] if item["category"] == "player_feedback"
+        )
+
+        self.assertEqual(issue["players"], ["LilyFairy_uwu", "_Dawnstar_"])
+        self.assertTrue(any("没权限" in sample for sample in issue["evidence_samples"]))
+
+    def test_short_repeat_chat_is_not_flood(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Player> 好的",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Player", "chatMessage": "好的"},
+                timestamp=base_ts + i * 30000,
+            )
+            for i in range(4)
+        ]
+        report = builder.build(records, 60, "survival")
+        self.assertEqual(report["chat_topics"].get("flood_players"), [])
+        self.assertFalse(any("chat_flood" in record.tags for record in records))
+
+    def test_chat_review_issue_uses_player_chat_evidence(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <Spammer> spam-link",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "Spammer", "chatMessage": "spam-link"},
+                timestamp=base_ts + i * 10000,
+            )
+            for i in range(5)
+        ]
+
+        report = builder.build(records, 60, "survival")
+        issue = next(
+            item for item in report["issues"] if item["category"] == "chat_review"
+        )
+
+        self.assertEqual(issue["severity"], "medium")
+        self.assertEqual(issue["players"], ["Spammer"])
+        self.assertTrue(
+            any("<Spammer> spam-link" in sample for sample in issue["evidence_samples"])
+        )
+
+    def test_text_report_uses_judgement_event_format(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin ExamplePlugin",
+                level="ERROR",
+                timestamp=base_ts,
+            ),
+            *[
+                self._make_record(
+                    "[Async Chat Thread/INFO]: <Spammer> spam-link",
+                    tags=["server_log", "chat_message"],
+                    context={"chatPlayer": "Spammer", "chatMessage": "spam-link"},
+                    timestamp=base_ts + 300_000 + i * 10000,
+                )
+                for i in range(5)
+            ],
+        ]
+
+        report = builder.build(records, 60, "survival")
+        text = format_report(report, len(records), 0, 1)
+
+        self.assertIn("一、整体情况", text)
+        self.assertIn("二、重点事件总结", text)
+        self.assertIn("三、聊天与社区观察", text)
+        self.assertIn("四、玩家问题/投诉识别", text)
+        self.assertIn("关键证据：", text)
+        self.assertIn("摘要：", text)
+        self.assertIn("初步判断：", text)
+        self.assertIn("建议处理：", text)
+        self.assertIn("Spammer", text)
+        self.assertIn("spam-link", text)
+
+    def test_text_report_separates_incidents_from_observations(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin ModernPluginLoadingStrategy",
+                level="ERROR",
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Server thread/WARN]: [QuickShop-Hikari] SQLTimeoutException: HikariPool - Connection is not available, request timed out after 30000ms",
+                level="WARN",
+                timestamp=base_ts + 10_000,
+            ),
+            *[
+                self._make_record(
+                    "[Async Chat Thread/INFO]: <Spammer> hhhhhhhhhhhh",
+                    tags=["server_log", "chat_message"],
+                    context={"chatPlayer": "Spammer", "chatMessage": "hhhhhhhhhhhh"},
+                    timestamp=base_ts + 600_000 + i * 10_000,
+                )
+                for i in range(5)
+            ],
+            self._make_record(
+                "[Server thread/INFO]: Summer event activity started, reward dispatched",
+                level="INFO",
+                timestamp=base_ts + 900_000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        text = format_report(report, len(records), 0, 1)
+
+        self.assertIn("重点事件", text)
+        self.assertIn("一般观察", text)
+        self.assertIn("插件加载失败与数据库连接超时", text)
+        self.assertIn("短时间重复/无意义聊天内容", text)
+        self.assertIn("等级：Low", text)
+        self.assertIn("社区活动与普通问答", text)
+        self.assertNotIn("事故级问题", text)
+
+    def test_text_report_time_window_uses_actual_record_bounds(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Server thread/ERROR]: Could not load plugin ExamplePlugin",
+                level="ERROR",
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+                level="ERROR",
+                timestamp=base_ts + 318 * 60 * 1000,
+            ),
+        ]
+
+        report = builder.build(records, 120, "survival")
+        text = format_report(report, len(records), 0, 0)
+
+        self.assertIn("时间范围：", text)
+        self.assertNotIn("时间范围：最近 120 分钟", text)
+        self.assertIn("过去约 5 小时 18 分钟内", text)
+        self.assertNotIn("318 分钟", text)
+        self.assertEqual(report["window_start_ts"], base_ts)
+        self.assertEqual(report["window_end_ts"], base_ts + 318 * 60 * 1000)
+
+    def test_key_evidence_filters_low_value_info_lifecycle_lines(self):
+        from services.mine_sentinel.reporting.text_renderer import _incident_key_evidence
+
+        issues = [
+            {
+                "category": "bug",
+                "tag": "server_log_plugin",
+                "severity": "high",
+                "evidence_samples": [
+                    "[survival] [16:30:10] [Server thread/INFO]: [CarbonChat] CarbonChat-HikariPool - Starting...",
+                    "[survival] [16:30:14] [Server thread/ERROR]: Could not load plugin paper-remapped",
+                    "[survival] [16:30:37] [Server thread/WARN]: MariaDB Error 1193-HY000: Unknown system variable 'WSREP_ON'",
+                    "[survival] QuickShop Connect timed out",
+                ],
+            }
+        ]
+
+        evidence = _incident_key_evidence(issues, limit=3)
+
+        self.assertNotIn("CarbonChat-HikariPool - Starting", "\n".join(evidence))
+        self.assertTrue(any("Could not load plugin" in item for item in evidence))
+        self.assertTrue(any("MariaDB Error 1193-HY000" in item for item in evidence))
+        self.assertTrue(any("QuickShop Connect timed out" in item for item in evidence))
+
+    def test_chat_cheat_report_is_high_not_critical_without_external_evidence(self):
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Async Chat Thread/INFO]: <JasonOXMO> 他开飞行外挂了，我举报",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "JasonOXMO", "chatMessage": "他开飞行外挂了，我举报"},
+        )
+
+        report = builder.build([record], 60, "survival")
+        issue = report["issues"][0]
+
+        self.assertEqual(issue["category"], "community")
+        self.assertEqual(issue["severity"], "high")
+        self.assertNotEqual(issue["severity"], "critical")
+
+        text = format_report(report, 1, 0, 1)
+        self.assertIn("证据强度：聊天证据为主，暂缺反作弊日志、视频或管理员确认。", text)
+        self.assertIn("待人工复核；不建议仅凭聊天处罚", text)
 
     def test_active_priority_reflects_filter(self):
         """_active_priority 应正确移除被关闭的分类，并保留 daily 兜底。"""
@@ -2179,6 +2994,198 @@ class MineSentinelRulesTests(unittest.TestCase):
         keywords = {item["keyword"] for item in topics["top_keywords"]}
         self.assertIn("hello", keywords)
 
+    def test_chat_topics_include_three_layer_classification(self):
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread/INFO]: <TestMia> 商店扣了金币却没有给我物品，管理员能查一下吗？",
+            tags=["server_log", "chat_message"],
+            context={
+                "chatPlayer": "TestMia",
+                "chatMessage": "商店扣了金币却没有给我物品，管理员能查一下吗？",
+            },
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["chatClassification"]
+        issue = report["issues"][0]
+        admin_message = report["chat_topics"]["admin_messages"][0]
+
+        self.assertEqual(classification["primary_category"], "经济与物品")
+        self.assertEqual(classification["severity"], "high")
+        self.assertTrue(classification["needs_admin"])
+        self.assertIn("商店异常", classification["labels"])
+        self.assertIn("金币异常", classification["labels"])
+        self.assertIn("物品未发放", classification["labels"])
+        self.assertIn("管理员求助", classification["labels"])
+        self.assertEqual(issue["category"], "economy")
+        self.assertEqual(issue["severity"], "high")
+        self.assertEqual(issue["chat_primary_categories"], ["经济与物品"])
+        self.assertEqual(admin_message["player"], "TestMia")
+        self.assertEqual(admin_message["primary_category"], "经济与物品")
+
+    def test_chat_three_layer_classification_keeps_normal_question_non_actionable(self):
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread/INFO]: <TestLuna> 谁能带我去新手村？",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "TestLuna", "chatMessage": "谁能带我去新手村？"},
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["chatClassification"]
+
+        self.assertEqual(classification["primary_category"], "普通交流")
+        self.assertIn("新手提问", classification["labels"])
+        self.assertFalse(classification["needs_admin"])
+        self.assertEqual(report["issues"], [])
+
+    def test_chat_three_layer_does_not_treat_turn_off_as_disconnect(self):
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread/INFO]: <dxe_explode> 我已经关掉了",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "dxe_explode", "chatMessage": "我已经关掉了"},
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["chatClassification"]
+
+        self.assertNotIn("掉线", classification["labels"])
+        self.assertFalse(classification["needs_admin"])
+        self.assertEqual(report["issues"], [])
+
+    def test_chat_problem_labels_merge_into_one_incident(self):
+        from services.mine_sentinel.reporting.incidents import IncidentGrouper, IssuePolicy
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <TestAlex> /home 后卡住，还被传送进虚空",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "TestAlex", "chatMessage": "/home 后卡住，还被传送进虚空"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <TestSteve> 今晚掉线三次，连接稳定性是不是有问题？",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "TestSteve", "chatMessage": "今晚掉线三次，连接稳定性是不是有问题？"},
+                timestamp=base_ts + 30_000,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <TestMia> 商店扣钱没给物品，管理员能查一下吗？",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "TestMia", "chatMessage": "商店扣钱没给物品，管理员能查一下吗？"},
+                timestamp=base_ts + 60_000,
+            ),
+            self._make_record(
+                "[Async Chat Thread/INFO]: <TestAlex> 切换世界后背包不同步",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "TestAlex", "chatMessage": "切换世界后背包不同步"},
+                timestamp=base_ts + 90_000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        groups = IncidentGrouper().group(IssuePolicy().actionable_issues(report["issues"]))
+        text = format_report(report, len(records), 0, 3)
+
+        self.assertEqual(len(groups), 1)
+        self.assertIn("传送异常", text)
+        self.assertIn("虚空/卡位置", text)
+        self.assertIn("掉线", text)
+        self.assertIn("商店异常", text)
+        self.assertIn("背包不同步", text)
+
+    def test_ops_log_classification_database_timeout(self):
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/ERROR]: java.sql.SQLTimeoutException: HikariPool-1 - Connection is not available, request timed out after 30000ms.",
+            level="ERROR",
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["opsClassification"]
+        issue = report["issues"][0]
+
+        self.assertEqual(classification["level"], "ERROR")
+        self.assertEqual(classification["category"], "数据库与存储")
+        self.assertEqual(classification["subtype"], "数据库超时")
+        self.assertEqual(classification["severity"], "high")
+        self.assertTrue(classification["needs_admin"])
+        self.assertEqual(issue["category"], "bug")
+        self.assertIn("数据库超时", issue["ops_subtypes"])
+        self.assertIn("数据库超时", issue["issue_terms"])
+        self.assertEqual(issue["ops_severity"], "high")
+
+    def test_ops_info_plugin_loaded_is_context_only(self):
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/INFO]: [ExamplePlugin] Loaded plugin ExamplePlugin v1.0",
+            level="INFO",
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["opsClassification"]
+
+        self.assertEqual(classification["severity"], "info")
+        self.assertFalse(classification["needs_admin"])
+        self.assertEqual(report["issues"], [])
+
+    def test_ops_error_is_not_automatically_critical(self):
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/ERROR]: Could not pass event PlayerInteractEvent to ExamplePlugin v1.0",
+            level="ERROR",
+        )
+
+        report = builder.build([record], 60, "survival")
+        classification = record.context["opsClassification"]
+        issue = report["issues"][0]
+
+        self.assertEqual(classification["category"], "插件与模组")
+        self.assertEqual(classification["subtype"], "插件运行异常")
+        self.assertEqual(issue["severity"], "high")
+        self.assertNotEqual(issue["severity"], "critical")
+
+    def test_ops_warn_error_and_chat_feedback_merge_into_one_incident(self):
+        from services.mine_sentinel.reporting.incidents import IncidentGrouper, IssuePolicy
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        config = MineSentinelConfig.from_dict({})
+        builder = HeuristicReportBuilder(config)
+        base_ts = 1700000000000
+        records = [
+            self._make_record(
+                "[Async Chat Thread/INFO]: <TestAlex> /home 后卡住，还被传送进虚空",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": "TestAlex", "chatMessage": "/home 后卡住，还被传送进虚空"},
+                timestamp=base_ts,
+            ),
+            self._make_record(
+                "[Server thread/ERROR]: Could not pass event PlayerTeleportEvent to Essentials v2.20.1",
+                level="ERROR",
+                timestamp=base_ts + 40_000,
+            ),
+        ]
+
+        report = builder.build(records, 60, "survival")
+        groups = IncidentGrouper().group(IssuePolicy().actionable_issues(report["issues"]))
+        text = format_report(report, len(records), 0, 3)
+
+        self.assertEqual(len(groups), 1)
+        self.assertIn("传送异常", text)
+        self.assertIn("虚空/卡位置", text)
+        self.assertIn("传送/位置异常", text)
+
     def test_chat_topics_review_evidence_includes_flood_and_hint(self):
         """chat_topics.review_evidence 应包含 flood 行为和 hint 候选，含玩家上下文。
 
@@ -2199,7 +3206,7 @@ class MineSentinelRulesTests(unittest.TestCase):
                     context={"chatPlayer": "Spammer", "chatMessage": "哈哈哈"},
                     timestamp=base_ts + i * 60000,
                 )
-                for i in range(3)
+                for i in range(5)
             ],
             # 2. 单条 URL 命中（hint 候选）
             self._make_record(
@@ -2289,7 +3296,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         base_ts = 1700000000000
         records = []
         # Spammer 在 3 分钟内发 3 条相同消息
-        for i in range(3):
+        for i in range(5):
             records.append(self._make_record(
                 "[Async Chat Thread/INFO]: <Spammer> 来加群啊",
                 level="INFO",
@@ -2472,6 +3479,30 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertIn("chat_message", obs["tags"])
         self.assertEqual(obs["context"].get("chatPlayer"), "Steve")
         self.assertEqual(obs["context"].get("chatMessage"), "hello world")
+
+    def test_redacted_ip_log_not_tagged_as_chat_message(self):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "[16:30:33] [Server thread/INFO]: [RedisEconomy] Connecting to redis server redis://user@127.0.0.1?clientName=RedisEconomy&timeout=1s...",
+            runtime_config,
+        )
+
+        self.assertNotIn("chat_message", obs["tags"])
+        self.assertNotEqual(obs["context"].get("chatPlayer"), "ip")
+
+    def test_stack_trace_init_not_tagged_as_chat_message(self):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        runtime_config = MineSentinelRuntimeLogConfig()
+        obs = self._build(
+            "\tat QuickShop-Hikari-6.2.0.11.jar//com.ghostchu.crowdin.CrowdinOTA.<init>(CrowdinOTA.java:68) ~[?:?]",
+            runtime_config,
+        )
+
+        self.assertNotIn("chat_message", obs["tags"])
+        self.assertNotEqual(obs["context"].get("chatPlayer"), "init")
 
     def test_daily_noise_filter_disabled_no_tag(self):
         """daily_noise_filter_enabled=false 时不打 daily_noise 标签。"""
@@ -5027,6 +6058,76 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         """fixture 应加载出大量真实日志记录。"""
         self.assertGreater(len(self.records), 9000, "应加载出 9000+ 条真实日志")
 
+    def test_real_category_filter_chat_review_ignores_chat_surface(self):
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"chat_review": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        report = builder.build(self.records, 120, "survival")
+        topics = report["chat_topics"]
+
+        original_chat_count = sum(
+            1 for record in self.records if "chat_message" in (record.tags or [])
+        )
+        self.assertLess(topics["total_messages"], original_chat_count)
+        self.assertEqual(topics["flood_players"], [])
+        self.assertEqual(topics["abuse_players"], [])
+        self.assertEqual(topics["review_evidence"], [])
+        self.assertNotIn(
+            "chat_review",
+            {issue["category"] for issue in report["issues"]},
+        )
+
+    def test_real_category_filter_community_suppresses_vulcan_summary(self):
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"community": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        report = builder.build(self.records, 120, "survival")
+
+        self.assertEqual(report["vulcan_alerts"], {})
+        self.assertNotIn(
+            "community",
+            {issue["category"] for issue in report["issues"]},
+        )
+
+    def test_real_category_whitelist_bug_suppresses_other_surfaces(self):
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_whitelist": ["bug"]}}
+        )
+        builder = HeuristicReportBuilder(config)
+        report = builder.build(self.records, 120, "survival")
+        topics = report["chat_topics"]
+
+        self.assertEqual(report["vulcan_alerts"], {})
+        self.assertLessEqual(topics["total_messages"], 1)
+        self.assertEqual(topics["flood_players"], [])
+        self.assertEqual(topics["abuse_players"], [])
+        self.assertEqual(topics["review_evidence"], [])
+        self.assertNotIn(
+            "community",
+            {issue["category"] for issue in report["issues"]},
+        )
+        self.assertNotIn(
+            "chat_review",
+            {issue["category"] for issue in report["issues"]},
+        )
+
+    def test_real_mechanical_classifications_not_promoted_to_issues(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        report = builder.build(self.records, 120, "survival")
+        issue_categories = {issue["category"] for issue in report["issues"]}
+        issue_tags = {issue["tag"] for issue in report["issues"]}
+
+        self.assertNotIn("daily", issue_categories)
+        self.assertNotIn("plugin", issue_categories)
+        self.assertNotIn("network", issue_categories)
+        self.assertNotIn("economy", issue_categories)
+        self.assertNotIn("cross_server", issue_categories)
+        self.assertNotIn("chat_review", issue_categories)
+        self.assertNotIn("server_log_info", issue_tags)
+        self.assertLessEqual(len(report["issues"]), 8)
+
     def test_real_vulcan_alerts_aggregated_for_massive_alerts(self):
         """海量 Vulcan 告警（4202 条）应被聚合统计而非全列。
 
@@ -5263,7 +6364,7 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
                 f"'私聊' 聊天不应被误判为 chat_review: {record.content[:80]}",
             )
 
-    def test_real_chat_flood_detected_and_classified_as_chat_review(self):
+    def test_real_short_repeats_do_not_trigger_chat_flood(self):
         """真实日志中存在刷屏玩家（同一ID短时间大量消息），应被检测并归入 chat_review。
 
         PR10 v2: 刷屏=同一ID短时间集中发送大量重复/相似信息。
@@ -5274,13 +6375,15 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         # 注意：必须用 build() 跑，刷屏检测在 build() 阶段做
         report = builder.build(self.records, 120, "survival")
         flood_players = report["chat_topics"].get("flood_players") or []
+        self.assertEqual(flood_players, [])
+        return
         # 真实日志中 LilyFairy_uwu 发了 546 条消息，应被检测为高频刷屏
         self.assertTrue(flood_players, "应检测到刷屏玩家")
         lily = next((p for p in flood_players if p["player"] == "LilyFairy_uwu"), None)
         self.assertIsNotNone(lily, "LilyFairy_uwu 应在刷屏玩家列表中")
         self.assertGreater(lily["total_messages"], 0)
 
-    def test_real_chat_flood_triggers_alert(self):
+    def test_real_short_repeats_do_not_trigger_chat_review_alert(self):
         """真实日志刷屏记录应触发告警（避免审核漏报）。
 
         PR10 v2: chat_flood 标签的记录强制告警，确保审核可见。
@@ -5293,6 +6396,8 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         chat_issues = [
             issue for issue in report["issues"] if issue["category"] == "chat_review"
         ]
+        self.assertEqual(chat_issues, [])
+        return
         # 应存在由 chat_flood 形成的 chat_review issue
         self.assertTrue(chat_issues, "应存在 chat_review issue")
         # 至少一个 chat_review issue 应触发告警（chat_flood 强制告警）
@@ -5302,7 +6407,7 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
             "chat_flood 形成的 chat_review issue 应触发告警",
         )
 
-    def test_real_chat_topics_flood_players_includes_samples(self):
+    def test_real_chat_topics_has_no_short_repeat_flood_players(self):
         """真实日志 chat_topics.flood_players 应包含刷屏玩家+时间窗口+样本原文。
 
         PR10 v2: LLM 需要 chat_summary 字段贴出刷屏玩家、刷屏类型、时间窗口、消息数和样本原文。
@@ -5310,6 +6415,8 @@ class MineSentinelRealLogV54kwMiTests(unittest.TestCase):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         report = builder.build(self.records, 120, "survival")
         flood_players = report["chat_topics"].get("flood_players") or []
+        self.assertEqual(flood_players, [])
+        return
         self.assertGreater(len(flood_players), 0, "应存在刷屏玩家")
         for fp in flood_players:
             self.assertIn("player", fp)

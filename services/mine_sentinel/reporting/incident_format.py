@@ -74,8 +74,12 @@ def format_duration(report: dict) -> str:
         match = re.search(r"最近\s*(\d+)\s*分钟", str(report.get("time_window") or ""))
         if match:
             minutes = int(match.group(1))
-    if minutes and minutes % 60 == 0:
-        return f"{minutes // 60} 小时"
+    if minutes and minutes >= 60:
+        hours = minutes // 60
+        remainder = minutes % 60
+        if remainder:
+            return f"约 {hours} 小时 {remainder} 分钟"
+        return f"{hours} 小时"
     if minutes:
         return f"{minutes} 分钟"
     return "本窗口"

@@ -179,14 +179,15 @@ class HourlySummarizer:
         hour_end_ms: int,
         umo: str | None = None,
     ) -> HourlySummary:
-        heuristic = self.rules.build(records, 60, source.server_id)
-        records_count = len(records)
-        error_count = sum(1 for r in records if "error" in r.tags)
-        warning_count = sum(1 for r in records if "warning" in r.tags)
+        report_records = self.rules.filter_records_for_report(records)
+        heuristic = self.rules.build(report_records, 60, source.server_id)
+        records_count = len(report_records)
+        error_count = sum(1 for r in report_records if self._is_error_record(r))
+        warning_count = sum(1 for r in report_records if self._is_warning_record(r))
         info_count = records_count - error_count - warning_count
         summary_text = self._heuristic_hourly_text(heuristic, records_count)
         key_issues = self._heuristic_key_issues(heuristic)
-        top_events = self._heuristic_top_events(records)
+        top_events = self._heuristic_top_events(report_records)
 
         hourly = HourlySummary(
             server_id=source.server_id,
@@ -208,7 +209,13 @@ class HourlySummarizer:
         if provider is None:
             return hourly
 
-        prompt = self._build_hourly_prompt(records, source, hour_start_ms, hour_end_ms, heuristic)
+        prompt = self._build_hourly_prompt(
+            report_records,
+            source,
+            hour_start_ms,
+            hour_end_ms,
+            heuristic,
+        )
         try:
             result = await provider.text_chat(
                 prompt=prompt,
@@ -300,7 +307,7 @@ class HourlySummarizer:
             content = (record.content or "").strip()
             if not content or content in seen:
                 continue
-            if any(t in record.tags for t in ("error", "warning")):
+            if self._is_error_record(record) or self._is_warning_record(record):
                 out.append(content[:200])
                 seen.add(content)
             if len(out) >= 6:
@@ -314,6 +321,20 @@ class HourlySummarizer:
                 if len(out) >= 6:
                     break
         return out
+
+    @staticmethod
+    def _is_error_record(record: ObservationRecord) -> bool:
+        level = str((record.context or {}).get("level") or "").lower()
+        return "error" in (record.tags or []) or level in {"error", "fatal", "severe"}
+
+    @staticmethod
+    def _is_warning_record(record: ObservationRecord) -> bool:
+        level = str((record.context or {}).get("level") or "").lower()
+        return (
+            "warning" in (record.tags or [])
+            or "warn" in (record.tags or [])
+            or level in {"warn", "warning"}
+        )
 
     def _build_hourly_prompt(
         self,

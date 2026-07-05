@@ -280,13 +280,18 @@ class MineSentinelService:
             window_data,
         )
         self.last_report_time = time.time()
-        text = format_report(report, window_data.total_count, 0, window_data.unique_players)
+        report_records = self.reporter.rules.filter_records_for_report(records)
+        report_total_count = len(report_records)
+        report_unique_players = len(
+            {record.identity for record in report_records if record.identity}
+        )
+        text = format_report(report, report_total_count, 0, report_unique_players)
         report_file = self._report_file_path(report)
         image = await self._render_report_image(
             report,
-            window_data.total_count,
+            report_total_count,
             0,
-            window_data.unique_players,
+            report_unique_players,
             render_image,
         )
         if report_file and current_session:
@@ -295,7 +300,7 @@ class MineSentinelService:
         if self._has_report_delivery_targets():
             await self.dispatcher.send_to_target_sessions(
                 text,
-                records,
+                report_records,
                 current_session,
                 include_server_targets=self.config.report.send_to_target_sessions,
                 image=image,
@@ -318,6 +323,7 @@ class MineSentinelService:
                 include_server_targets=self.config.report.send_to_target_sessions,
             ).items()
         ):
+            report_records = self.reporter.rules.filter_records_for_report(scoped_records)
             report = await self._build_report(
                 scoped_records,
                 window,
@@ -326,17 +332,17 @@ class MineSentinelService:
                 window_data,
             )
             unique_players = len(
-                {record.identity for record in scoped_records if record.identity}
+                {record.identity for record in report_records if record.identity}
             )
             text = format_report(
                 report,
-                len(scoped_records),
+                len(report_records),
                 0,
                 unique_players,
             )
             image = await self._render_report_image(
                 report,
-                len(scoped_records),
+                len(report_records),
                 0,
                 unique_players,
                 None,

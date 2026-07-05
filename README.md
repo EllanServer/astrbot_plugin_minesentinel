@@ -231,11 +231,11 @@ community > chat_review > player_feedback > community_ops
 
 **检查项目开关与过滤**：12 类检查项目可以在 `mine_sentinel.runtime_log` 下按需开关或过滤：
 
-- `category_enabled`（dict[str, bool]）：单分类开关。把某个分类设为 `false` 即关闭该检查项目，被关闭的分类不再参与匹配，记录会落到下一优先级分类或 `daily`。例：`{"chat_review": false, "player_feedback": false}`。
-- `category_whitelist`（list[str]）：白名单模式。非空时仅白名单内分类参与检查，其余全部关闭。例：`["bug", "plugin", "network"]` 表示只检查这三类。
+- `category_enabled`（dict[str, bool]）：单分类开关。把某个分类设为 `false` 即关闭该检查项目；命中该分类的记录会从规则报告、AI prompt、小时总结、图片/文本渲染统计和导出附件中忽略，不再降级到其他分类或 `daily`。例：`{"chat_review": false, "player_feedback": false}`。
+- `category_whitelist`（list[str]）：白名单模式。非空时仅白名单内分类参与检查，其余全部关闭；命中白名单外分类的记录同样从总结链路入口忽略。例：`["bug", "plugin", "network"]` 表示只检查这三类。
 - `disabled_categories`（list[str]）：已弃用别名，等价于把这些分类在 `category_enabled` 中设为 `false`。
 
-两者可同时使用：先用 `category_whitelist` 选出关注集合，再用 `category_enabled` 在白名单内做二次细关。`daily` 是兜底分类，强制开启（写 `false` 也会被忽略），保证无关键词日志仍能被归类。配置示例：
+两者可同时使用：先用 `category_whitelist` 选出关注集合，再用 `category_enabled` 在白名单内做二次细关。`daily` 是兜底分类，强制开启（写 `false` 也会被忽略）；只有没有命中已关闭分类的普通日志才会落入 `daily`。配置示例：
 
 ```yaml
 mine_sentinel:

@@ -113,6 +113,9 @@ class LogTemplateMiner:
         self._max_namespaces = max_namespaces
         # per-server drain3 miners
         self._miners: dict[str, Any] = {}
+        # per-server fallback state used when drain3 is unavailable. It keeps
+        # namespace isolation and first-seen semantics for fingerprint mode.
+        self._fallback_templates: dict[str, dict[str, dict[str, Any]]] = {}
 
         if not _DRAIN3_AVAILABLE:
             logger.warning(
@@ -138,9 +141,12 @@ class LogTemplateMiner:
           所有溢出 server 共享 default 的锁，不会与 default 的正常 parse 竞争。
         """
         with self._dict_lock:
-            if server_id in self._miners:
+            namespaces = (
+                self._miners if self._available else self._fallback_templates
+            )
+            if server_id in namespaces:
                 return server_id
-            if len(self._miners) < self._max_namespaces:
+            if len(namespaces) < self._max_namespaces:
                 return server_id
             return "default"
 
@@ -152,7 +158,7 @@ class LogTemplateMiner:
         if server_id in self._miners:
             return self._miners[server_id]
 
-        if len(self._miners) >= self._max_namespaces:
+        if len(self._miners) >= self._max_namespaces and server_id != "default":
             # 超出上限：复用 "default" miner，不再创建新 namespace。
             # 注意：调用方应通过 _resolve_namespace 已经把 server_id 归一到 "default"，
             # 这里保留兜底逻辑以防直接调用。
@@ -204,23 +210,30 @@ class LogTemplateMiner:
         ``server_id`` 用于分 namespace：不同服务器的日志使用独立的 parse tree，
         避免模板互相污染。PR9 起不同 server_id 的 parse 互相不阻塞。
         """
+        namespace = self._resolve_namespace(server_id)
+        lock = self._lock_for(namespace)
         if not self._available:
-            # 降级：返回 fallback fingerprint，调用方用旧逻辑去重
             from .runtime_log import _fingerprint
 
             fp = _fingerprint(line)
-            return ParsedTemplate(
-                template_id=fp,
-                template=line,
-                params=[],
-                is_new_template=False,
-                cluster_size=0,
-                fallback=True,
-                fallback_fingerprint=fp,
-            )
+            with lock:
+                templates = self._fallback_templates.setdefault(namespace, {})
+                entry = templates.get(fp)
+                is_new = entry is None
+                if entry is None:
+                    entry = {"template": line, "size": 0}
+                    templates[fp] = entry
+                entry["size"] = int(entry.get("size") or 0) + 1
+                return ParsedTemplate(
+                    template_id=fp,
+                    template=str(entry.get("template") or line),
+                    params=[],
+                    is_new_template=is_new,
+                    cluster_size=int(entry.get("size") or 0),
+                    fallback=True,
+                    fallback_fingerprint=fp,
+                )
 
-        namespace = self._resolve_namespace(server_id)
-        lock = self._lock_for(namespace)
         with lock:
             miner = self._get_or_create_miner(namespace)
             result = miner.add_log_message(line)
@@ -249,7 +262,24 @@ class LogTemplateMiner:
     def match(self, line: str, server_id: str = "default") -> ParsedTemplate | None:
         """只匹配不学习。若模板未见过的返回 None。线程安全（per-server 锁）。"""
         if not self._available:
-            return None
+            from .runtime_log import _fingerprint
+
+            namespace = self._resolve_namespace(server_id)
+            lock = self._lock_for(namespace)
+            fp = _fingerprint(line)
+            with lock:
+                entry = self._fallback_templates.get(namespace, {}).get(fp)
+                if entry is None:
+                    return None
+                return ParsedTemplate(
+                    template_id=fp,
+                    template=str(entry.get("template") or line),
+                    params=[],
+                    is_new_template=False,
+                    cluster_size=int(entry.get("size") or 0),
+                    fallback=True,
+                    fallback_fingerprint=fp,
+                )
         namespace = self._resolve_namespace(server_id)
         lock = self._lock_for(namespace)
         with lock:
@@ -295,7 +325,21 @@ class LogTemplateMiner:
         ``{"available": True, "namespaces": {"srv1": {"T1": {...}}, ...}}``
         """
         if not self._available:
-            return {"available": False, "namespaces": {}}
+            with self._dict_lock:
+                items = sorted(self._fallback_templates.items())
+            namespaces: dict[str, dict[str, Any]] = {}
+            for server_id, templates in items:
+                lock = self._lock_for(server_id)
+                with lock:
+                    namespaces[server_id] = {
+                        fingerprint: {
+                            "template": str(entry.get("template") or ""),
+                            "size": int(entry.get("size") or 0),
+                            "fallback": True,
+                        }
+                        for fingerprint, entry in sorted(templates.items())
+                    }
+            return {"available": False, "namespaces": namespaces}
         return {"available": True, "namespaces": self._snapshot_namespaces()}
 
     def save_state(self) -> bool:

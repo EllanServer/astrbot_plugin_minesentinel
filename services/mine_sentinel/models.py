@@ -201,8 +201,10 @@ class MineSentinelRuntimeLogConfig:
     io_workers: int = 0
     # 检查项目（12 类分类）开关与白名单：
     # - category_enabled: 单分类开关，key 为分类名，value=False 关闭该分类检查；
+    #   命中已关闭分类的记录会从总结链路入口忽略，不降级到其他分类。
     #   未列出或 value=True 视为开启。daily 始终兜底，关闭后会被强制重新开启。
     # - category_whitelist: 非空时仅白名单内分类参与检查，其余全部关闭；
+    #   命中白名单外分类的记录会从总结链路入口忽略。
     #   为空时按 category_enabled 决定。daily 不受白名单限制（始终兜底）。
     category_enabled: dict[str, bool] = field(default_factory=dict)
     category_whitelist: list[str] = field(default_factory=list)

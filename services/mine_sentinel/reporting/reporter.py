@@ -24,7 +24,14 @@ class MineSentinelReporter:
         umo: str | None = None,
     ) -> dict[str, Any]:
         heuristic = self.rules.build(records, window_minutes, server_id)
-        ai_report = await self.ai.build(records, window_minutes, heuristic, umo)
+        ai_records = self.rules.filter_records_for_report(records)
+        ai_report = await self.ai.build(
+            ai_records,
+            window_minutes,
+            heuristic,
+            umo,
+            review_records=records,
+        )
         return ai_report or heuristic
 
     def build_heuristic_report(

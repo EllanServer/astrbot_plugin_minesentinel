@@ -83,7 +83,7 @@ _ERROR_WORDS = (
 # 用于 chat_summary 热点总结，提取玩家名和消息内容。
 _CHAT_THREAD_RE = re.compile(r"\[Async Chat Thread[^\]]*\]\s*:?\s*", re.IGNORECASE)
 # 原生聊天：<player> message
-_CHAT_PLAYER_PREFIX_RE = re.compile(r"<(?P<player>[^>\s]{1,40})>\s*(?P<message>.*)$")
+_CHAT_PLAYER_PREFIX_RE = re.compile(r"^\s*<(?P<player>[^>\s]{1,40})>\s*(?P<message>.*)$")
 # 聊天插件（CarbonChat 等）：[Not Secure] [频道] player >> message
 # 兼容 [Not Secure] 可选、频道名可含中文/数字、>> 分隔符。
 _CHAT_PLUGIN_RE = re.compile(
@@ -1218,6 +1218,7 @@ def _detect_chat_message(content: str) -> tuple[str, str] | None:
     stripped = content
     if _CHAT_THREAD_RE.search(content):
         stripped = _CHAT_THREAD_RE.sub("", content).strip()
+    stripped = _PREFIX_RE.sub("", stripped).strip()
     plugin_match = _CHAT_PLUGIN_RE.search(stripped)
     if plugin_match:
         player = plugin_match.group("player").strip()
@@ -1280,7 +1281,7 @@ def _detect_meaningless_message(message: str) -> bool:
 _CHAT_FLOOD_HIGH_FREQ_WINDOW_MS = 30 * 1000  # 30 秒窗口（高频刷屏）
 _CHAT_FLOOD_HIGH_FREQ_COUNT = 8  # 30 秒内 >=8 条消息视为高频刷屏（轰炸级别）
 _CHAT_FLOOD_REPEAT_WINDOW_MS = 5 * 60 * 1000  # 5 分钟窗口（重复内容）
-_CHAT_FLOOD_REPEAT_COUNT = 3  # 5 分钟内 >=3 条相同/高度相似消息视为重复刷屏
+_CHAT_FLOOD_REPEAT_COUNT = 5  # 5 分钟内 >=5 条相同/高度相似消息视为重复刷屏
 _CHAT_FLOOD_MEANINGLESS_COUNT = 3  # 5 分钟内 >=3 条无意义符号消息视为无意义刷屏
 
 
@@ -1311,7 +1312,7 @@ def _detect_chat_flood(
 
     三类刷屏（参考百度百科+社区规则定义）：
     1. high_frequency: 60 秒内同一玩家发送 >=5 条消息（高频刷屏）
-    2. repeat_content: 5 分钟内同一玩家发送 >=3 条相同/高度相似消息（重复刷屏）
+    2. repeat_content: 5 分钟内同一玩家发送 >=5 条相同/高度相似消息（重复刷屏）
     3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息（无意义刷屏）
     """
     from .models import ObservationRecord as _OR  # 类型提示用
