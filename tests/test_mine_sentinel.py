@@ -515,6 +515,65 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             # content 应被裁剪到 max_line_length=50 左右，远小于原始 5000
             self.assertLess(len(observations[0]["content"]), 100)
 
+    def test_template_miner_parses_log_into_template_and_params(self):
+        """drain3 应当把相似日志归为同一模板，参数化变量。"""
+        from services.mine_sentinel.template_miner import LogTemplateMiner
+
+        miner = LogTemplateMiner()
+        if not miner.available:
+            self.skipTest("drain3 未安装，跳过模板解析测试")
+
+        r1 = miner.parse("[14:02:11 INFO]: Steve joined the game")
+        r2 = miner.parse("[14:02:14 INFO]: Alex joined the game")
+        # 同一模板（玩家加入），template_id 应相同
+        self.assertEqual(r1.template_id, r2.template_id)
+        self.assertGreater(r2.cluster_size, r1.cluster_size)
+        # 模板应参数化玩家名
+        self.assertIn("<*>", r2.template)
+
+    def test_build_observation_includes_template_id_in_context(self):
+        """_build_observation 应当在 context 里写入 templateId/template/templateSize。"""
+        from services.mine_sentinel.models import MineSentinelLogSourceConfig
+
+        source = MineSentinelLogSourceConfig(
+            server_id="srv", server_name="Srv",
+            server_type="minecraft", root="/tmp",
+        )
+        obs = _build_observation(
+            source, Path("/tmp/logs/latest.log"),
+            "[14:02:11 INFO]: Steve joined the game",
+            timestamp_ms=1700000000000, max_line_length=1000,
+        )
+        ctx = obs["context"]
+        self.assertIn("templateId", ctx)
+        self.assertIn("template", ctx)
+        self.assertIn("templateSize", ctx)
+
+    def test_loop_filter_dedupes_by_template_id(self):
+        """loop_filter 应当按 templateId 合并同类日志，而不是只看 fingerprint。"""
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+        from services.mine_sentinel.runtime_log import RuntimeLogLoopFilter
+
+        config = MineSentinelRuntimeLogConfig(
+            enabled=True, loop_filter_enabled=True,
+            loop_filter_window_seconds=300, loop_summary_interval_seconds=60,
+        )
+        lf = RuntimeLogLoopFilter(config)
+        # 两条相似日志（同模板，不同玩家名）
+        base_ctx = {
+            "level": "WARN", "serverType": "minecraft",
+            "templateId": "T1", "template": "<*> WARN]: connection reset",
+            "templateSize": 1, "fingerprint": "fp1",
+        }
+        obs1 = {"serverId": "srv", "content": "[14:00 WARN]: connection reset",
+                "timestamp": 1700000000000, "context": dict(base_ctx), "tags": []}
+        obs2 = {"serverId": "srv", "content": "[14:01 WARN]: connection reset",
+                "timestamp": 1700000030000, "context": dict(base_ctx), "tags": []}
+        r1 = lf.process(obs1)
+        r2 = lf.process(obs2)
+        self.assertEqual(len(r1), 1)  # 首条直接放行
+        self.assertEqual(len(r2), 0)  # 第二条被合并（30s < summary_interval=60s）
+
 
 class MineSentinelRulesTests(unittest.TestCase):
     """Tests for the refactored rules engine: network/plugin categories and critical direct alert."""

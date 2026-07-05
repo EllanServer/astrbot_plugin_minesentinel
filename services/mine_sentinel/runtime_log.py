@@ -16,6 +16,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .models import MineSentinelLogSourceConfig, MineSentinelRuntimeLogConfig
+from .template_miner import get_template_miner
 
 
 BatchHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
@@ -112,17 +113,22 @@ class RuntimeLogLoopFilter:
             return [observation]
 
         context = dict(observation.get("context") or {})
+        # 优先用 drain3 模板 ID 去重（同一模板的日志归为一类），
+        # 不可用时回退到 fingerprint（基于正则替换的哈希）。
+        dedupe_key = str(context.get("templateId") or "")
         fingerprint = str(context.get("fingerprint") or "")
-        if not fingerprint:
+        if not dedupe_key:
+            dedupe_key = fingerprint
+        if not dedupe_key:
             return [observation]
 
         now_ms = _as_millis(observation.get("timestamp")) or int(time.time() * 1000)
-        key = f"{observation.get('serverId') or ''}:{fingerprint}"
+        key = f"{observation.get('serverId') or ''}:{dedupe_key}"
         entry = self._entries.get(key)
         window_ms = max(1, self.config.loop_filter_window_seconds) * 1000
         if entry is None or now_ms - entry.last_ts > window_ms:
             self._entries[key] = _LoopEntry(
-                fingerprint=fingerprint,
+                fingerprint=fingerprint or dedupe_key,
                 first_ts=now_ms,
                 last_ts=now_ms,
                 last_emit_ts=now_ms,
@@ -139,6 +145,10 @@ class RuntimeLogLoopFilter:
         entry.count += 1
         entry.suppressed += 1
         entry.last_ts = now_ms
+        # 更新模板大小（drain3 模式下会随样本增长）
+        new_size = int(context.get("templateSize") or 0)
+        if new_size > 0:
+            entry.context["templateSize"] = new_size
         summary_ms = max(1, self.config.loop_summary_interval_seconds) * 1000
         if now_ms - entry.last_emit_ts >= summary_ms:
             summary = self._summary(entry)
@@ -739,6 +749,10 @@ def _build_observation(
     content = _sanitize_line(_truncate(line, max_line_length))
     level = _detect_level(content)
     fingerprint = _fingerprint(content)
+    # 模板解析：drain3 可用时返回 template_id，否则降级为 fingerprint
+    parsed = get_template_miner().parse(content)
+    template_id = parsed.template_id
+    template = parsed.template
     digest = hashlib.sha1(
         f"{source.server_id}:{timestamp_ms}:{fingerprint}:{log_file.name}".encode("utf-8")
     ).hexdigest()[:20]
@@ -756,6 +770,23 @@ def _build_observation(
         tags.append("error")
     elif level in {"WARN", "WARNING"}:
         tags.append("warning")
+    if parsed.is_new_template:
+        tags.append("new_template")
+    context = {
+        "source": "astrbot_runtime_log",
+        "logFile": str(log_file),
+        "level": level,
+        "fingerprint": fingerprint,
+        "compressed": log_file.name.lower().endswith(".gz"),
+        "serverType": server_type,
+        "templateId": template_id,
+        "template": template,
+        "templateSize": parsed.cluster_size,
+    }
+    if parsed.params:
+        context["templateParams"] = parsed.params[:8]
+    if parsed.fallback:
+        context["templateFallback"] = True
     return {
         "eventId": f"local-log:{source.server_id}:{digest}",
         "kind": "SERVER_LOG",
@@ -764,14 +795,7 @@ def _build_observation(
         "serverName": source.server_name or source.server_id or "Minecraft",
         "content": content,
         "tags": tags,
-        "context": {
-            "source": "astrbot_runtime_log",
-            "logFile": str(log_file),
-            "level": level,
-            "fingerprint": fingerprint,
-            "compressed": log_file.name.lower().endswith(".gz"),
-            "serverType": server_type,
-        },
+        "context": context,
     }
 
 

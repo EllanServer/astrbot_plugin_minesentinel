@@ -1,5 +1,9 @@
 aiohttp>=3.14.1
 Pillow>=12.2.0
+# Optional: log template miner. When absent the loop_filter falls back to
+# fingerprint-based dedup; when present, same-template logs are merged more
+# accurately and template stats feed the anomaly detector (PR3).
+drain3>=0.9.11
 # Required native Rust core (mine_sentinel_rs). Install the platform wheel
 # produced by the "Build Rust wheels" GitHub Actions workflow before loading
 # this branch; the pure-Python fallback has intentionally been removed.
