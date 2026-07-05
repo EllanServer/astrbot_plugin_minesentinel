@@ -252,7 +252,7 @@ fn compact_py_dict<'py>(
             break;
         }
         let key_str: String = key.extract().unwrap_or_else(|_| key.to_string());
-        let compacted = compact_py_value(py, &value, max_len)?;
+        let compacted = compact_py_value(py, &value, max_len, max_fields)?;
         out.set_item(key_str, compacted)?;
         count += 1;
     }
@@ -260,10 +260,13 @@ fn compact_py_dict<'py>(
 }
 
 /// Mirror `compact_value` operating on a single Python value.
+/// Recursively compacts nested dicts/lists to preserve structure (e.g.
+/// `context["otel"]`), instead of JSON-dumping them to a string.
 fn compact_py_value<'py>(
     py: Python<'py>,
     value: &Bound<'py, PyAny>,
     max_len: usize,
+    max_fields: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
     if value.is_none() {
         return Ok(value.clone());
@@ -281,9 +284,19 @@ fn compact_py_value<'py>(
     if let Ok(s) = value.extract::<String>() {
         return Ok(truncate(&s, max_len).into_pyobject(py)?.into_any());
     }
-    // Fallback (lists/dicts/unknown): stringify via Python str() then truncate.
-    // Matches Python's `json.dumps(value, default=str)` for the common cases
-    // we see in context/raw.
+    // 嵌套 dict → 递归 compact，保持结构化（而非 stringify）。
+    if let Ok(d) = value.extract::<Bound<PyDict>>() {
+        return Ok(compact_py_dict(py, &d, max_fields, max_len)?.into_any());
+    }
+    // 嵌套 list → 递归 compact，截断到 max_fields 项。
+    if let Ok(l) = value.extract::<Bound<PyList>>() {
+        let out = PyList::empty(py);
+        for item in l.iter().take(max_fields) {
+            out.append(compact_py_value(py, &item, max_len, max_fields)?)?;
+        }
+        return Ok(out.into_any());
+    }
+    // Fallback (unknown types): stringify via Python str() then truncate.
     let s: String = value.str()?.extract().unwrap_or_else(|_| value.to_string());
     Ok(truncate(&s, max_len).into_pyobject(py)?.into_any())
 }

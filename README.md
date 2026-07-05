@@ -6,11 +6,57 @@
 
 - 直接按路径读取单服或 Velocity 群组服日志。
 - 启动时回扫最近窗口，避免 `latest.log` 轮转或压缩后 8 小时总结缺日志。
-- 实时尾读 `latest.log`，轮转、截断或重启后会自动补读近期日志。
+- 实时尾读 `latest.log`，轮转、截断或重启后会自动补读近期日志；单源异常带 supervisor 自动重启（指数退避，最多 10 次）。
 - 过滤服务器报错死循环：同类 ERROR/WARN/Exception 只保留首条和周期性摘要。
+- **Drain3 模板化 + 统计异常检测**：每条日志解析为 `(templateId, template, params)`，按 `(server_id, template_id)` 维护 EWMA 突增基线和分位数阈值，新模板/突增会标记 `new_template` / `anomaly_spike` 并提升 severity。
+- **OpenTelemetry Logs Data Model**：每条 observation 的 `context.otel` 写入 `severityNumber` / `eventName` / `body` / `resource.service.name` / `attributes.template.id` 等字段，落盘 JSONL 保持嵌套 dict 结构，便于 Loki / OTel-compatible 系统按字段检索。
 - AI 生成五段式巡检报告，并保留图片渲染和完整 JSONL 附件。
 - 社区管理单独分类：ban、kick、mute、report、spam、grief、cheat、举报、封禁、禁言、刷屏等会进入 `community`，不混入普通插件报错。
-- 注重性能和内存安全：追加读取限制字节数，末尾补读按块读取，回扫分批写入 JSONL，报告窗口有内存上限和优先级采样。
+- 注重性能和内存安全：追加读取限制字节数，末尾补读按块读取，回扫分批写入 JSONL，报告窗口有内存上限和优先级采样；突发日志走 backlog 排队（不静默丢弃），模板/异常状态有 per-server 上限和 TTL 清理。
+
+## 高级日志分析链路
+
+MineSentinel 的日志处理不是简单的"读日志 + 循环过滤 + AI 总结"，而是一条结构化分析管线：
+
+```
+raw log line
+  │
+  ▼ sanitize          去 ANSI / 控制字符；截断超长行
+  │
+  ▼ Drain3 template   按 server_id 分 namespace 解析为 (templateId, template, params)
+  │                   新模板 → tags += new_template
+  │
+  ▼ anomaly score     对 (server_id, template_id) 维护 EWMA 基线 + 分位数阈值
+  │                   突增 → tags += anomaly_spike，score 提升 severity
+  │
+  ▼ loop_filter       同 templateId 的 ERROR/WARN 合并为周期摘要（loop_suppressed）
+  │
+  ▼ rules             12 类分类 + critical/high/medium/low 严重级别 + 推荐动作
+  │
+  ▼ storage           normalize → compact（保持 OTel 嵌套 dict）→ JSONL 落盘
+  │
+  ▼ LLM report        五段式巡检 + 异常证据（预计算，不让 LLM 重新检测）
+```
+
+关键设计：
+
+- **模板按 server_id 分 namespace**：不同后端服的插件组合、语言、日志模式差异大，全局共享 parse tree 会导致 A 服模板污染 B 服的 `new_template` 判定。每个 `server_id` 维护独立的 Drain3 tree，上限 16 个 namespace。
+- **异常检测有界**：`max_templates_per_server`（默认 500）超过时淘汰最久未见的；`inactive_template_ttl_hours`（默认 24h）周期清理不活跃模板。snapshot 输出 `per_server_count` / `cleanup_count` / `last_cleanup_ms`。
+- **突发日志 backlog**：单轮超过 `max_lines_per_poll` 时，前 N 行本轮处理，剩余完整行存入 backlog 留到下一轮；backlog 超 `max_lines*4` 才丢弃最旧行并写一条 synthetic observation 标注"本窗口审计日志不完整"。
+- **OTel 字段不被字符串化**：`compact_value` 对嵌套 dict/list 递归 compact 而非 JSON dump 成字符串，`context.otel` 在落盘 JSONL 里保持可查询的嵌套对象。
+
+## Rust 加速（可选）
+
+`mine_sentinel_rs` 是用 PyO3 写的原生扩展，用于加速 CPU 热路径（`normalize_record` / `record_to_json` / `json_line` / `dedupe_key`）。**它是可选依赖**：未安装时 codec 自动降级为纯 Python 实现，行为完全等价，只是慢一些。插件不会因为缺少 wheel 而加载失败。
+
+启用方式：从 GitHub Actions "Build Rust wheels" 工作流下载对应平台的 wheel，然后：
+
+```bash
+pip install mine_sentinel_rs-<version>-<platform>.whl
+python -c "import mine_sentinel_rs; print('rust core enabled')"
+```
+
+不需要在目标机器本地编译 Rust。如果 `import mine_sentinel_rs` 失败，插件照常工作，只是日志里不会出现 "rust core enabled"。
 
 ## 命令
 
@@ -172,15 +218,15 @@ community > chat_review > player_feedback > community_ops
 
 执行要求：
 1. 检查目录存在，识别 AstrBot 插件目录、MineSentinel 数据目录和现有配置。
-2. 从 GitHub Actions 下载 astrbot_plugin_minecraft_adapter 主分支最新 successful wheel/source，不要在目标机器本地编译 Rust。
-3. 安装 AstrBot 插件源码到插件目录；覆盖前把旧目录和配置备份到带时间戳的 backup 目录。
-4. 用 AstrBot 实际 Python 安装 mine_sentinel_rs wheel，并验证 import mine_sentinel_rs 成功。
+2. 安装 AstrBot 插件源码到插件目录；覆盖前把旧目录和配置备份到带时间戳的 backup 目录。
+3. `pip install -r requirements.txt` 安装 Python 依赖（drain3 等可选依赖会启用模板化/异常检测，缺失时自动降级）。
+4. **可选**：如需 Rust 加速，从 GitHub Actions "Build Rust wheels" 工作流下载对应平台 wheel 并 `pip install <wheel>.whl`；未安装时插件照常运行（纯 Python 降级）。不要在目标机器本地编译 Rust。
 5. 在 mine_sentinel.runtime_log.sources 写入服务器根目录或 latest.log 路径；Velocity 群组服写入 Velocity 和所有后端服。
 6. 开启 runtime_log、backfill_on_start、loop_filter_enabled、storage、report、send_as_image、send_full_log_file。
 7. 报告目标写入 mine_sentinel.report.delivery_targets，优先使用 /sid 完整 UMO。
 8. 重启后执行 /mc monitor status，确认日志源数量和 observation/export 目录。
 9. 触发或等待一条 MC 日志后执行 /mc report now <服务器ID> 30m，验证图片报告和 JSONL 附件能发送。
-10. 最后汇总安装文件、备份位置、日志源 server_id、wheel 文件名、验证结果和需要我手动确认的事项。
+10. 最后汇总安装文件、备份位置、日志源 server_id、是否启用 Rust 加速、验证结果和需要我手动确认的事项。
 ```
 
 ## 许可证

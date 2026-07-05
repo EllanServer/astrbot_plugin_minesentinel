@@ -74,6 +74,12 @@ class TemplateAnomalyDetector:
         分位数阈值（0~1），超过历史 P{percentile*100} 视为异常（默认 0.95）。
     min_window_size:
         滑动窗口最小样本数，低于此值不触发分位数检测（默认 10）。
+    max_templates_per_server:
+        每个服务器最多跟踪多少个模板，超过时淘汰最久未见的（默认 500）。
+    inactive_template_ttl_hours:
+        超过此小时数未出现的模板被视为不活跃，会被清理（默认 24）。
+    cleanup_interval:
+        每隔多少次 observe 触发一次清理（默认 200）。
     """
 
     def __init__(
@@ -84,6 +90,9 @@ class TemplateAnomalyDetector:
         min_baseline_count: int = 5,
         percentile: float = 0.95,
         min_window_size: int = 10,
+        max_templates_per_server: int = 500,
+        inactive_template_ttl_hours: int = 24,
+        cleanup_interval: int = 200,
     ):
         self._lock = threading.Lock()
         self._bucket_seconds = max(1, bucket_seconds)
@@ -92,10 +101,17 @@ class TemplateAnomalyDetector:
         self._min_baseline_count = max(1, min_baseline_count)
         self._percentile = max(0.5, min(0.999, percentile))
         self._min_window_size = max(3, min_window_size)
+        self._max_templates_per_server = max(1, max_templates_per_server)
+        self._inactive_ttl_ms = max(1, inactive_template_ttl_hours) * 3600 * 1000
+        self._cleanup_interval = max(1, cleanup_interval)
         # (server_id, template_id) -> TemplateStat
         self._stats: dict[tuple[str, str], TemplateStat] = {}
         # 当前桶的计数：(server_id, template_id) -> (bucket_index, count)
         self._current_bucket: dict[tuple[str, str], tuple[int, int]] = {}
+        # 清理统计
+        self._observe_count = 0
+        self._cleanup_count = 0
+        self._last_cleanup_ms = 0
 
     def observe(
         self,
@@ -120,9 +136,12 @@ class TemplateAnomalyDetector:
                     template=template,
                     level=level,
                     first_seen_ms=timestamp_ms,
+                    last_seen_ms=timestamp_ms,
                     last_update_ms=timestamp_ms,
                 )
                 self._stats[key] = stat
+                # 新模板创建时检查 per-server 上限
+                self._enforce_max_templates(server_id, timestamp_ms)
 
             # 桶切换：把上一个桶的计数写入滑动窗口并用它更新 EWMA，
             # 然后重置当前桶。注意：当前桶的 count 不更新 EWMA，
@@ -144,6 +163,11 @@ class TemplateAnomalyDetector:
             if template:
                 stat.template = template
             stat.level = level
+
+            # 周期性清理不活跃模板，防止长期运行状态膨胀
+            self._observe_count += 1
+            if self._observe_count % self._cleanup_interval == 0:
+                self._cleanup_inactive(timestamp_ms)
 
             return self._evaluate(stat, current_count, timestamp_ms)
 
@@ -220,6 +244,37 @@ class TemplateAnomalyDetector:
             idx = len(sorted_vals) - 1
         return float(sorted_vals[idx])
 
+    def _cleanup_inactive(self, now_ms: int):
+        """清理超过 TTL 未活跃的模板，防止长期运行状态膨胀。"""
+        cutoff = now_ms - self._inactive_ttl_ms
+        expired_keys = [
+            key for key, stat in self._stats.items()
+            if stat.last_seen_ms < cutoff
+        ]
+        for key in expired_keys:
+            self._stats.pop(key, None)
+            self._current_bucket.pop(key, None)
+        if expired_keys:
+            self._cleanup_count += len(expired_keys)
+            self._last_cleanup_ms = now_ms
+
+    def _enforce_max_templates(self, server_id: str, now_ms: int):
+        """当某 server 的模板数超过上限时，淘汰最久未见的。"""
+        server_stats = [
+            (key, stat) for key, stat in self._stats.items()
+            if stat.server_id == server_id
+        ]
+        if len(server_stats) <= self._max_templates_per_server:
+            return
+        # 按 last_seen_ms 升序，淘汰最旧的
+        server_stats.sort(key=lambda x: x[1].last_seen_ms)
+        evict_count = len(server_stats) - self._max_templates_per_server
+        for key, _ in server_stats[:evict_count]:
+            self._stats.pop(key, None)
+            self._current_bucket.pop(key, None)
+        self._cleanup_count += evict_count
+        self._last_cleanup_ms = now_ms
+
     def get_anomalies(self, min_score: float = 0.5) -> list[TemplateStat]:
         """返回当前所有异常模板（score >= min_score）。"""
         with self._lock:
@@ -232,8 +287,15 @@ class TemplateAnomalyDetector:
     def snapshot(self) -> dict[str, Any]:
         """返回所有模板统计快照，用于 LLM 证据和报告。"""
         with self._lock:
+            # 按 server_id 统计模板数
+            per_server: dict[str, int] = {}
+            for stat in self._stats.values():
+                per_server[stat.server_id] = per_server.get(stat.server_id, 0) + 1
             return {
                 "template_count": len(self._stats),
+                "per_server_count": per_server,
+                "cleanup_count": self._cleanup_count,
+                "last_cleanup_ms": self._last_cleanup_ms,
                 "anomalies": [
                     {
                         "server_id": s.server_id,

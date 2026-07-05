@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import json
+import re
 import sys
 import tempfile
 import time
@@ -31,9 +33,18 @@ api.logger = getattr(api, "logger", _Logger())
 sys.modules.update({"astrbot": astrbot, "astrbot.api": api})
 
 if "mine_sentinel_rs" not in sys.modules:
+    _STUB_WS_RE = re.compile(r"\s+")
+
     native_stub = types.ModuleType("mine_sentinel_rs")
 
     class _ObservationRecordCodec:
+        """纯 Python 模拟 mine_sentinel_rs.ObservationRecordCodec。
+
+        镜像 Rust 扩展的 4 个方法（normalize_record / record_to_json /
+        json_line / dedupe_key），使测试在不编译 Rust wheel 时也能跑通
+        "Rust 路径"的代码分支。
+        """
+
         def __init__(
             self,
             max_content_length,
@@ -42,14 +53,93 @@ if "mine_sentinel_rs" not in sys.modules:
             include_raw,
             dedupe_window_seconds,
         ):
+            self.max_content_length = int(max_content_length)
+            self.max_tags_per_record = int(max_tags_per_record)
+            self.max_raw_fields = int(max_raw_fields)
+            self.include_raw = bool(include_raw)
             self.dedupe_window_seconds = max(1, int(dedupe_window_seconds))
 
-        def dedupe_key(self, record):
-            bucket = int(record.timestamp or 0) // (self.dedupe_window_seconds * 1000)
-            return (
-                f"{record.kind}:{record.server_id}:{record.backend_server}:"
-                f"{bucket}:{record.content[:160]}"
+        @staticmethod
+        def _truncate(value, max_length):
+            if max_length <= 0:
+                return ""
+            if len(value) <= max_length:
+                return value
+            if max_length <= 3:
+                return value[:max_length]
+            return value[: max_length - 3] + "..."
+
+        def _compact_value(self, value):
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            if isinstance(value, str):
+                return self._truncate(value, self.max_content_length)
+            if isinstance(value, dict):
+                return self._compact_dict(value, self.max_raw_fields)
+            if isinstance(value, list):
+                return [self._compact_value(v) for v in value[: self.max_raw_fields]]
+            try:
+                text = json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                text = str(value)
+            return self._truncate(text, self.max_content_length)
+
+        def _compact_dict(self, data, max_fields):
+            compact = {}
+            for index, (key, value) in enumerate((data or {}).items()):
+                if index >= max_fields:
+                    break
+                compact[str(key)] = self._compact_value(value)
+            return compact
+
+        def normalize_record(self, record):
+            record.content = self._truncate(record.content, self.max_content_length)
+            record.tags = [
+                self._truncate(str(tag), self.max_content_length)
+                for tag in record.tags[: self.max_tags_per_record]
+            ]
+            record.context = self._compact_dict(record.context, self.max_raw_fields)
+            record.raw = (
+                self._compact_dict(record.raw, self.max_raw_fields)
+                if self.include_raw
+                else {}
             )
+
+        def record_to_json(self, record):
+            return {
+                "eventId": record.event_id,
+                "kind": record.kind,
+                "timestamp": record.timestamp,
+                "serverId": record.server_id,
+                "serverName": record.server_name,
+                "backendServer": record.backend_server,
+                "proxyId": record.proxy_id,
+                "player": {
+                    "name": record.player_name,
+                    "uuidHash": record.player_uuid_hash,
+                },
+                "content": record.content,
+                "tags": record.tags,
+                "context": record.context,
+                "raw": record.raw if self.include_raw else {},
+            }
+
+        def json_line(self, record):
+            return json.dumps(
+                self.record_to_json(record),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        def dedupe_key(self, record):
+            if record.event_id:
+                return record.event_id
+            identity = record.identity or ""
+            content_lower = _STUB_WS_RE.sub(" ", record.content.lower()).strip()
+            bucket = int(record.timestamp or 0) // (self.dedupe_window_seconds * 1000)
+            raw = f"{record.kind}|{record.server_id}|{identity}|{content_lower}|{bucket}"
+            digest = hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest()
+            return f"h:{digest}"
 
     def _observation_priority_score(record, matcher=None):
         if record.kind != "SERVER_LOG":
@@ -458,22 +548,75 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
             f"expected no-sources warning, got: {captured}",
         )
 
-    def test_read_appended_lines_reports_dropped_count_in_burst(self):
-        """burst 超过 max_lines 时应当返回 dropped_count 而不是静默丢弃。"""
+    def test_read_appended_lines_backlogs_instead_of_dropping(self):
+        """burst 超过 max_lines 时应把剩余行存入 backlog 而非丢弃。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "burst.log"
-            # 写入 10 行，max_lines=3 应丢弃前 7 行
+            # 写入 10 行，max_lines=3 → 本轮处理前 3 行，剩余 7 行存入 backlog
             path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
             lines, position, partial, dropped = _read_appended_lines(
                 path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
             )
             self.assertEqual(len(lines), 3)
-            self.assertEqual(dropped, 7)
-            self.assertEqual(partial, "")
+            self.assertEqual(dropped, 0)  # 不丢弃，推迟到下一轮
+            self.assertNotEqual(partial, "")  # backlog 非空
             self.assertGreater(position, 0)
-            # 应保留最后 3 行（最近的日志更相关）
-            self.assertEqual(lines[0], "line 7")
-            self.assertEqual(lines[2], "line 9")
+            # 本轮处理前 3 行（不再保留最后 3 行）
+            self.assertEqual(lines[0], "line 0")
+            self.assertEqual(lines[2], "line 2")
+            # backlog 中包含剩余 7 行
+            self.assertIn("line 3", partial)
+            self.assertIn("line 9", partial)
+
+    def test_read_appended_lines_backlog_processed_next_poll(self):
+        """backlog 应在下一轮被处理，而非永久丢失。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "burst.log"
+            path.write_text("\n".join(f"line {i}" for i in range(10)) + "\n")
+            # 第一轮：处理前 3 行，剩余 7 行存入 backlog
+            lines1, position, partial1, dropped1 = _read_appended_lines(
+                path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
+            )
+            self.assertEqual(len(lines1), 3)
+            self.assertEqual(dropped1, 0)
+            # 第二轮：position 已到文件末尾，但 backlog 仍有数据
+            lines2, position2, partial2, dropped2 = _read_appended_lines(
+                path, position, partial1, max_bytes=65536, max_lines=3, max_line_length=1000
+            )
+            # backlog 中的前 3 行被处理
+            self.assertEqual(len(lines2), 3)
+            self.assertEqual(dropped2, 0)
+            self.assertEqual(lines2[0], "line 3")
+            # 第三轮：处理剩余 4 行中的前 3 行
+            lines3, position3, partial3, dropped3 = _read_appended_lines(
+                path, position2, partial2, max_bytes=65536, max_lines=3, max_line_length=1000
+            )
+            self.assertEqual(len(lines3), 3)
+            self.assertEqual(lines3[0], "line 6")
+            # 第四轮：处理最后 1 行
+            lines4, position4, partial4, dropped4 = _read_appended_lines(
+                path, position3, partial3, max_bytes=65536, max_lines=3, max_line_length=1000
+            )
+            self.assertEqual(len(lines4), 1)
+            self.assertEqual(lines4[0], "line 9")
+            self.assertEqual(partial4, "")
+
+    def test_read_appended_lines_drops_when_backlog_exceeds_limit(self):
+        """backlog 超过 max_lines*4 时才丢弃最旧的行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "huge_burst.log"
+            # max_lines=3 → backlog 上限 12 行；写 20 行
+            path.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
+            lines, position, partial, dropped = _read_appended_lines(
+                path, 0, "", max_bytes=65536, max_lines=3, max_line_length=1000
+            )
+            self.assertEqual(len(lines), 3)
+            # 20 - 3(processed) - 12(backlog) = 5 dropped
+            self.assertEqual(dropped, 5)
+            # backlog 中保留最后 12 行 (line 8 ~ line 19)
+            self.assertIn("line 8", partial)
+            self.assertIn("line 19", partial)
+            self.assertNotIn("line 7", partial)
 
     def test_read_appended_lines_no_drop_when_under_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -595,6 +738,44 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
         self.assertEqual(_severity_number("SEVERE"), 21)
         # 未知级别默认 INFO
         self.assertEqual(_severity_number("UNKNOWN"), 9)
+
+    def test_otel_dict_survives_compact_as_dict(self):
+        """compact_value 应当递归 compact 嵌套 dict，而不是 stringify。
+
+        context["otel"] 必须在 normalize_record 后仍为 dict，
+        否则 OTel-compatible 系统无法按字段检索。
+        """
+        from services.mine_sentinel.storage.codec import ObservationRecordCodec
+
+        config = MineSentinelConfig.from_dict({})
+        codec = ObservationRecordCodec(config)
+        record = ObservationRecord(
+            event_id="", kind="SERVER_LOG", timestamp=1700000000000,
+            server_id="srv", server_name="Srv",
+            content="[14:02 ERROR]: Failed to tick plugin Example",
+            tags=["server_log", "error"],
+            context={
+                "level": "ERROR",
+                "otel": {
+                    "severityNumber": 17,
+                    "severityText": "ERROR",
+                    "eventName": "T1",
+                    "resource": {"service.name": "srv"},
+                    "attributes": {"template.id": "T1", "anomaly.score": 0.8},
+                },
+            },
+        )
+        codec.normalize_record(record)
+        # otel 必须仍然是 dict（而不是被 JSON dump 成字符串）
+        otel = record.context["otel"]
+        self.assertIsInstance(otel, dict)
+        self.assertEqual(otel["severityNumber"], 17)
+        self.assertEqual(otel["severityText"], "ERROR")
+        # 嵌套 dict 也应保持结构
+        self.assertIsInstance(otel["resource"], dict)
+        self.assertEqual(otel["resource"]["service.name"], "srv")
+        self.assertIsInstance(otel["attributes"], dict)
+        self.assertEqual(otel["attributes"]["template.id"], "T1")
 
     def test_ai_prompt_includes_anomaly_evidence(self):
         """AI prompt 应当包含预计算的异常证据，而非让 LLM 重新检测。"""
@@ -718,6 +899,88 @@ class MineSentinelRuntimeLogAuditTests(unittest.TestCase):
                              level="INFO", timestamp_ms=1000)
         self.assertGreater(r.score, 0.0)
         self.assertIn("new_template", r.reason)
+
+    def test_anomaly_detector_evicts_when_per_server_exceeds_max(self):
+        """per-server 模板数超过 max_templates_per_server 时应当淘汰最久未见的。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+
+        detector = TemplateAnomalyDetector(
+            max_templates_per_server=3,
+            cleanup_interval=1000,  # 不触发周期清理
+        )
+        # 创建 3 个模板，每个 last_seen_ms 递增
+        for i in range(3):
+            detector.observe("srv", f"T{i}", template=f"tpl{i}",
+                             level="INFO", timestamp_ms=1000 + i * 1000)
+        snap = detector.snapshot()
+        self.assertEqual(snap["per_server_count"].get("srv"), 3)
+        self.assertEqual(snap["cleanup_count"], 0)
+
+        # 创建第 4 个：超出上限，最久未见的 T0 应被淘汰
+        detector.observe("srv", "T3", template="tpl3",
+                         level="INFO", timestamp_ms=5000)
+        snap = detector.snapshot()
+        self.assertEqual(snap["per_server_count"].get("srv"), 3)
+        self.assertGreaterEqual(snap["cleanup_count"], 1)
+        self.assertGreater(snap["last_cleanup_ms"], 0)
+        # T0 应该已经被淘汰（最久未见）
+        survivor_ids = {a["template_id"] for a in snap["anomalies"]}
+        # anomalies 只列 score 最高的 20 个，但 T0 若被淘汰应不在 _stats 里
+        # 直接检查内部状态
+        with detector._lock:
+            keys = list(detector._stats.keys())
+        self.assertNotIn(("srv", "T0"), keys)
+        self.assertIn(("srv", "T3"), keys)
+
+    def test_anomaly_detector_cleans_inactive_templates_by_ttl(self):
+        """超过 inactive_template_ttl_hours 未活跃的模板应被周期性清理。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+
+        detector = TemplateAnomalyDetector(
+            inactive_template_ttl_hours=1,  # 1 小时 TTL
+            cleanup_interval=3,  # 每 3 次 observe 触发清理
+        )
+        # 早期模板：1 小时之前
+        old_ms = 1000
+        detector.observe("srv", "OLD_TPL", template="old",
+                         level="INFO", timestamp_ms=old_ms)
+        # 当前时间（超过 TTL）
+        now_ms = old_ms + 2 * 3600 * 1000  # 2 小时后
+        detector.observe("srv", "FRESH_TPL", template="fresh",
+                         level="INFO", timestamp_ms=now_ms)
+        detector.observe("srv", "FRESH_TPL", template="fresh",
+                         level="INFO", timestamp_ms=now_ms + 1000)
+        # 第 3 次 observe 触发清理，OLD_TPL last_seen_ms < cutoff 应被清除
+        detector.observe("srv", "FRESH_TPL", template="fresh",
+                         level="INFO", timestamp_ms=now_ms + 2000)
+        snap = detector.snapshot()
+        with detector._lock:
+            keys = list(detector._stats.keys())
+        self.assertNotIn(("srv", "OLD_TPL"), keys)
+        self.assertIn(("srv", "FRESH_TPL"), keys)
+        self.assertGreaterEqual(snap["cleanup_count"], 1)
+
+    def test_anomaly_detector_snapshot_reports_per_server_and_cleanup(self):
+        """snapshot 应当输出 per_server_count / cleanup_count / last_cleanup_ms。"""
+        from services.mine_sentinel.anomaly_detector import TemplateAnomalyDetector
+
+        detector = TemplateAnomalyDetector(
+            max_templates_per_server=2,
+            cleanup_interval=1000,
+        )
+        detector.observe("srv_a", "T1", template="a1", level="INFO", timestamp_ms=1000)
+        detector.observe("srv_b", "T1", template="b1", level="INFO", timestamp_ms=1000)
+        # 触发 srv_a 淘汰
+        detector.observe("srv_a", "T2", template="a2", level="INFO", timestamp_ms=2000)
+        detector.observe("srv_a", "T3", template="a3", level="INFO", timestamp_ms=3000)
+
+        snap = detector.snapshot()
+        self.assertIn("per_server_count", snap)
+        self.assertIn("cleanup_count", snap)
+        self.assertIn("last_cleanup_ms", snap)
+        self.assertGreaterEqual(snap["cleanup_count"], 1)
+        # 至少有一个 server 有计数
+        self.assertTrue(any(v > 0 for v in snap["per_server_count"].values()))
 
 
 class MineSentinelRulesTests(unittest.TestCase):

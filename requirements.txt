@@ -4,6 +4,8 @@ Pillow>=12.2.0
 # fingerprint-based dedup; when present, same-template logs are merged more
 # accurately and template stats feed the anomaly detector (PR3).
 drain3>=0.9.11
-# Required native Rust core (mine_sentinel_rs). Install the platform wheel
-# produced by the "Build Rust wheels" GitHub Actions workflow before loading
-# this branch; the pure-Python fallback has intentionally been removed.
+# Optional: native Rust core (mine_sentinel_rs). When absent the codec
+# automatically falls back to a pure-Python implementation with identical
+# behavior (just slower). To enable Rust acceleration, install the platform
+# wheel produced by the "Build Rust wheels" GitHub Actions workflow:
+#   pip install mine_sentinel_rs-<version>-<platform>.whl

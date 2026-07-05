@@ -458,8 +458,9 @@ class MineSentinelRuntimeLogTailer:
         server_name = state.source.server_name or state.source.server_id or "Minecraft"
         server_type = (state.source.server_type or "minecraft").lower()
         body = (
-            f"hourly tailer 在单次轮询中丢弃了 {dropped_count} 行日志（超过 max_lines_per_poll="
-            f"{self.config.max_lines_per_poll}），建议调大 max_bytes_per_poll / max_lines_per_poll。"
+            f"本窗口审计日志不完整：突发日志量超过 backlog 上限，"
+            f"{dropped_count} 行早期日志被丢弃（max_lines_per_poll="
+            f"{self.config.max_lines_per_poll}）。建议调大 max_bytes_per_poll / max_lines_per_poll。"
         )
         observation = {
             "eventId": f"local-drop:{state.source.server_id}:{timestamp_ms}",
@@ -554,11 +555,12 @@ def _read_appended_lines(
 ) -> tuple[list[str], int, str, int]:
     """Read appended bytes from ``path`` and split into lines.
 
-    Returns ``(lines, new_position, next_partial, dropped_count)``. When the
-    decoded chunk yields more than ``max_lines`` complete lines, the **earlier**
-    lines are dropped (the tail is kept because recent logs are usually more
-    relevant) and ``dropped_count`` reports how many were skipped so callers can
-    emit a ``loop_suppressed``-style observation instead of silently losing data.
+    Returns ``(lines, new_position, next_partial, dropped_count)``.
+
+    Burst handling: 当本轮完整行数超过 ``max_lines`` 时，**不再丢弃早期行**。
+    前面 ``max_lines`` 行本轮处理，剩余完整行存入 ``next_partial`` 作为
+    backlog，下一轮继续处理。只有当 backlog 累积超过 ``max_lines * 4`` 行时，
+    才丢弃最旧的行并报告 ``dropped_count``。
     """
     try:
         with path.open("rb") as handle:
@@ -567,22 +569,51 @@ def _read_appended_lines(
             new_position = handle.tell()
     except OSError:
         return [], position, partial, 0
-    if not data:
+
+    # 构建 text：backlog (partial) + 新数据
+    if data:
+        text = data.decode("utf-8", errors="replace")
+        if partial:
+            text = partial + text
+    elif partial:
+        # 无新数据但有 backlog —— 继续处理积压行
+        text = partial
+        new_position = position
+    else:
         return [], new_position, partial, 0
-    text = data.decode("utf-8", errors="replace")
-    if partial:
-        text = partial + text
+
     parts = text.splitlines(keepends=True)
     next_partial = ""
     if parts and not parts[-1].endswith(("\n", "\r")):
         next_partial = parts.pop()
-    if len(next_partial) > max_line_length * 2:
-        next_partial = next_partial[-max_line_length:]
+
     lines = [_truncate(part.rstrip("\r\n"), max_line_length) for part in parts if part.strip()]
+
     dropped_count = 0
     if len(lines) > max_lines:
-        dropped_count = len(lines) - max_lines
-        lines = lines[-max_lines:]
+        # Backlog: 本轮处理前 max_lines 行，剩余行推迟到下一轮
+        backlog_lines = lines[max_lines:]
+        lines = lines[:max_lines]
+
+        # 防止 backlog 无限增长：超过 max_lines*4 行时丢弃最旧的
+        max_backlog_lines = max(1, max_lines * 4)
+        if len(backlog_lines) > max_backlog_lines:
+            dropped_count = len(backlog_lines) - max_backlog_lines
+            backlog_lines = backlog_lines[-max_backlog_lines:]
+
+        # 构建 backlog 文本：完整行用 \n 连接并加尾部换行，
+        # 再追加不完整的末行（如果有）
+        backlog_text = "\n".join(backlog_lines)
+        if backlog_text:
+            backlog_text += "\n"
+        if next_partial:
+            backlog_text += next_partial
+        next_partial = backlog_text
+    elif next_partial:
+        # 无溢出：裁剪过长的单行 partial
+        if len(next_partial) > max_line_length * 2:
+            next_partial = next_partial[-max_line_length:]
+
     return lines, new_position, next_partial, dropped_count
 
 
@@ -788,7 +819,7 @@ def _build_observation(
     level = _detect_level(content)
     fingerprint = _fingerprint(content)
     # 模板解析：drain3 可用时返回 template_id，否则降级为 fingerprint
-    parsed = get_template_miner().parse(content)
+    parsed = get_template_miner().parse(content, server_id=source.server_id or "default")
     template_id = parsed.template_id
     template = parsed.template
     # 异常检测：基于模板计数突增（EWMA + 分位数）
