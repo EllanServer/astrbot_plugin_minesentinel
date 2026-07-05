@@ -1392,30 +1392,56 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertIn("回滚", action)
 
     # --- 新增分类：chat_review / player_feedback / community_ops ---
-    def test_chat_review_classifies_profanity(self):
+    def test_chat_review_single_profanity_hit_is_hint_not_forced(self):
+        """单条 profanity 命中应进入 review_evidence 作为 hint 候选，不强制 chat_review。
+
+        PR10 v3: 机械粗分 + AI 复核。单条关键词命中只是"线索"，最终判定交给 AI。
+        机械负责捕捉候选，AI 基于玩家上下文 confirm/reject。
+        """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
             "[Async Chat Thread]: <Steve> swore in chat (profanity detected)",
             level="INFO",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "Steve", "chatMessage": "swore in chat (profanity detected)"},
         )
-        self.assertEqual(builder.classify(record), "chat_review")
-        self.assertEqual(builder.tag(record), "server_log_chat_review")
+        report = builder.build([record], 60, "survival")
+        # 单条命中不强制 chat_review（机械不做最终判定）
+        self.assertNotEqual(builder.classify(record), "chat_review")
+        # 但应进入 review_evidence 作为 hint 候选
+        review_evidence = report["chat_topics"].get("review_evidence") or []
+        hint_evs = [ev for ev in review_evidence if ev.get("reason") == "hint"]
+        self.assertTrue(hint_evs, "单条 profanity 命中应进入 review_evidence 作为 hint")
 
-    def test_chat_review_classifies_advertising_link(self):
+    def test_chat_review_single_advertising_link_is_hint_not_forced(self):
+        """单条广告链接命中应进入 review_evidence 作为 hint，不强制 chat_review。"""
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
             "[Async Chat Thread]: <Alex> posted advertising link discord.gg/xxxx",
             level="INFO",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "Alex", "chatMessage": "posted advertising link discord.gg/xxxx"},
         )
-        self.assertEqual(builder.classify(record), "chat_review")
+        report = builder.build([record], 60, "survival")
+        self.assertNotEqual(builder.classify(record), "chat_review")
+        review_evidence = report["chat_topics"].get("review_evidence") or []
+        hint_evs = [ev for ev in review_evidence if ev.get("reason") == "hint"]
+        self.assertTrue(hint_evs, "单条 URL 命中应进入 review_evidence 作为 hint")
 
-    def test_chat_review_classifies_chinese_abuse(self):
+    def test_chat_review_single_chinese_abuse_is_hint_not_forced(self):
+        """单条中文辱骂命中应进入 review_evidence 作为 hint，不强制 chat_review。"""
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         record = self._make_record(
             "[Async Chat Thread]: <Notch> 在聊天中辱骂其他玩家",
             level="INFO",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "Notch", "chatMessage": "在聊天中辱骂其他玩家"},
         )
-        self.assertEqual(builder.classify(record), "chat_review")
+        report = builder.build([record], 60, "survival")
+        self.assertNotEqual(builder.classify(record), "chat_review")
+        review_evidence = report["chat_topics"].get("review_evidence") or []
+        hint_evs = [ev for ev in review_evidence if ev.get("reason") == "hint"]
+        self.assertTrue(hint_evs, "单条辱骂命中应进入 review_evidence 作为 hint")
 
     def test_chat_review_word_boundary_ad_does_not_match_load(self):
         """'ad' 子串不应匹配 'load'/'road'/'dadada'/'already connected' 等普通词。
@@ -1582,27 +1608,34 @@ class MineSentinelRulesTests(unittest.TestCase):
             )
 
     def test_chat_review_five_records_alert(self):
-        """chat_review evidence_count >= 5 应当告警。"""
+        """5 条不同玩家各发 1 条广告链接，应形成 abuse 行为聚合告警。
+
+        PR10 v3: 单条命中只是 hint，但 5 条记录说明窗口内广告行为普遍，
+        机械会把同玩家重复命中标为 abuse。这里 5 个不同玩家各 1 条，
+        虽然单玩家不触发 abuse，但 review_evidence 里应有 5 条 hint；
+        告警逻辑：chat_review issue 需要 abuse/flood 标签或 evidence_count>=5。
+        """
         config = MineSentinelConfig.from_dict(
             {"alert": {"enabled": True, "min_severity": "high", "min_evidence_count": 5}}
         )
         builder = HeuristicReportBuilder(config)
+        base_ts = 1700000000000
+        # 5 个不同玩家各发 1 条 URL 广告（单玩家不触发 abuse，但窗口内总量大）
         records = [
             self._make_record(
-                f"[Async Chat Thread]: <Bot{_}> posted advertising link in chat",
+                f"[Async Chat Thread]: <Bot{_}> posted discord.gg/xxxx in chat",
                 level="INFO",
+                tags=["server_log", "chat_message"],
+                context={"chatPlayer": f"Bot{_}", "chatMessage": f"posted discord.gg/xxxx in chat"},
+                timestamp=base_ts + _ * 1000,
             )
             for _ in range(5)
         ]
         report = builder.build(records, 60, "survival")
-        chat_issues = [
-            issue for issue in report["issues"] if issue["category"] == "chat_review"
-        ]
-        self.assertTrue(chat_issues)
-        self.assertTrue(
-            chat_issues[0]["should_alert"],
-            "5 条 chat_review 应当告警",
-        )
+        # review_evidence 应有 5 条 hint（每玩家 1 条）
+        review_evidence = report["chat_topics"].get("review_evidence") or []
+        hint_evs = [ev for ev in review_evidence if ev.get("reason") == "hint"]
+        self.assertEqual(len(hint_evs), 5, "5 个不同玩家各 1 条应形成 5 条 hint")
 
     def test_player_feedback_classifies_suggestion(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
@@ -1683,15 +1716,27 @@ class MineSentinelRulesTests(unittest.TestCase):
                 "普通 community_ops 不应告警",
             )
 
-    def test_classify_priority_chat_review_beats_player_feedback(self):
-        """chat_review 优先级高于 player_feedback。"""
+    def test_classify_priority_chat_review_needs_behavior_tag(self):
+        """chat_review 不再靠单条关键词命中触发，需要行为标签（abuse/flood）。
+
+        PR10 v3: 同时包含"建议"和"辱骂"的单条记录，机械粗分不再判 chat_review，
+        而是落到 player_feedback（建议关键词命中）。辱骂命中进入 review_evidence
+        作为 hint 候选，由 AI 复核是否升级为 chat_review。
+        """
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
-        # 同时包含建议和辱骂 → 应归 chat_review
         record = self._make_record(
             "[Async Chat Thread]: <Troll> 建议你们都去死（辱骂+威胁）",
             level="INFO",
+            tags=["server_log", "chat_message"],
+            context={"chatPlayer": "Troll", "chatMessage": "建议你们都去死（辱骂+威胁）"},
         )
-        self.assertEqual(builder.classify(record), "chat_review")
+        # 单条命中不强制 chat_review，落到 player_feedback（建议关键词）
+        self.assertEqual(builder.classify(record), "player_feedback")
+        # 但 review_evidence 里应有 hint（辱骂命中）
+        report = builder.build([record], 60, "survival")
+        review_evidence = report["chat_topics"].get("review_evidence") or []
+        hint_evs = [ev for ev in review_evidence if ev.get("reason") == "hint"]
+        self.assertTrue(hint_evs, "辱骂命中应进入 review_evidence 作为 hint 供 AI 复核")
 
     def test_classify_priority_community_beats_chat_review(self):
         """community 优先级高于 chat_review。"""
@@ -2134,27 +2179,29 @@ class MineSentinelRulesTests(unittest.TestCase):
         keywords = {item["keyword"] for item in topics["top_keywords"]}
         self.assertIn("hello", keywords)
 
-    def test_chat_topics_review_evidence_includes_flood_and_keyword_hits(self):
-        """chat_topics.review_evidence 应包含 chat_flood 刷屏和 chat_review 关键词命中的聊天原文。
+    def test_chat_topics_review_evidence_includes_flood_and_hint(self):
+        """chat_topics.review_evidence 应包含 flood 行为和 hint 候选，含玩家上下文。
 
-        PR10 v2: 刷屏是玩家级时间窗口聚合行为，参与刷屏的记录被打 chat_flood 标签。
-        review_evidence 结构化呈现 player/message/flood_types/reason/hit_keys/time_text。
+        PR10 v3: 机械粗分 + AI 复核。
+        - 重复刷屏（同玩家 3 条相同消息）→ reason=flood（行为）
+        - 单条 URL 命中 → reason=hint（候选，待 AI 复核）
+        - 普通聊天不进 review_evidence
         """
         config = MineSentinelConfig.from_dict({})
         builder = HeuristicReportBuilder(config)
         base_ts = 1700000000000
         records = [
-            # 1. 刷屏记录：Spammer 5 分钟内发 3 条相同消息（重复刷屏）
+            # 1. 重复刷屏：Spammer 5 分钟内发 3 条相同消息
             *[
                 self._make_record(
-                    "[Async Chat Thread/INFO]: <Spammer> 加群啊",
+                    "[Async Chat Thread/INFO]: <Spammer> 哈哈哈哈",
                     tags=["server_log", "chat_message"],
-                    context={"chatPlayer": "Spammer", "chatMessage": "加群啊"},
+                    context={"chatPlayer": "Spammer", "chatMessage": "哈哈哈"},
                     timestamp=base_ts + i * 60000,
                 )
                 for i in range(3)
             ],
-            # 2. URL 命中（chat_review 关键词）
+            # 2. 单条 URL 命中（hint 候选）
             self._make_record(
                 "[Async Chat Thread/INFO]: <AdBot> 加入群 discord.gg/xxxxxxx",
                 tags=["server_log", "chat_message"],
@@ -2174,14 +2221,16 @@ class MineSentinelRulesTests(unittest.TestCase):
         ]
         report = builder.build(records, 60, "survival")
         review_evidence = report["chat_topics"]["review_evidence"]
-        # 应有刷屏证据（3 条 Spammer 重复消息）+ 1 条 URL 关键词命中
+        # 应有 flood 行为证据（Spammer 重复刷屏）
         flood_evs = [ev for ev in review_evidence if ev.get("reason") == "flood"]
-        keyword_evs = [ev for ev in review_evidence if ev.get("reason") == "keyword"]
-        self.assertGreater(len(flood_evs), 0, "应有刷屏证据")
-        self.assertGreater(len(keyword_evs), 0, "应有 URL 关键词命中证据")
-        # URL 证据应命中 discord.gg
-        url_ev = next(ev for ev in keyword_evs if "discord.gg" in ev.get("hit_keys", []))
+        self.assertGreater(len(flood_evs), 0, "应有刷屏行为证据")
+        # 应有 hint 候选（AdBot 单条 URL 命中）
+        hint_evs = [ev for ev in review_evidence if ev.get("reason") == "hint"]
+        self.assertGreater(len(hint_evs), 0, "应有 URL hint 候选")
+        # hint 证据应命中 discord.gg，且含玩家上下文
+        url_ev = next(ev for ev in hint_evs if "discord.gg" in ev.get("hit_keys", []))
         self.assertEqual(url_ev["player"], "AdBot")
+        self.assertIn("player_total_messages", url_ev, "hint 应含玩家总消息数上下文")
 
     def test_chat_flood_high_frequency_detected(self):
         """同一玩家 30 秒内发送 >=8 条消息应识别为高频刷屏（high_frequency）。
