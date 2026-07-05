@@ -209,24 +209,51 @@ community > chat_review > player_feedback > community_ops
 ```text
 你是 Minecraft + AstrBot 部署助手。请帮我部署 MineSentinel 日志审计插件，不要跳过备份和验证。
 
+GitHub 仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
+- 源码：仓库 master 分支，`git clone` 或下载 zip 均可。
+- Rust 加速 wheel：仓库的 GitHub Actions → "Build Rust wheels" 工作流，从最近一次成功 run 的 Artifacts 下载对应平台 wheel。
+  直接链接：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/actions/workflows/rust-wheels.yml
+- 不要在目标机器本地编译 Rust；只从上述 Actions 下载预编译 wheel。
+
 开始前先向我索取：
 1. 部署模式：单服 / Velocity 群组服。
 2. Minecraft 服务器根目录；Velocity 群组服需要 Velocity 根目录和每个后端服根目录。
 3. AstrBot 根目录和实际运行 Python 路径。
 4. 接收报告的 AstrBot 会话 UMO，优先使用 /sid 输出；也可提供 group: 或 qq: 简写。
-5. 是否现在重启 AstrBot 和 Minecraft 服务端。
+5. 服务器日志量量级：小服（<50 玩家日常）/ 大服（≥50 玩家日常或 mod 服、连锁机器多）。
+6. 是否现在重启 AstrBot 和 Minecraft 服务端。
 
 执行要求：
 1. 检查目录存在，识别 AstrBot 插件目录、MineSentinel 数据目录和现有配置。
-2. 安装 AstrBot 插件源码到插件目录；覆盖前把旧目录和配置备份到带时间戳的 backup 目录。
+2. 从 GitHub 仓库安装 AstrBot 插件源码到插件目录；覆盖前把旧目录和配置备份到带时间戳的 backup 目录。
 3. `pip install -r requirements.txt` 安装 Python 依赖（drain3 等可选依赖会启用模板化/异常检测，缺失时自动降级）。
-4. **可选**：如需 Rust 加速，从 GitHub Actions "Build Rust wheels" 工作流下载对应平台 wheel 并 `pip install <wheel>.whl`；未安装时插件照常运行（纯 Python 降级）。不要在目标机器本地编译 Rust。
+4. **可选**：如需 Rust 加速，从 GitHub Actions "Build Rust wheels" 工作流（见上方链接）最近一次成功 run 的 Artifacts 下载对应平台 wheel 并 `pip install <wheel>.whl`；未安装时插件照常运行（纯 Python 降级）。不要在目标机器本地编译 Rust。
 5. 在 mine_sentinel.runtime_log.sources 写入服务器根目录或 latest.log 路径；Velocity 群组服写入 Velocity 和所有后端服。
 6. 开启 runtime_log、backfill_on_start、loop_filter_enabled、storage、report、send_as_image、send_full_log_file。
 7. 报告目标写入 mine_sentinel.report.delivery_targets，优先使用 /sid 完整 UMO。
-8. 重启后执行 /mc monitor status，确认日志源数量和 observation/export 目录。
-9. 触发或等待一条 MC 日志后执行 /mc report now <服务器ID> 30m，验证图片报告和 JSONL 附件能发送。
-10. 最后汇总安装文件、备份位置、日志源 server_id、是否启用 Rust 加速、验证结果和需要我手动确认的事项。
+8. 按日志量量级选择性能档位（见下方"性能档位参考"），写入 runtime_log.template_parse_mode、runtime_log.anomaly_track_info、runtime_log.io_workers、report.export_format、report.export_reuse_existing。
+9. 重启后执行 /mc monitor status，确认日志源数量、observation/export 目录、io_workers 是否生效。
+10. 触发或等待一条 MC 日志后执行 /mc report now <服务器ID> 30m，验证图片报告和 JSONL 附件能发送；同时检查附件文件名含 _t<秒级时间戳> 后缀（手动连续 report now 不会复用旧附件）。
+11. 最后汇总安装文件、备份位置、日志源 server_id、性能档位、是否启用 Rust 加速、验证结果和需要我手动确认的事项。
+
+性能档位参考（写入 mine_sentinel 配置）：
+- 小服默认档（开箱即用，功能完整）：
+  runtime_log.template_parse_mode: all        # 全量 Drain3 模板解析
+  runtime_log.anomaly_track_info: true        # 普通 INFO 也进入异常检测
+  runtime_log.io_workers: 0                   # 沿用 asyncio 默认线程池
+  report.export_format: jsonl                 # 明文 JSONL 附件
+  report.export_reuse_existing: true          # 周期报告重试时复用同路径
+- 大服性能优先档（≥50 玩家日常 / mod 服 / 高日志量）：
+  runtime_log.template_parse_mode: interesting  # 只解析 WARN+ 和命中关键词的 INFO（如 crash/timeout/rollback/out of memory/lag/异常报错等）
+  runtime_log.anomaly_track_info: false         # 普通 INFO 不进入异常检测（仅 fingerprint + 简化 observation）
+  runtime_log.io_workers: 2                     # 专用有界 ThreadPoolExecutor，避免和 AstrBot 其他任务抢默认池
+  report.export_format: jsonl.gz                # gzip 压缩附件，省磁盘和传输带宽
+  report.export_reuse_existing: true            # 周期报告重试时复用同路径（手动 report now 因秒级时间戳不会误复用）
+
+注意事项：
+- observation 按天分片（YYYYMMDD.jsonl），清理粒度为天，当天文件会保留到跨天后才删；retention_minutes 仅决定哪一天的文件可删。若需小时级保留请告知我，后续可改 hourly shard。
+- 若机器上已有旧版 .idx 偏移索引文件（无 #trust_legacy header），storage.trust_legacy_index 默认 true（按单调处理，保持向后兼容）；若怀疑旧 .idx 乱序导致漏日志，可设为 false 进入保守模式（全量扫描，性能下降但不漏）。
+- 不要在目标机器本地编译 Rust；只从 GitHub Actions 下载预编译 wheel。
 ```
 
 ## 许可证
