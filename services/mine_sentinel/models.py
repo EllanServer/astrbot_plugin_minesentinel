@@ -199,6 +199,13 @@ class MineSentinelRuntimeLogConfig:
     # PR9: 专用 bounded ThreadPoolExecutor，避免和 asyncio 默认线程池争用。
     # 0 表示沿用 asyncio.to_thread（默认池），>0 表示创建独立的有界池。
     io_workers: int = 0
+    # 检查项目（12 类分类）开关与白名单：
+    # - category_enabled: 单分类开关，key 为分类名，value=False 关闭该分类检查；
+    #   未列出或 value=True 视为开启。daily 始终兜底，关闭后会被强制重新开启。
+    # - category_whitelist: 非空时仅白名单内分类参与检查，其余全部关闭；
+    #   为空时按 category_enabled 决定。daily 不受白名单限制（始终兜底）。
+    category_enabled: dict[str, bool] = field(default_factory=dict)
+    category_whitelist: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -346,6 +353,13 @@ class MineSentinelConfig:
                     0,
                     _as_int(runtime_log_data.get("io_workers"), 0),
                 ),
+                category_enabled=_category_enabled_dict(
+                    runtime_log_data.get("category_enabled"),
+                    runtime_log_data.get("disabled_categories"),
+                ),
+                category_whitelist=_category_whitelist_list(
+                    runtime_log_data.get("category_whitelist")
+                ),
             ),
             report=MineSentinelReportConfig(
                 default_window_minutes=default_window_minutes,
@@ -491,6 +505,64 @@ def _list_values(value: Any) -> list[Any]:
     else:
         raw = [value]
     return [item for item in raw if item not in (None, "")]
+
+
+def _category_enabled_dict(
+    enabled_value: Any, disabled_value: Any
+) -> dict[str, bool]:
+    """解析 category_enabled 配置。
+
+    支持两种来源合并：
+    1. ``category_enabled``: dict[str, bool]，显式逐项开关。
+    2. ``disabled_categories``: list[str]，等价于把这些分类设为 False（向后兼容简写）。
+
+    返回的 dict 只记录 *被显式关闭* 的分类（value=False），
+    未列出的分类视为开启，由 rules 层 ``.get(cat, True)`` 判定。
+    daily 始终兜底，不出现在返回值里。
+    """
+    result: dict[str, bool] = {}
+    if isinstance(enabled_value, dict):
+        for raw_key, raw_val in enabled_value.items():
+            key = str(raw_key).strip().lower()
+            if not key:
+                continue
+            result[key] = _as_bool(raw_val, True)
+    if disabled_value not in (None, ""):
+        if isinstance(disabled_value, (list, tuple, set)):
+            for item in disabled_value:
+                key = str(item).strip().lower()
+                if key:
+                    result[key] = False
+        elif isinstance(disabled_value, str):
+            # 单个字符串也按一个分类处理
+            key = disabled_value.strip().lower()
+            if key:
+                result[key] = False
+    # daily 是兜底分类，禁止关闭
+    result.pop("daily", None)
+    # 只保留 False 项，True 项无意义（默认就是 True）
+    return {k: v for k, v in result.items() if v is False}
+
+
+def _category_whitelist_list(value: Any) -> list[str]:
+    """解析 category_whitelist 配置，返回小写分类名列表。"""
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = [value]
+    whitelist: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if item in (None, ""):
+            continue
+        key = str(item).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        whitelist.append(key)
+    return whitelist
 
 
 def _infer_log_source_id(path_text: str, index: int) -> str:

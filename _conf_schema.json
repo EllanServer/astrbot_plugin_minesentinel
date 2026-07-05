@@ -127,6 +127,21 @@
             "type": "int",
             "description": "专用 bounded ThreadPoolExecutor 线程数，用于 runtime log 读取/报告生成/hourly 扫描，避免与 asyncio 默认线程池争用。0=沿用 asyncio.to_thread（默认）；单服建议 1，Velocity+3~5 后端建议 2，大型多服建议 min(4, 数据盘数)",
             "default": 0
+          },
+          "category_enabled": {
+            "type": "object",
+            "description": "服务器日志检查项目（分类）开关。key 为分类名（community / chat_review / player_feedback / community_ops / complaint / network / plugin / cross_server / moderation / bug / economy / daily），value=false 关闭该分类检查。未列出或 true 视为开启。被关闭的分类不再参与匹配，记录会落到下一优先级分类或 daily。daily 是兜底分类，强制开启（写 false 也会被忽略）。例：{\"chat_review\": false, \"player_feedback\": false}。",
+            "default": {}
+          },
+          "category_whitelist": {
+            "type": "list",
+            "description": "服务器日志检查项目白名单。非空时仅白名单内分类参与检查，其余全部关闭（等价于一次性只开几个分类）。为空时按 category_enabled 决定。daily 不受白名单限制（始终兜底）。例：[\"bug\", \"plugin\", \"network\"] 表示只检查这三类。与 category_enabled 可同时使用：先按白名单筛选，再按 category_enabled 二次过滤。",
+            "default": []
+          },
+          "disabled_categories": {
+            "type": "list",
+            "description": "已弃用别名：等价于把这些分类在 category_enabled 中设为 false。例：[\"chat_review\", \"player_feedback\"]。建议改用 category_enabled。",
+            "default": []
           }
         }
       },

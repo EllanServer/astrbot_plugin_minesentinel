@@ -1675,6 +1675,138 @@ class MineSentinelRulesTests(unittest.TestCase):
         report = builder.build([record], window_minutes=60)
         self.assertEqual(report["max_severity"], "critical")
 
+    # --- 检查项目开关 / 过滤 ---
+    def test_category_enabled_disables_specific_category(self):
+        """category_enabled={"chat_review": false} 后 chat_review 不再匹配，
+        记录落到下一优先级 player_feedback。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"chat_review": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread]: <Troll> 建议辱骂玩家",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "player_feedback")
+
+    def test_category_enabled_value_true_keeps_enabled(self):
+        """显式写 true 等价于未写，分类仍开启。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"network": True}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/ERROR]: java.net.SocketException: Connection reset",
+            level="ERROR",
+        )
+        self.assertEqual(builder.classify(record), "network")
+
+    def test_category_enabled_daily_cannot_be_disabled(self):
+        """daily 是兜底分类，写 false 也会被忽略，仍可兜底匹配。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"daily": False}}}
+        )
+        # daily 被强制重新开启
+        self.assertNotIn("daily", config.runtime_log.category_enabled)
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/INFO]: Done!",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_disabled_categories_alias_works(self):
+        """disabled_categories 是 category_enabled 的别名，应等价关闭分类。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"disabled_categories": ["chat_review", "player_feedback"]}}
+        )
+        self.assertEqual(
+            config.runtime_log.category_enabled,
+            {"chat_review": False, "player_feedback": False},
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread]: <Troll> 建议辱骂玩家",
+            level="INFO",
+        )
+        # chat_review 和 player_feedback 都被关闭，没有更高优先级匹配，应兜底 daily
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_category_whitelist_only_keeps_listed(self):
+        """category_whitelist 非空时只保留白名单内分类，
+        其他分类（含更高优先级）都会被关闭，记录会落到白名单内分类或 daily。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_whitelist": ["bug"]}}
+        )
+        builder = HeuristicReportBuilder(config)
+        # community 优先级最高但被白名单排除，应落到 bug
+        record = self._make_record(
+            "[Server thread/WARN]: Anticheat flagged Steve for cheat, exception thrown",
+            level="WARN",
+        )
+        self.assertEqual(builder.classify(record), "bug")
+
+    def test_category_whitelist_with_enabled_secondary_filter(self):
+        """白名单和 category_enabled 同时使用：先白名单筛选，再二次过滤。"""
+        config = MineSentinelConfig.from_dict(
+            {
+                "runtime_log": {
+                    "category_whitelist": ["bug", "network"],
+                    "category_enabled": {"network": False},
+                }
+            }
+        )
+        builder = HeuristicReportBuilder(config)
+        # 含 network 关键词但 network 被二次关闭，应落到 bug
+        record = self._make_record(
+            "[Server thread/ERROR]: java.net.SocketException: Connection reset (exception)",
+            level="ERROR",
+        )
+        self.assertEqual(builder.classify(record), "bug")
+
+    def test_category_whitelist_does_not_disable_daily(self):
+        """daily 始终兜底，即使不在白名单内也能匹配无关键词日志。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_whitelist": ["bug"]}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Server thread/INFO]: Done!",
+            level="INFO",
+        )
+        self.assertEqual(builder.classify(record), "daily")
+
+    def test_category_filter_persists_in_build_issues(self):
+        """被关闭的分类不应出现在 build 输出的 issues 中。"""
+        config = MineSentinelConfig.from_dict(
+            {"runtime_log": {"category_enabled": {"chat_review": False}}}
+        )
+        builder = HeuristicReportBuilder(config)
+        record = self._make_record(
+            "[Async Chat Thread]: <Troll> 辱骂玩家",
+            level="INFO",
+        )
+        report = builder.build([record], 60, "survival")
+        categories_in_issues = {issue["category"] for issue in report["issues"]}
+        self.assertNotIn("chat_review", categories_in_issues)
+
+    def test_active_priority_reflects_filter(self):
+        """_active_priority 应正确移除被关闭的分类，并保留 daily 兜底。"""
+        config = MineSentinelConfig.from_dict(
+            {
+                "runtime_log": {
+                    "category_whitelist": ["bug", "plugin"],
+                    "category_enabled": {"plugin": False},
+                }
+            }
+        )
+        builder = HeuristicReportBuilder(config)
+        self.assertIn("bug", builder._active_priority)
+        self.assertNotIn("plugin", builder._active_priority)
+        self.assertNotIn("chat_review", builder._active_priority)
+        # daily 始终在末尾
+        self.assertEqual(builder._active_priority[-1], "daily")
+
 
 class MineSentinelHourlySummaryTests(unittest.IsolatedAsyncioTestCase):
     """Tests for the hourly summary mode (no polling, per-hour log read + AI integrate)."""

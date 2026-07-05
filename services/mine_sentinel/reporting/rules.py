@@ -391,6 +391,28 @@ class HeuristicReportBuilder:
 
     def __init__(self, config: MineSentinelConfig):
         self.config = config
+        # 预计算当前生效的分类优先级列表（应用 category_enabled / category_whitelist）。
+        # daily 始终兜底，永远保留在末尾。
+        self._active_priority: tuple[str, ...] = self._compute_active_priority()
+
+    def _compute_active_priority(self) -> tuple[str, ...]:
+        """根据 runtime_log.category_enabled / category_whitelist 计算生效分类。"""
+        runtime = self.config.runtime_log
+        whitelist = set(runtime.category_whitelist or ())
+        disabled = set(
+            cat for cat, enabled in (runtime.category_enabled or {}).items()
+            if enabled is False
+        )
+        active = [
+            cat
+            for cat in CLASSIFY_PRIORITY
+            if cat != "daily"
+            and cat not in disabled
+            and (not whitelist or cat in whitelist)
+        ]
+        # daily 永远兜底
+        active.append("daily")
+        return tuple(active)
 
     def build(
         self,
@@ -504,8 +526,9 @@ class HeuristicReportBuilder:
     # --- 分类 -------------------------------------------------------------
     def classify(self, record: ObservationRecord) -> str:
         text = self._record_text(record)
-        # 按 CLASSIFY_PRIORITY 顺序匹配，daily 兜底
-        for category in CLASSIFY_PRIORITY:
+        # 按当前生效的优先级列表匹配（已应用 category_enabled / category_whitelist），
+        # daily 兜底。被关闭的分类直接跳过，记录会落到下一优先级或 daily。
+        for category in self._active_priority:
             if category == "daily":
                 continue
             keys = CATEGORY_KEYS.get(category, ())
