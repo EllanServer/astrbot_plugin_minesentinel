@@ -309,6 +309,13 @@ def _low_value_for_ai(
         category = str(ops.get("category") or "")
         severity = str(ops.get("severity") or "").lower()
         needs_admin = bool(ops.get("needs_admin"))
+        ops_observation = bool(ops.get("opsObservation"))
+        if (
+            ops_observation
+            and not needs_admin
+            and severity in {"", "info", "low"}
+        ):
+            return True
         if (
             category in LOW_VALUE_AI_OPS_CATEGORIES
             and not needs_admin
@@ -400,6 +407,13 @@ def _python_feature(record: ObservationRecord) -> _SampleFeature:
         category = str(ops.get("category") or "")
         severity = str(ops.get("severity") or "").lower()
         needs_admin = bool(ops.get("needs_admin"))
+        ops_observation = bool(ops.get("opsObservation"))
+        if (
+            ops_observation
+            and not needs_admin
+            and severity in {"", "info", "low"}
+        ):
+            low_value = True
         if (
             category in LOW_VALUE_AI_OPS_CATEGORIES
             and not needs_admin
@@ -441,6 +455,8 @@ def _context_terms_for_sampling(ctx: dict[str, Any]) -> list[str]:
                 terms.append(value)
         if ops.get("needs_admin"):
             terms.append("needs_admin")
+        if ops.get("opsObservation"):
+            terms.append("ops_observation")
     return terms
 
 

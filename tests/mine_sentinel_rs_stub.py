@@ -175,6 +175,8 @@ def ai_sampling_features_batch_stub(records):
                     context_terms.append(value)
             if ops.get("needs_admin"):
                 context_terms.append("needs_admin")
+            if ops.get("opsObservation"):
+                context_terms.append("ops_observation")
         text = _norm(f"{record.content} {' '.join(tags)} {' '.join(context_terms)}")
         source = record.backend_server or record.server_id
         player = f"{record.player_name}: " if record.player_name else ""
@@ -185,6 +187,13 @@ def ai_sampling_features_batch_stub(records):
             category = str(ops.get("category") or "")
             severity = str(ops.get("severity") or "").lower()
             needs_admin = bool(ops.get("needs_admin"))
+            ops_observation = bool(ops.get("opsObservation"))
+            if (
+                ops_observation
+                and not needs_admin
+                and severity in {"", "info", "low"}
+            ):
+                low_value = True
             if (
                 category in {"启动与关闭", "指标观察"}
                 and not needs_admin

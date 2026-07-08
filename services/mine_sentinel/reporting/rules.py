@@ -581,7 +581,6 @@ def _is_benign_mechanical_record(raw_content: str, text: str, level: str) -> boo
         "docs.papermc.io/velocity/security",
         "update available",
         "a new version of ",
-        "no translation for key:",
     )
     if is_warn and "legacy plugin " in text and " does not specify an api-version" in text:
         return True
@@ -893,6 +892,20 @@ OPS_LOG_RULES: tuple[dict[str, Any], ...] = (
         "severity": "medium",
         "impact": "可能导致插件以默认配置运行、功能关闭或部分指令异常。",
         "report_categories": ("plugin", "bug"),
+    },
+    {
+        "category": "插件与模组",
+        "subtype": "本地化/资源键缺失",
+        "markers": (
+            "no translation for key:",
+            "missing translation",
+            "translation key",
+        ),
+        "severity": "low",
+        "impact": "插件本地化或资源文件缺失，通常不影响核心玩法，但会导致提示文本缺失。",
+        "needs_admin": False,
+        "report_categories": ("plugin",),
+        "ops_observation": True,
     },
     {
         "category": "传送与位置",
@@ -1213,6 +1226,14 @@ OPS_HINT_CLASSIFICATIONS: dict[str, dict[str, Any]] = {
         "impact": "可能导致插件以默认配置运行、功能关闭或部分指令异常。",
         "report_categories": ("plugin", "bug"),
     },
+    "plugin_translation": {
+        "category": "插件与模组",
+        "subtype": "本地化/资源键缺失",
+        "severity": "low",
+        "impact": "插件本地化或资源文件缺失，通常不影响核心玩法，但会导致提示文本缺失。",
+        "report_categories": ("plugin",),
+        "ops_observation": True,
+    },
     "plugin_runtime": {
         "category": "插件与模组",
         "subtype": "插件运行异常",
@@ -1408,6 +1429,7 @@ class HeuristicReportBuilder:
                     impact=str(rule.get("impact") or OPS_DEFAULT_IMPACT),
                     needs_admin=needs_admin,
                     report_categories=tuple(rule.get("report_categories") or ()),
+                    ops_observation=bool(rule.get("ops_observation")),
                 )
 
         if level in {"fatal", "severe"}:
@@ -1479,6 +1501,7 @@ class HeuristicReportBuilder:
             impact=str(spec.get("impact") or OPS_DEFAULT_IMPACT),
             needs_admin=needs_admin,
             report_categories=tuple(spec.get("report_categories") or ()),
+            ops_observation=bool(spec.get("ops_observation")),
         )
 
     def _ops_rule_matches(
@@ -1510,8 +1533,9 @@ class HeuristicReportBuilder:
         needs_admin: bool,
         report_categories: tuple[str, ...],
         ops_first: bool = True,
+        ops_observation: bool = False,
     ) -> dict[str, Any]:
-        return {
+        data = {
             "level": (level or "info").upper(),
             "category": category,
             "subtype": subtype,
@@ -1521,6 +1545,9 @@ class HeuristicReportBuilder:
             "report_categories": list(report_categories),
             "opsFirst": ops_first,
         }
+        if ops_observation:
+            data["opsObservation"] = True
+        return data
 
     @staticmethod
     def _ops_default_severity(level: str) -> str:
@@ -1600,7 +1627,12 @@ class HeuristicReportBuilder:
             return False
         severity = str(ops_info.get("severity") or "info").lower()
         needs_admin = bool(ops_info.get("needs_admin"))
-        if not needs_admin and OPS_SEVERITY_RANK.get(severity, 0) < OPS_SEVERITY_RANK["medium"]:
+        ops_observation = bool(ops_info.get("opsObservation"))
+        if (
+            not needs_admin
+            and not ops_observation
+            and OPS_SEVERITY_RANK.get(severity, 0) < OPS_SEVERITY_RANK["medium"]
+        ):
             return False
         report_categories = tuple(
             str(item)
@@ -1628,7 +1660,12 @@ class HeuristicReportBuilder:
         if ops_info and str(ops_info.get("category") or "") != "指标观察":
             severity = str(ops_info.get("severity") or "info").lower()
             needs_admin = bool(ops_info.get("needs_admin"))
-            if needs_admin or OPS_SEVERITY_RANK.get(severity, 0) >= OPS_SEVERITY_RANK["medium"]:
+            ops_observation = bool(ops_info.get("opsObservation"))
+            if (
+                needs_admin
+                or ops_observation
+                or OPS_SEVERITY_RANK.get(severity, 0) >= OPS_SEVERITY_RANK["medium"]
+            ):
                 categories = tuple(
                     str(item)
                     for item in (ops_info.get("report_categories") or ())
@@ -2348,6 +2385,9 @@ class HeuristicReportBuilder:
             "economy": "server_log_economy",
         }
         if category in tag_map:
+            ops_info = (record.context or {}).get("opsClassification")
+            if isinstance(ops_info, dict) and bool(ops_info.get("opsObservation")):
+                return f"{tag_map[category]}_observation"
             return tag_map[category]
         return f"server_log_{level or 'info'}"
 
@@ -2369,6 +2409,8 @@ class HeuristicReportBuilder:
         # PR10: 全员 daily_noise 的 group 强制 low，避免被 EWMA 突增/网络关键词
         # 提级，保证正常 login/disconnect/UUID 等绝不形成事件。
         if group and all("daily_noise" in record.tags for record in group):
+            return "low"
+        if group and all(self._low_value_ops_observation(record) for record in group):
             return "low"
         text = " ".join(self._record_text(record) for record in group)
         n = len(group)
@@ -2397,6 +2439,16 @@ class HeuristicReportBuilder:
             # 异常突增至少 high（除非其他规则已判 critical）
             return "critical" if base_severity == "critical" else "high"
         return base_severity
+
+    @staticmethod
+    def _low_value_ops_observation(record: ObservationRecord) -> bool:
+        ops = (record.context or {}).get("opsClassification")
+        if not isinstance(ops, dict) or not bool(ops.get("opsObservation")):
+            return False
+        if bool(ops.get("needs_admin")):
+            return False
+        severity = str(ops.get("severity") or "info").lower()
+        return OPS_SEVERITY_RANK.get(severity, 0) < OPS_SEVERITY_RANK["medium"]
 
     @staticmethod
     def _low_value_info_group(group: list[ObservationRecord]) -> bool:

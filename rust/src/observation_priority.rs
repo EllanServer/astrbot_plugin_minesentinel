@@ -170,6 +170,9 @@ fn sampling_context_terms(context: &Bound<PyDict>) -> PyResult<Vec<String>> {
             if dict_bool(&ops, "needs_admin")?.unwrap_or(false) {
                 terms.push("needs_admin".to_string());
             }
+            if dict_bool(&ops, "opsObservation")?.unwrap_or(false) {
+                terms.push("ops_observation".to_string());
+            }
         }
     }
     Ok(terms)
@@ -184,7 +187,12 @@ fn low_value_ops_classification(context: &Bound<PyDict>) -> PyResult<bool> {
     };
     let category = dict_string(&ops, "category")?;
     if category != "启动与关闭" && category != "指标观察" {
-        return Ok(false);
+        let severity = dict_string(&ops, "severity")?.to_lowercase();
+        let needs_admin = dict_bool(&ops, "needs_admin")?.unwrap_or(false);
+        let ops_observation = dict_bool(&ops, "opsObservation")?.unwrap_or(false);
+        return Ok(ops_observation
+            && !needs_admin
+            && matches!(severity.as_str(), "" | "info" | "low"));
     }
     if dict_bool(&ops, "needs_admin")?.unwrap_or(false) {
         return Ok(false);

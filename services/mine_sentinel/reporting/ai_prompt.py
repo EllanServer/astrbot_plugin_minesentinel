@@ -683,6 +683,7 @@ def _compact_classification(value: Any) -> dict[str, Any]:
         "subtype",
         "severity",
         "needs_admin",
+        "opsObservation",
         "labels",
     )
     compact: dict[str, Any] = {}

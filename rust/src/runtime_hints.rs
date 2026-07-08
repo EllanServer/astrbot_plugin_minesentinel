@@ -342,6 +342,13 @@ fn detect_ops_hint(content: &str, level: &str) -> Option<OpsHint> {
             markers,
         });
     }
+    if let Some(markers) = matched_markers(&text, PLUGIN_TRANSLATION_MARKERS) {
+        return Some(OpsHint {
+            code: "plugin_translation",
+            severity: "low",
+            markers,
+        });
+    }
     if let Some(markers) = matched_markers(&text, PLUGIN_RUNTIME_MARKERS) {
         return Some(OpsHint {
             code: "plugin_runtime",
@@ -697,6 +704,12 @@ const PLUGIN_CONFIG_MARKERS: &[&str] = &[
     "toml",
 ];
 
+const PLUGIN_TRANSLATION_MARKERS: &[&str] = &[
+    "no translation for key:",
+    "missing translation",
+    "translation key",
+];
+
 const PLUGIN_RUNTIME_MARKERS: &[&str] = &[
     "could not pass event",
     "eventexception",
@@ -764,6 +777,18 @@ mod tests {
         ] {
             assert!(detect_ops_hint(line, "WARN").is_none(), "{line}");
         }
+    }
+
+    #[test]
+    fn detects_plugin_translation_hint_as_low_risk() {
+        let hint = detect_ops_hint(
+            "[Server thread/WARN]: [MarriageMaster] No translation for key: Ingame.Info.Headline",
+            "WARN",
+        )
+        .expect("ops hint");
+        assert_eq!(hint.code, "plugin_translation");
+        assert_eq!(hint.severity, "low");
+        assert!(hint.markers.contains(&"no translation for key:"));
     }
 
     #[test]

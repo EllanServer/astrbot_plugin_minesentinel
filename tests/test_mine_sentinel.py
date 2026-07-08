@@ -3014,6 +3014,36 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertEqual(ops_info.get("subtype"), "经济/商店异常")
         self.assertEqual(ops_info.get("report_categories"), ["economy"])
 
+    def test_plugin_translation_warning_is_low_risk_observation(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        record = self._make_record(
+            "[Server thread/WARN]: [MarriageMaster] "
+            "No translation for key: Ingame.Info.Headline",
+            level="WARN",
+            context={
+                "opsHintCode": "plugin_translation",
+                "opsHintSeverity": "low",
+                "opsHintMarkers": ["no translation for key:"],
+            },
+        )
+
+        self.assertEqual(builder.classify(record), "plugin")
+        self.assertEqual(builder.tag(record), "server_log_plugin_observation")
+        ops_info = record.context.get("opsClassification") or {}
+        self.assertEqual(ops_info.get("category"), "插件与模组")
+        self.assertEqual(ops_info.get("subtype"), "本地化/资源键缺失")
+        self.assertEqual(ops_info.get("severity"), "low")
+        self.assertFalse(ops_info.get("needs_admin"))
+        self.assertTrue(ops_info.get("opsObservation"))
+
+        report = HeuristicReportBuilder(MineSentinelConfig.from_dict({})).build(
+            [record],
+            60,
+            "survival",
+        )
+        self.assertEqual(report["issues"], [])
+        self.assertIn("server_log_plugin_observation", report["categories"]["plugin"][0])
+
     def test_player_feedback_permission_chat_keeps_players(self):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         base_ts = 1700000000000
@@ -4003,6 +4033,19 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(hints.get("opsHintSeverity"), "high")
         self.assertIn("quickshop", hints.get("opsHintMarkers", []))
 
+    def test_runtime_log_hints_add_low_risk_plugin_translation_hint(self):
+        from services.mine_sentinel import runtime_log as runtime_module
+
+        hints = runtime_module._python_runtime_log_hints(
+            "[20:54:06] [Server thread/WARN]: [MarriageMaster] "
+            "No translation for key: Ingame.Info.Headline",
+            2000,
+        )
+
+        self.assertEqual(hints.get("opsHintCode"), "plugin_translation")
+        self.assertEqual(hints.get("opsHintSeverity"), "low")
+        self.assertIn("no translation for key:", hints.get("opsHintMarkers", []))
+
     def test_runtime_log_hints_skip_hikari_lifecycle_noise(self):
         from services.mine_sentinel import runtime_log as runtime_module
 
@@ -4031,6 +4074,19 @@ class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
         self.assertEqual(ctx.get("opsHintSeverity"), "high")
         self.assertIn("quickshop", ctx.get("opsHintMarkers", []))
         self.assertEqual(ctx["otel"]["attributes"]["ops.hint_code"], "economy_shop")
+
+    def test_build_observation_adds_plugin_translation_hint_context(self):
+        from services.mine_sentinel.models import MineSentinelRuntimeLogConfig
+
+        obs = self._build(
+            "[20:54:06] [Server thread/WARN]: [MarriageMaster] "
+            "No translation for key: Ingame.Info.Headline",
+            MineSentinelRuntimeLogConfig(),
+        )
+        ctx = obs["context"]
+        self.assertEqual(ctx.get("opsHintCode"), "plugin_translation")
+        self.assertEqual(ctx.get("opsHintSeverity"), "low")
+        self.assertIn("no translation for key:", ctx.get("opsHintMarkers", []))
 
     def test_luckperms_worker_tagged_as_daily_noise(self):
         """用户案例中的 luckperms-worker 日志应被打 daily_noise 标签。"""
@@ -6946,6 +7002,31 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
             any("ConnectTimeoutException" in sample for sample in economy_samples),
             "expected QuickShop timeout stack evidence to be prioritized",
         )
+
+    def test_real_plugin_translation_warnings_are_observations_not_issues(self):
+        translation_records = [
+            record
+            for record in self.records
+            if "No translation for key:" in record.content
+        ]
+        self.assertGreaterEqual(len(translation_records), 5)
+
+        builder = HeuristicReportBuilder(self.config)
+        for record in translation_records[:5]:
+            self.assertEqual(builder.classify(record), "plugin")
+            self.assertEqual(builder.tag(record), "server_log_plugin_observation")
+            ops_info = record.context.get("opsClassification") or {}
+            self.assertEqual(ops_info.get("subtype"), "本地化/资源键缺失")
+            self.assertTrue(ops_info.get("opsObservation"))
+
+        self.assertTrue(
+            any(
+                "server_log_plugin_observation" in line
+                for line in self.report["categories"].get("plugin", [])
+            )
+        )
+        issue_text = json.dumps(self.report["issues"], ensure_ascii=False)
+        self.assertNotIn("No translation for key:", issue_text)
 
     def test_real_report_has_five_sections_and_bounded_prompt(self):
         from services.mine_sentinel.reporting.ai_prompt import AIReportPromptBuilder

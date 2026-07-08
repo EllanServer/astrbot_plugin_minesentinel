@@ -1651,6 +1651,15 @@ _OPS_HINT_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "plugin_translation",
+        "low",
+        (
+            "no translation for key:",
+            "missing translation",
+            "translation key",
+        ),
+    ),
+    (
         "plugin_runtime",
         "high",
         (

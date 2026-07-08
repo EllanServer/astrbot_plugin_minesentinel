@@ -43,7 +43,7 @@ raw log line
 
 内置分类包括 `daily`、`complaint`、`bug`、`network`、`plugin`、`economy`、`community`、`chat_review`、`player_feedback`、`community_ops`、`moderation`、`cross_server`、`suggestion`。
 
-分类优先使用结构化 runtime hints 和 ops hints，再回退到关键词、上下文、日志等级、线程、插件名和事故聚合。真实样本 `tests/fixtures/mclogs_pbfhCaI.log` 来自 [mclo.gs/pbfhCaI](https://mclo.gs/pbfhCaI)，用于验证 QuickShop/经济异常、数据库异常、插件异常、网络异常会进入正确分类，同时 Hikari 生命周期日志、AstrbotAdapter/CMI 正常代理握手不会误报为管理事件。
+分类优先使用结构化 runtime hints 和 ops hints，再回退到关键词、上下文、日志等级、线程、插件名和事故聚合。真实样本 `tests/fixtures/mclogs_pbfhCaI.log` 来自 [mclo.gs/pbfhCaI](https://mclo.gs/pbfhCaI)，用于验证 QuickShop/经济异常、数据库异常、插件异常、网络异常会进入正确分类，同时 Hikari 生命周期日志、AstrbotAdapter/CMI 正常代理握手不会误报为管理事件；插件本地化资源键缺失等低风险 WARN 会进入观察分类，不升级为管理事件。
 
 可用配置控制分类入口：
 
