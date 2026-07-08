@@ -95,18 +95,83 @@ pip install -r astrbot_plugin_minecraft_adapter/requirements.txt
 
 在 AstrBot 插件管理中启用后，插件会注册 `/ms` 命令组，并在数据目录下使用 `plugin_data/mine_sentinel`。首次启动若发现旧路径 `plugin_data/astrbot_plugin_minecraft_adapter/mine_sentinel`，会自动迁移 MineSentinel 历史数据。
 
-## 可复制 Prompt
+## 部署/升级提示词
 
-全新安装时可以把下面这段发给 Codex、服务器运维助手或自动化执行器：
+把下面的提示词交给有本机文件读写权限的 AI 助手即可。第一段用于全新部署，第二段用于已安装旧版插件时升级。
+
+### 全新部署
 
 ```text
-请把 MineSentinel 安装到当前 AstrBot 实例中。仓库地址是 https://github.com/EllanServer/astrbot_plugin_minecraft_adapter.git，插件目录名必须保持为 astrbot_plugin_minecraft_adapter。请先确认 AstrBot 插件目录位置，再 clone 或复制仓库，执行 pip install -r requirements.txt，保留 Python 纯实现可运行；如果当前平台已有 mine_sentinel_rs wheel，再额外安装 wheel 启用 Rust 加速。然后按 README 的最小配置写入我的 Minecraft/Velocity 日志源、投递目标和报告周期，重启 AstrBot，最后用 /ms monitor status 和 /ms report now 验证插件已经读取日志并能生成五段式监控管理报告。执行前不要删除 plugin_data 中已有数据。
+你是 Minecraft + AstrBot 部署助手。请帮我部署 MineSentinel 监控管理报告 AI 插件，不要跳过备份、配置确认和验证。
+
+GitHub 仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
+- 源码：仓库 main 分支，插件目录名必须保持为 astrbot_plugin_minecraft_adapter。
+- Rust 加速 wheel：GitHub Actions -> "Build Rust wheels" 工作流，下载最近一次成功 run 的对应平台 Artifacts。
+  直接链接：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/actions/workflows/rust-wheels.yml
+- 不要在目标机器本地编译 Rust；没有可用 wheel 时保持纯 Python 降级运行。
+
+开始前先向我索取：
+1. 部署模式：单服 / Velocity 群组服 / 多个独立服务器。
+2. Minecraft 服务器根目录；Velocity 群组服需要 Velocity 根目录和每个后端服根目录，也可以直接提供 logs/latest.log 路径。
+3. AstrBot 根目录、插件目录和实际运行 Python 路径。
+4. 接收报告的 QQ 群号 / QQ 号 / AstrBot 会话 UMO：
+   - 完整 UMO 最稳，推荐在 AstrBot 里对目标会话执行 /sid 获取，例如 napcat:GroupMessage:123456。
+   - QQ 群号可写成 group:123456789，QQ 号可写成 qq:10001。
+   - 多个目标写成列表；若不同 server_id 要发到不同群/QQ，请逐一说明。
+5. 日志量量级：小服默认档 / 大服性能优先档。
+6. 是否允许现在重启 AstrBot。
+
+执行要求：
+1. 检查目录存在，识别 AstrBot 插件目录、MineSentinel 数据目录和现有配置。
+2. 安装前把旧插件目录、配置文件和 plugin_data/mine_sentinel 备份到带时间戳的 backup 目录；如果没有旧数据也要说明。
+3. 从 GitHub main 分支 clone 或覆盖安装源码到 AstrBot 插件目录。
+4. 使用 AstrBot 实际运行的 Python 执行 pip install -r requirements.txt。
+5. 可选启用 Rust 加速：只从上方 GitHub Actions 下载预编译 wheel 并 pip install <wheel>.whl；安装失败不要阻塞插件运行，记录为纯 Python 降级。
+6. 在 mine_sentinel.runtime_log.sources 写入服务器 root、logs_dir 或 log_file；Velocity 群组服要把 Velocity 和所有后端服分别写成 source。
+7. 开启 runtime_log、backfill_on_start、loop_filter_enabled、storage、report、send_as_image、send_full_log_file，并保留五段式报告输出。
+8. 自动检测 AstrBot 已配置 bot 平台；读取 <AstrBot 根目录>/data/cmd_config.json 时用 utf-8-sig，识别 enable=true 的 aiocqhttp / qq_official / qq_official_webhook。若用户提供的是 group: 或 qq: 简写，优先解析到可用 QQ 平台；若平台不唯一，列出候选让我选择。
+9. 全局投递目标写入 mine_sentinel.report.delivery_targets；单服单独投递写入 source.delivery_targets 或 source.target_sessions。send_to_target_sessions 默认保持 true。
+10. 按日志量选择性能档位：
+    - 小服默认档：runtime_log.template_parse_mode=all，runtime_log.anomaly_track_info=true，runtime_log.io_workers=0，report.export_format=jsonl，report.export_reuse_existing=true。
+    - 大服性能优先档：runtime_log.template_parse_mode=interesting，runtime_log.anomaly_track_info=false，runtime_log.io_workers=2，report.export_format=jsonl.gz，report.export_reuse_existing=true。
+11. 重启 AstrBot 后执行 /ms monitor status，确认日志源数量、轮询状态、observation/export 目录和 io_workers 生效。
+12. 触发或等待一条 Minecraft 日志后执行 /ms report now <服务器ID> 30m；再执行 /ms report now 8h 验证全局报告。
+13. 确认报告包含 overall、incidents、community、player_problems、risk_actions 五段，图片报告和 JSONL/JSONL.GZ 附件能发送到目标会话。
+14. 最后汇总安装文件、备份位置、日志源 server_id、性能档位、投递目标、是否启用 Rust 加速、验证命令结果和需要我手动确认的事项。
 ```
 
-已安装旧版或历史 Minecraft Adapter 时，用下面这段做升级：
+### 已安装升级
 
 ```text
-请把当前 AstrBot 插件 astrbot_plugin_minecraft_adapter 升级为最新 MineSentinel。升级前先记录当前分支、未提交改动、配置文件和 plugin_data 路径，并备份 plugin_data/astrbot_plugin_minecraft_adapter/mine_sentinel 与 plugin_data/mine_sentinel。随后切到 main 分支，拉取 https://github.com/EllanServer/astrbot_plugin_minecraft_adapter.git 的最新代码，执行 pip install -r requirements.txt；如果有匹配平台的 mine_sentinel_rs wheel，请升级安装以启用 Rust 加速。保留现有 mine_sentinel 配置，移除旧 Minecraft Adapter 的远程命令、聊天桥、玩家绑定等废弃配置，只保留日志监控、报告投递和导出配置。重启 AstrBot 后检查自动数据迁移是否完成，再运行 /ms monitor status 和 /ms report now 8h，确认报告包含 overall、incidents、community、player_problems、risk_actions 五段，并且不会把正常启动/关闭/连接池生命周期日志误报为管理事件。
+你是 Minecraft + AstrBot 升级助手。请把当前 astrbot_plugin_minecraft_adapter 升级为最新 MineSentinel 监控管理报告 AI，不要跳过备份、迁移检查和回归验证。
+
+GitHub 仓库：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter
+- 目标版本：main 分支。
+- Rust 加速 wheel：GitHub Actions -> "Build Rust wheels" 工作流，下载最近一次成功 run 的对应平台 Artifacts。
+  直接链接：https://github.com/EllanServer/astrbot_plugin_minecraft_adapter/actions/workflows/rust-wheels.yml
+- 不要在目标机器本地编译 Rust；缺少 wheel 时允许纯 Python 降级。
+
+升级前先记录并备份：
+1. 当前插件目录、当前 git 分支、未提交改动和远端地址。
+2. AstrBot 根目录、插件配置文件、实际运行 Python 路径。
+3. plugin_data/astrbot_plugin_minecraft_adapter/mine_sentinel 和 plugin_data/mine_sentinel；两个路径存在任意一个都要备份。
+4. 现有 mine_sentinel 配置、报告投递目标和日志源。
+
+执行要求：
+1. 如果旧插件目录有未提交改动，先生成 diff 备份，不要直接丢弃。
+2. 切到 main 分支并拉取 https://github.com/EllanServer/astrbot_plugin_minecraft_adapter.git 最新代码；目录名继续保持 astrbot_plugin_minecraft_adapter。
+3. 用 AstrBot 实际运行的 Python 执行 pip install -r requirements.txt。
+4. 可选升级 Rust 加速 wheel：只从 GitHub Actions 下载预编译 wheel 并 pip install <wheel>.whl；失败时记录原因并继续纯 Python 路径。
+5. 保留 mine_sentinel 下的日志源、投递目标、报告周期和导出配置；移除旧 Minecraft Adapter 的 Java 端插件、WebSocket、聊天桥、远程命令、玩家绑定等废弃配置。
+6. 检查旧路径 plugin_data/astrbot_plugin_minecraft_adapter/mine_sentinel 是否已自动迁移到 plugin_data/mine_sentinel；迁移前后文件数量和最新 observation/export 文件要对得上。
+7. 如果发现旧 .idx 偏移索引来自早期版本，优先备份后删除让新版重建；不想删除时把 mine_sentinel.storage.trust_legacy_index 设为 false 进入保守扫描模式。
+8. 按日志量重新选择性能档位：
+   - 小服默认档：template_parse_mode=all，anomaly_track_info=true，io_workers=0，export_format=jsonl。
+   - 大服性能优先档：template_parse_mode=interesting，anomaly_track_info=false，io_workers=2，export_format=jsonl.gz。
+9. 重启 AstrBot 后执行 /ms monitor status，确认日志源、轮询、backlog、异常检测、报告投递目标都正常。
+10. 执行 /ms report now <服务器ID> 30m 和 /ms report now 8h，验证图片报告、文本兜底和完整窗口附件。
+11. 检查报告包含 overall、incidents、community、player_problems、risk_actions 五段；正常启动/关闭、Hikari/连接池生命周期、代理握手和 Unknown or incomplete command 不应被误报为管理事件。
+12. 最后汇总升级文件、备份位置、迁移结果、保留/删除的旧配置、性能档位、Rust 加速状态、验证命令结果和仍需人工确认的风险。
 ```
 
 ## 最小配置
