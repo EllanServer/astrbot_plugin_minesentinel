@@ -5,6 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::IntoPyObjectExt as _;
 use regex::Regex;
 use sha1::{Digest, Sha1};
 use std::sync::OnceLock;
@@ -75,7 +76,14 @@ pub fn runtime_log_time_parts_batch<'py>(
     let out = PyList::empty(py);
     for line in lines {
         let (date_text, time_text, ms_text) = extract_time_parts(&line);
-        out.append(PyTuple::new(py, (date_text, time_text, ms_text))?)?;
+        out.append(PyTuple::new(
+            py,
+            [
+                date_text.into_bound_py_any(py)?,
+                time_text.into_bound_py_any(py)?,
+                ms_text.into_bound_py_any(py)?,
+            ],
+        )?)?;
     }
     Ok(out)
 }

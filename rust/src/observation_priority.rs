@@ -5,6 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::IntoPyObjectExt as _;
 
 /// Score records that should survive bounded-memory report sampling.
 /// `record` is the Python `ObservationRecord` object. The second argument is
@@ -134,19 +135,19 @@ fn ai_sampling_feature_tuple<'py>(
 
     PyTuple::new(
         py,
-        (
-            clean_key,
-            text,
-            evidence_text,
-            content_text,
-            low_value,
-            quality,
-            timestamp,
-            is_server_log,
-            anomaly_spike,
-            new_template,
-            daily_noise,
-        ),
+        vec![
+            clean_key.into_bound_py_any(py)?,
+            text.into_bound_py_any(py)?,
+            evidence_text.into_bound_py_any(py)?,
+            content_text.into_bound_py_any(py)?,
+            low_value.into_bound_py_any(py)?,
+            quality.into_bound_py_any(py)?,
+            timestamp.into_bound_py_any(py)?,
+            is_server_log.into_bound_py_any(py)?,
+            anomaly_spike.into_bound_py_any(py)?,
+            new_template.into_bound_py_any(py)?,
+            daily_noise.into_bound_py_any(py)?,
+        ],
     )
 }
 
