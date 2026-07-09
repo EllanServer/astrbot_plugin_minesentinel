@@ -116,7 +116,7 @@ class MineSentinelReportImageRenderer:
             report,
             player_count,
             len(incident_groups),
-            len(observation_groups),
+            len(observation_groups) + len(category_observations),
             text_report._high_risk_count(incident_groups),
             text_report._manual_review_count(incident_groups),
             _format_duration(report),
@@ -128,6 +128,11 @@ class MineSentinelReportImageRenderer:
         if incident_groups:
             for index, group in enumerate(incident_groups[:8], 1):
                 canvas.incident_card(index, group)
+            if len(incident_groups) > 8:
+                canvas.info_note(
+                    f"另有 {len(incident_groups) - 8} 个重点事件未在图片展开；"
+                    "图片已优先展示风险最高的 8 个，完整证据见附件。"
+                )
             canvas.info_note(_quiet_window_text(report, incident_groups))
         else:
             canvas.info_note("本窗口未发现需要管理员优先处理的事故或玩家问题。")

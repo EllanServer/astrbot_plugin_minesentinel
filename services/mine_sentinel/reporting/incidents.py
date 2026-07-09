@@ -180,7 +180,7 @@ def issue_sort_key(issue: dict[str, Any]) -> tuple[int, int, str]:
 
 def incident_sort_key(group: IncidentGroup) -> tuple[int, int]:
     severity = SEVERITY_RANK.get(str(group.max_severity or "low"), 0)
-    return (group.start_ts if group.start_ts else 2**63 - 1, -severity)
+    return (-severity, group.start_ts if group.start_ts else 2**63 - 1)
 
 
 def issue_time_bounds(issue: dict[str, Any]) -> tuple[int, int]:

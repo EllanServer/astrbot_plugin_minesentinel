@@ -22,6 +22,17 @@ _MINE_SENTINEL_DATA_DIR = "mine_sentinel"
 _LEGACY_PLUGIN_DATA_DIR = "astrbot_plugin_minecraft_adapter"
 
 
+def _effective_mine_sentinel_config(config: dict | None) -> dict:
+    """Combine the plugin and service enable switches into one source of truth."""
+
+    root = config or {}
+    nested = dict(root.get("mine_sentinel") or {})
+    nested["enabled"] = bool(
+        root.get("enabled", True) and nested.get("enabled", True)
+    )
+    return nested
+
+
 def _resolve_mine_sentinel_data_path(data_root: str | Path) -> Path:
     """Return the MineSentinel data directory, migrating legacy storage once."""
 
@@ -64,7 +75,7 @@ class MineSentinelPlugin(Star):
 
         self.mine_sentinel_service = MineSentinelService(
             context=context,
-            config_data=self.config.get("mine_sentinel", {}),
+            config_data=_effective_mine_sentinel_config(self.config),
             get_server_config=self._server_report_config,
             storage_dir=plugin_data_path,
         )
@@ -96,7 +107,7 @@ class MineSentinelPlugin(Star):
             logger.error(f"[MineSentinel] 后台任务 {task_name} 异常退出: {exc}")
 
     async def _initialize(self):
-        if not self.config.get("enabled", True):
+        if not self.mine_sentinel_service.config.enabled:
             logger.info("[MineSentinel] 插件已禁用")
             return
         self.mine_sentinel_service.start()

@@ -24,10 +24,10 @@ class RecentWindowBuilder:
         self.reservoir_records: list[ObservationRecord] = []
         self.identities: set[str] = set()
         self.total_count = 0
-        # Per-builder RNG so sampling is independent across concurrent window
-        # reads. Not seeded: window sampling does not require reproducibility
-        # (total_count is always reported separately from kept records).
-        self._rng = random.Random()
+        # A local fixed seed keeps the standard reservoir distribution while
+        # making identical ordered windows reproducible across cache expiry,
+        # restarts, AI prompts, and regression runs.
+        self._rng = random.Random(0x4D534E54)
 
     def add(self, record: ObservationRecord):
         self.total_count += 1

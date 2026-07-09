@@ -8,7 +8,7 @@ import hashlib
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -264,6 +264,7 @@ class _LoopEntry:
     sample: str
     server_id: str
     server_name: str
+    tags: tuple[str, ...]
     context: dict[str, Any]
 
 
@@ -289,12 +290,22 @@ class RuntimeLogLoopFilter:
             dedupe_key = fingerprint
         if not dedupe_key:
             return [observation]
+        tags = tuple(str(tag) for tag in (observation.get("tags") or []) if tag)
+        if "anticheat_vulcan" in tags:
+            # Drain3 replaces player/check values with wildcards. Include both
+            # dimensions so weighted summaries preserve exact Vulcan totals.
+            player = str(context.get("vulcanPlayer") or "")
+            check = str(context.get("vulcanCheck") or "")
+            dedupe_key = f"{dedupe_key}:vulcan:{player}:{check}"
 
         now_ms = _as_millis(observation.get("timestamp")) or int(time.time() * 1000)
         key = f"{observation.get('serverId') or ''}:{dedupe_key}"
         entry = self._entries.get(key)
         window_ms = max(1, self.config.loop_filter_window_seconds) * 1000
         if entry is None or now_ms - entry.last_ts > window_ms:
+            output: list[dict[str, Any]] = []
+            if entry is not None and entry.suppressed:
+                output.append(self._summary(entry))
             self._entries[key] = _LoopEntry(
                 fingerprint=fingerprint or dedupe_key,
                 first_ts=now_ms,
@@ -306,9 +317,11 @@ class RuntimeLogLoopFilter:
                 sample=str(observation.get("content") or ""),
                 server_id=str(observation.get("serverId") or ""),
                 server_name=str(observation.get("serverName") or ""),
+                tags=tags,
                 context=context,
             )
-            return [observation]
+            output.append(observation)
+            return output
 
         entry.count += 1
         entry.suppressed += 1
@@ -375,6 +388,11 @@ class RuntimeLogLoopFilter:
             attrs["loop.last_timestamp"] = entry.last_ts
             otel["attributes"] = attrs
         context["otel"] = otel
+        tags = list(
+            dict.fromkeys(
+                (*entry.tags, "server_log", "runtime_log", "loop_suppressed", entry.level.lower())
+            )
+        )
         return {
             "eventId": f"local-log-loop:{entry.server_id}:{digest}",
             "kind": "SERVER_LOG",
@@ -382,12 +400,7 @@ class RuntimeLogLoopFilter:
             "serverId": entry.server_id,
             "serverName": entry.server_name,
             "content": body_text,
-            "tags": [
-                "server_log",
-                "runtime_log",
-                "loop_suppressed",
-                entry.level.lower(),
-            ],
+            "tags": tags,
             "context": context,
         }
 
@@ -983,7 +996,11 @@ import threading as _threading
 from collections import OrderedDict as _OrderedDict
 
 _GZ_SCAN_CACHE_MAX_ENTRIES = 64
-_gz_scan_cache: _OrderedDict[tuple[str, int, int], list[tuple[str, int, str]]] = _OrderedDict()
+_GZ_SCAN_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_gz_scan_cache: _OrderedDict[
+    tuple[str, int, int],
+    tuple[list[tuple[str, int, str]], int],
+] = _OrderedDict()
 _gz_scan_cache_lock = _threading.Lock()
 
 
@@ -996,7 +1013,8 @@ def _gz_scan_cache_get(
         if value is not None:
             # LRU: 命中时移到末尾（最近使用）。
             _gz_scan_cache.move_to_end(key)
-        return value
+            return value[0]
+        return None
 
 
 def _gz_scan_cache_put(
@@ -1006,16 +1024,26 @@ def _gz_scan_cache_put(
     rows: list[tuple[str, int, str]],
 ) -> None:
     key = (str(path), mtime, hour_start_ms)
+    estimated_bytes = sum(
+        len(line.encode("utf-8", errors="replace"))
+        + len(source_file.encode("utf-8", errors="replace"))
+        + 40
+        for line, _timestamp, source_file in rows
+    )
+    if estimated_bytes > _GZ_SCAN_CACHE_MAX_BYTES:
+        return
     with _gz_scan_cache_lock:
         if key in _gz_scan_cache:
-            # 已存在：更新值并移到末尾。
-            _gz_scan_cache[key] = rows
-            _gz_scan_cache.move_to_end(key)
-            return
-        while len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES:
+            _gz_scan_cache.pop(key, None)
+        cached_bytes = sum(size for _rows, size in _gz_scan_cache.values())
+        while _gz_scan_cache and (
+            len(_gz_scan_cache) >= _GZ_SCAN_CACHE_MAX_ENTRIES
+            or cached_bytes + estimated_bytes > _GZ_SCAN_CACHE_MAX_BYTES
+        ):
             # LRU 淘汰：弹出最旧（最久未用）的条目。
-            _gz_scan_cache.popitem(last=False)
-        _gz_scan_cache[key] = rows
+            _old_key, (_old_rows, old_size) = _gz_scan_cache.popitem(last=False)
+            cached_bytes -= old_size
+        _gz_scan_cache[key] = (rows, estimated_bytes)
 
 
 def _file_date_overlaps_hour(
@@ -1042,11 +1070,32 @@ def read_hour_log_lines(
     max_lines: int = 20000,
     max_line_length: int = 4000,
 ) -> list[tuple[str, int, str]]:
-    """Read log lines whose timestamp falls in [hour_start_ms, hour_end_ms).
+    """Return a materialized hour window for compatibility callers."""
+
+    return list(
+        _iter_hour_log_lines(
+            source,
+            hour_start_ms,
+            hour_end_ms,
+            max_lines=max_lines,
+            max_line_length=max_line_length,
+        )
+    )
+
+
+def _iter_hour_log_lines(
+    source: MineSentinelLogSourceConfig,
+    hour_start_ms: int,
+    hour_end_ms: int,
+    max_lines: int = 20000,
+    max_line_length: int = 4000,
+) -> Iterator[tuple[str, int, str]]:
+    """Yield log lines whose timestamp falls in [hour_start_ms, hour_end_ms).
 
     Directly scans the logs/ directory (latest.log + archives) without any
     long-lived polling loop, so it has zero impact on Minecraft server mspt/tps.
-    Returns a list of (line, timestamp_ms, file_path) tuples.
+    Yields (line, timestamp_ms, file_path) tuples without materializing the
+    complete source file or hour window.
 
     PR9 优化：
     - 文件名日期预过滤：归档文件名日期与目标小时不在同一天（含前一天）则跳过，
@@ -1054,8 +1103,8 @@ def read_hour_log_lines(
     - .gz 已扫描缓存：同一进程内对同一 (path, mtime, hour_start) 重复扫描时
       直接复用上次结果，归档文件内容不会变化。
     """
-    if hour_end_ms <= hour_start_ms:
-        return []
+    if hour_end_ms <= hour_start_ms or max_lines <= 0:
+        return
     # Start scanning a bit before the hour so lines without a date prefix but
     # carrying only HH:MM:SS can still be attributed correctly via fallback walk.
     scan_cutoff_ms = hour_start_ms - 60 * 60 * 1000
@@ -1068,7 +1117,7 @@ def read_hour_log_lines(
         max_backfill_files=20,
         max_backfill_lines=max_lines,
     )
-    rows: list[tuple[str, int, str]] = []
+    emitted = 0
     for path in _backfill_candidates(source, dummy_config, scan_cutoff_ms):
         # PR9: 文件名日期预过滤。归档 .log.gz 通常按日期命名，
         # 如果文件名日期明显不在目标小时附近，直接跳过不解压。
@@ -1087,9 +1136,10 @@ def read_hour_log_lines(
                 for line, ts, fp in cached:
                     if ts < hour_start_ms or ts >= hour_end_ms:
                         continue
-                    rows.append((line, ts, fp))
-                    if len(rows) >= max_lines:
-                        return rows
+                    emitted += 1
+                    yield line, ts, fp
+                    if emitted >= max_lines:
+                        return
                 continue
             cached_rows: list[tuple[str, int, str]] = []
             for line, timestamp_ms in _iter_timestamped_lines(path, max_line_length):
@@ -1101,10 +1151,12 @@ def read_hour_log_lines(
                     continue
                 if timestamp_ms >= hour_end_ms:
                     continue
-                rows.append((line, timestamp_ms, str(path)))
-                if len(rows) >= max_lines:
-                    _gz_scan_cache_put(path, mtime, hour_start_ms, cached_rows)
-                    return rows
+                emitted += 1
+                yield line, timestamp_ms, str(path)
+                if emitted >= max_lines:
+                    # A capped scan is incomplete; caching it would make a
+                    # later call with a larger limit silently miss the tail.
+                    return
             _gz_scan_cache_put(path, mtime, hour_start_ms, cached_rows)
             continue
         # latest.log / 普通 .log：实时增长，不缓存。
@@ -1113,10 +1165,10 @@ def read_hour_log_lines(
                 continue
             if timestamp_ms >= hour_end_ms:
                 continue
-            rows.append((line, timestamp_ms, str(path)))
-            if len(rows) >= max_lines:
-                return rows
-    return rows
+            emitted += 1
+            yield line, timestamp_ms, str(path)
+            if emitted >= max_lines:
+                return
 
 
 def build_hour_observations(
@@ -1132,39 +1184,54 @@ def build_hour_observations(
 
     Does not write to disk; the caller decides what to do with the result.
     """
-    rows = read_hour_log_lines(
+    if max_records <= 0:
+        return []
+    observations: list[dict] = []
+    row_batch: list[tuple[str, int, str]] = []
+    batch_limit = min(_TIMESTAMP_PARSE_BATCH_SIZE, max_records)
+
+    def append_batch(rows: list[tuple[str, int, str]]) -> bool:
+        hints_batch = _runtime_log_hints_batch(
+            [line for line, _timestamp_ms, _source_file in rows],
+            max_line_length,
+        )
+        for (line, timestamp_ms, source_file), hints in zip(
+            rows,
+            hints_batch,
+            strict=True,
+        ):
+            observation = _build_observation(
+                source,
+                Path(source_file),
+                line,
+                timestamp_ms,
+                max_line_length,
+                runtime_config=runtime_config,
+                hints=hints,
+            )
+            if isinstance(observation.get("context"), dict):
+                observation["context"]["logFile"] = source_file
+                observation["context"]["source"] = "astrbot_hourly_read"
+            observations.append(observation)
+            if len(observations) >= max_records:
+                return True
+        return False
+
+    for row in _iter_hour_log_lines(
         source,
         hour_start_ms,
         hour_end_ms,
         max_lines=max_lines,
         max_line_length=max_line_length,
-    )
-    if not rows:
-        return []
-    observations: list[dict] = []
-    hints_batch = _runtime_log_hints_batch(
-        [line for line, _timestamp_ms, _source_file in rows],
-        max_line_length,
-    )
-    for (line, timestamp_ms, source_file), hints in zip(rows, hints_batch, strict=True):
-        # Reuse _build_observation so the schema stays consistent with the polling path.
-        observation = _build_observation(
-            source,
-            Path(source_file),
-            line,
-            timestamp_ms,
-            max_line_length,
-            runtime_config=runtime_config,
-            hints=hints,
-        )
-        # Override the logFile context to point at the actual source file,
-        # and drop the compressed flag (it was inferred from the original latest.log).
-        if isinstance(observation.get("context"), dict):
-            observation["context"]["logFile"] = source_file
-            observation["context"]["source"] = "astrbot_hourly_read"
-        observations.append(observation)
-        if len(observations) >= max_records:
-            break
+    ):
+        row_batch.append(row)
+        if len(row_batch) < batch_limit:
+            continue
+        if append_batch(row_batch):
+            return observations
+        row_batch = []
+    if row_batch:
+        append_batch(row_batch)
     return observations
 
 
@@ -1238,17 +1305,15 @@ def _iter_log_file(path: Path):
     try:
         if path.name.lower().endswith(".gz"):
             with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-                # M19: 先全量读入列表再 yield，避免消费方提前 return 时延迟关闭句柄。
-                # .gz 归档通常不大，全量读取可接受。
-                lines = list(handle)
+                for line in handle:
+                    yield line
         else:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
-                lines = list(handle)
+                for line in handle:
+                    yield line
     except (OSError, EOFError):
         # M18: 截断的 .gz 在读取中途会抛 EOFError，需与 OSError 一并吞掉。
         return
-    for line in lines:
-        yield line
 
 
 def _iter_timestamped_lines(
@@ -1573,32 +1638,16 @@ def _detect_player_floods(
             # 跳过这个窗口内的记录，避免重叠
             break
 
-    # 2. 重复刷屏：5 分钟窗口内 >=5 条相同/高度相似消息
+    # 2. 重复刷屏：5 分钟窗口内 >=5 条相同/高度相似消息。
+    # 用常数规模签名索引寻找候选 anchor，再以 _is_similar 做最终复核。
+    # 这保留原判定语义，同时避免互不相似消息触发 O(n²) 全窗口扫描。
     normalized_list = [
         (r, _normalize_message(str((r.context or {}).get("chatMessage") or "")))
         for r in records
     ]
-    window_stop = 0
-    for i, (start_record, start_norm) in enumerate(normalized_list):
-        if not start_norm:
-            continue
-        window_start = start_record.timestamp or 0
-        window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
-        window_stop = max(window_stop, i)
-        while window_stop < len(records) and timestamps[window_stop] <= window_end:
-            window_stop += 1
-        similar = [
-            r for r, norm in normalized_list[i:window_stop]
-            if norm
-            and (norm == start_norm or _is_similar(norm, start_norm))
-        ]
-        if len(similar) >= _CHAT_FLOOD_REPEAT_COUNT:
-            floods.append(_make_flood_event(
-                player, "repeat_content", window_start,
-                similar[-1].timestamp or window_end,
-                similar,
-            ))
-            break
+    repeat_event = _detect_repeat_flood(player, normalized_list)
+    if repeat_event:
+        floods.append(repeat_event)
 
     # 3. 无意义刷屏：5 分钟窗口内 >=3 条无意义符号消息
     meaningless_records = [
@@ -1626,6 +1675,90 @@ def _detect_player_floods(
             break
 
     return floods
+
+
+def _detect_repeat_flood(
+    player: str,
+    normalized_records: list[tuple["ObservationRecord", str]],
+) -> dict[str, Any] | None:
+    signature_index: dict[tuple[str, str], deque[int]] = {}
+    anchor_matches: dict[int, list["ObservationRecord"]] = {}
+    timestamps = [int(record.timestamp or 0) for record, _ in normalized_records]
+
+    for current_index, (record, norm) in enumerate(normalized_records):
+        if not norm:
+            continue
+        now_ms = timestamps[current_index]
+        candidate_indexes: set[int] = set()
+        query_keys = _message_similarity_keys(norm, for_index=False)
+        for key in query_keys:
+            indexes = signature_index.get(key)
+            if not indexes:
+                continue
+            cutoff = now_ms - _CHAT_FLOOD_REPEAT_WINDOW_MS
+            while indexes and timestamps[indexes[0]] < cutoff:
+                indexes.popleft()
+            candidate_indexes.update(indexes)
+
+        for anchor_index in sorted(candidate_indexes):
+            anchor_record, anchor_norm = normalized_records[anchor_index]
+            anchor_ts = timestamps[anchor_index]
+            if now_ms - anchor_ts > _CHAT_FLOOD_REPEAT_WINDOW_MS:
+                continue
+            if not _is_similar(norm, anchor_norm):
+                continue
+            matches = anchor_matches[anchor_index]
+            matches.append(record)
+            if len(matches) >= _CHAT_FLOOD_REPEAT_COUNT:
+                return _make_flood_event(
+                    player,
+                    "repeat_content",
+                    anchor_ts,
+                    now_ms,
+                    matches,
+                )
+
+        anchor_matches[current_index] = [record]
+        for key in _message_similarity_keys(norm, for_index=True):
+            signature_index.setdefault(key, deque()).append(current_index)
+    return None
+
+
+def _message_similarity_keys(
+    value: str,
+    *,
+    for_index: bool,
+) -> tuple[tuple[str, str], ...]:
+    """Generate a bounded candidate-key set for the _is_similar relation."""
+
+    keys: set[tuple[str, str]] = {("exact", value)}
+    length = len(value)
+
+    # Strings with a one-edit relationship share either the original value or
+    # one single-character deletion signature.
+    if 2 <= length <= 8:
+        keys.add(("edit", value))
+        for index in range(length):
+            keys.add(("edit", value[:index] + value[index + 1 :]))
+
+    # The legacy relation accepts a contiguous substring when lengths differ
+    # by at most two. Removing up to two characters from the two ends covers
+    # all such pairs without enumerating arbitrary substrings.
+    # A shorter value advertises the two longer lengths it can match. Longer
+    # values publish only trimmed signatures keyed by their original length,
+    # preventing equal-length common-prefix messages from colliding.
+    original_role = "substring_short" if for_index else "substring_long"
+    trimmed_role = "substring_long" if for_index else "substring_short"
+    keys.add((original_role, f"{length + 1}:{value}"))
+    keys.add((original_role, f"{length + 2}:{value}"))
+    for removed in (1, 2):
+        if length <= removed:
+            continue
+        for prefix in range(removed + 1):
+            suffix = removed - prefix
+            end = length - suffix if suffix else length
+            keys.add((trimmed_role, f"{length}:{value[prefix:end]}"))
+    return tuple(keys)
 
 
 def _is_similar(norm_a: str, norm_b: str) -> bool:
@@ -2578,6 +2711,15 @@ def _clean_for_llm(line: str) -> tuple[str, int, list[str]]:
 
     text, control_stripped = _strip_transport_text(line)
     return _clean_transport_for_llm(text, control_stripped=control_stripped)
+
+
+def clean_text_for_prompt(value: Any, *, preserve_lines: bool = False) -> str:
+    """Return the same redacted text used by runtime-log prompt indexing."""
+
+    text = str(value or "")
+    if not preserve_lines:
+        return _clean_for_llm(text)[0]
+    return "\n".join(_clean_for_llm(line)[0] for line in text.splitlines())
 
 
 def _clean_transport_for_llm(

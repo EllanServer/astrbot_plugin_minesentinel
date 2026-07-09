@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from typing import Any
 
-from .common import format_locations
-from .sections import normalize_report_sections
+from .sections import build_report_sections
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,24 @@ _INJECTION_PATTERNS = [
 ]
 # 控制字符（保留换行 \n 与制表符 \t）
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_UNSAFE_ACTION_RE = re.compile(
+    r"(?:"
+    r"(?:自动|立即|立刻|马上|直接)(?:封禁|踢(?:出|人)?|回滚|删(?:除|库)|关服|停服)"
+    r"|(?:执行|运行|调用)\s*(?:rcon|/|rm\b|del\b|drop\b|shutdown\b|stop\b)"
+    r"|(?:自动\s*rcon|自动回档)"
+    r")",
+    re.IGNORECASE,
+)
+_ACTION_DOMAIN_RULES = (
+    (("数据库", "mariadb", "mysql", "jdbc", "sql", "连接池"), ("数据库", "mariadb", "mysql", "jdbc", "sql", "hikari")),
+    (("经济", "商店", "余额", "扣款", "补偿"), ("经济", "商店", "余额", "扣款", "quickshop", "vault", "物品", "资产")),
+    (("权限", "luckperms", "认证"), ("权限", "luckperms", "认证", "登录", "offline", "代理")),
+    (("网络", "代理", "velocity", "bungee", "防火墙"), ("网络", "代理", "连接", "velocity", "bungee", "timeout", "超时")),
+    (("内存", "heap", "oom", "gc"), ("内存", "heap", "oom", "gc", "memory")),
+    (("磁盘", "disk"), ("磁盘", "disk", "存储", "storage")),
+    (("封禁", "踢出", "禁言", "处罚"), ("封禁", "踢", "禁言", "处罚", "违规", "举报", "外挂", "作弊", "刷屏", "广告", "辱骂")),
+    (("回滚", "回档"), ("回滚", "回档", "资产", "经济", "物品", "数据丢失", "保存失败")),
+)
 
 
 def sanitize_free_text(value: Any, max_chars: int = MAX_FREE_TEXT_CHARS) -> str:
@@ -47,12 +65,6 @@ def sanitize_free_text(value: Any, max_chars: int = MAX_FREE_TEXT_CHARS) -> str:
     if len(text) > max_chars:
         text = text[:max_chars]
     return text.strip()
-
-
-def _sanitize_free_text_list(values: Any, max_chars: int = MAX_FREE_TEXT_CHARS) -> list[str]:
-    if not isinstance(values, list):
-        return []
-    return [sanitize_free_text(v, max_chars) for v in values if v]
 
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
@@ -81,73 +93,40 @@ def repair_json_object_text(text: str) -> str:
 
 
 class AIReportNormalizer:
-    """Preserves locations, evidence, and counts from fallback facts."""
+    """Apply AI wording without letting it mutate deterministic report facts."""
 
     def normalize_report(
         self,
         data: dict[str, Any],
         fallback: dict[str, Any],
     ) -> dict[str, Any]:
-        result = dict(fallback)
-        result.update({key: value for key, value in data.items() if key in result})
-        ai_categories = data.get("categories")
-        if not isinstance(ai_categories, dict):
-            ai_categories = {}
-        fallback_categories = fallback.get("categories") or {}
-        categories = {}
-        for key in (
-            "daily",
-            "complaint",
-            "bug",
-            "network",
-            "plugin",
-            "economy",
-            "community",
-            "chat_review",
-            "player_feedback",
-            "community_ops",
-            "moderation",
-            "cross_server",
-            "suggestion",
-        ):
-            fallback_items = fallback_categories.get(key) or []
-            ai_items = ai_categories.get(key)
-            if fallback_items and isinstance(ai_items, list):
-                categories[key] = ai_items
-            elif isinstance(fallback_items, list):
-                categories[key] = fallback_items
-            else:
-                categories[key] = []
-        result["categories"] = categories
-        if not fallback.get("vulcan_alerts"):
-            result["vulcan_alerts"] = fallback.get("vulcan_alerts", {})
-        if not fallback.get("chat_topics"):
-            result["chat_topics"] = fallback.get("chat_topics", {})
-        self.normalize_issues(result, fallback)
-        if not isinstance(result.get("ops_notes"), list):
-            result["ops_notes"] = fallback.get("ops_notes", [])
-        if not isinstance(result.get("incident_findings"), list):
-            result["incident_findings"] = fallback.get("incident_findings", [])
-        result["report_sections"] = normalize_report_sections(
-            data.get("report_sections"),
-            result,
-        )
+        # The heuristic report is the factual ledger. AI output is untrusted
+        # presentation data: it must not change counts, severity, scope,
+        # evidence, categories, anti-cheat totals, or the issue set itself.
+        result = deepcopy(fallback)
+        self.normalize_issues(result, fallback, data.get("issues"))
+        result["report_sections"] = build_report_sections(result)
         return result
 
-    def normalize_issues(self, result: dict[str, Any], fallback: dict[str, Any]):
+    def normalize_issues(
+        self,
+        result: dict[str, Any],
+        fallback: dict[str, Any],
+        ai_issues: Any,
+    ):
         fallback_issues_raw = fallback.get("issues", [])
         if not isinstance(fallback_issues_raw, list):
             fallback_issues_raw = []
-        if not isinstance(result.get("issues"), list):
-            result["issues"] = fallback_issues_raw
-            return
-
         fallback_issues = [
             issue for issue in fallback_issues_raw if isinstance(issue, dict)
         ]
+        if not isinstance(ai_issues, list):
+            result["issues"] = deepcopy(fallback_issues_raw)
+            return
+
         used_fallback_indexes: set[int] = set()
-        normalized_issues = []
-        for issue in result["issues"]:
+        normalized_issues = [deepcopy(issue) for issue in fallback_issues]
+        for issue in ai_issues:
             if not isinstance(issue, dict):
                 continue
             fallback_index, fallback_issue = self._match_fallback_issue(
@@ -157,18 +136,20 @@ class AIReportNormalizer:
             )
             if fallback_index < 0:
                 continue
-            if fallback_index >= 0:
-                used_fallback_indexes.add(fallback_index)
-            self._normalize_structured_fields(issue, fallback_issue)
-            self._normalize_players(issue, fallback_issue)
-            self._normalize_counts(issue, fallback_issue)
-            self._normalize_locations(issue, fallback_issue)
-            normalized_issues.append(issue)
+            used_fallback_indexes.add(fallback_index)
+            normalized = normalized_issues[fallback_index]
+            action = sanitize_free_text(issue.get("suggested_action"))
+            if (
+                action
+                and not _UNSAFE_ACTION_RE.search(action)
+                and _action_is_grounded(action, fallback_issue)
+            ):
+                normalized["suggested_action"] = action
 
-        if normalized_issues:
-            result["issues"] = normalized_issues
-        else:
-            result["issues"] = fallback_issues_raw
+        # Keep every reviewed deterministic issue in its original order. The
+        # dedicated issue-review stage is the only component allowed to drop
+        # candidates; the prose model cannot silently omit or duplicate them.
+        result["issues"] = normalized_issues
 
     @staticmethod
     def _match_fallback_issue(
@@ -197,96 +178,16 @@ class AIReportNormalizer:
                 return index, fallback_issue
         return -1, {}
 
-    @staticmethod
-    def _normalize_structured_fields(
-        issue: dict[str, Any],
-        fallback_issue: dict[str, Any],
-    ):
-        fallback_incident = _as_int(fallback_issue.get("incident_index"))
-        issue_incident = _as_int(issue.get("incident_index"))
-        if fallback_incident is not None:
-            issue["incident_index"] = fallback_incident
-        elif issue_incident is not None:
-            issue["incident_index"] = issue_incident
-        for field in (
-            "source_tag",
-            "first_seen_ts",
-            "last_seen_ts",
-            "urgent_signal_count",
-        ):
-            if field not in issue and field in fallback_issue:
-                issue[field] = fallback_issue[field]
-        # 对 LLM 产出的自由文本/列表字段做清洗，防止提示注入文本经报告
-        # 渲染进入管理员群。
-        issue["suggested_action"] = sanitize_free_text(issue.get("suggested_action"))
-        issue["incident_title"] = sanitize_free_text(
-            issue.get("incident_title") or issue.get("title")
-        )
-        issue["ops_categories"] = _sanitize_free_text_list(issue.get("ops_categories"))
-        issue["ops_subtypes"] = _sanitize_free_text_list(issue.get("ops_subtypes"))
-        issue["ops_impacts"] = _sanitize_free_text_list(issue.get("ops_impacts"))
-        if not isinstance(issue.get("issue_terms"), list):
-            terms = fallback_issue.get("issue_terms") or []
-            issue["issue_terms"] = [str(term) for term in terms if term]
-        else:
-            issue["issue_terms"] = _sanitize_free_text_list(issue.get("issue_terms"))
-        if not isinstance(issue.get("evidence_samples"), list):
-            samples = fallback_issue.get("evidence_samples") or []
-            issue["evidence_samples"] = [str(sample) for sample in samples if sample]
 
-    @staticmethod
-    def _normalize_players(
-        issue: dict[str, Any],
-        fallback_issue: dict[str, Any],
-    ):
-        players = issue.get("players") or issue.get("player_names")
-        if not isinstance(players, list):
-            players = fallback_issue.get("players") or []
-        issue["players"] = [str(player) for player in players if player]
-        if not issue.get("players_text"):
-            issue["players_text"] = "无"
-
-        mentioned_players = issue.get("mentioned_players")
-        if not isinstance(mentioned_players, list):
-            mentioned_players = fallback_issue.get("mentioned_players") or []
-        issue["mentioned_players"] = [
-            str(player) for player in mentioned_players if player
-        ]
-        if not issue.get("mentioned_players_text"):
-            issue["mentioned_players_text"] = "无"
-
-    @staticmethod
-    def _normalize_counts(
-        issue: dict[str, Any],
-        fallback_issue: dict[str, Any],
-    ):
-        for count_field in (
-            "evidence_count",
-            "signal_count",
-            "distinct_message_count",
-            "unique_players",
-        ):
-            if count_field not in issue and count_field in fallback_issue:
-                issue[count_field] = fallback_issue[count_field]
-
-    @staticmethod
-    def _normalize_locations(
-        issue: dict[str, Any],
-        fallback_issue: dict[str, Any],
-    ):
-        for list_field in (
-            "affected_servers",
-            "affected_backends",
-            "affected_locations",
-        ):
-            values = issue.get(list_field)
-            if not isinstance(values, list):
-                values = fallback_issue.get(list_field) or []
-            issue[list_field] = [str(value) for value in values if value]
-        if not issue.get("affected_locations_text"):
-            issue["affected_locations_text"] = format_locations(
-                issue.get("affected_locations") or []
-            )
+def _action_is_grounded(action: str, issue: dict[str, Any]) -> bool:
+    action_text = str(action or "").lower()
+    issue_text = json.dumps(issue, ensure_ascii=False, default=str).lower()
+    for action_markers, evidence_markers in _ACTION_DOMAIN_RULES:
+        if not any(marker in action_text for marker in action_markers):
+            continue
+        if not any(marker in issue_text for marker in evidence_markers):
+            return False
+    return True
 
 def _as_int(value: Any) -> int | None:
     try:

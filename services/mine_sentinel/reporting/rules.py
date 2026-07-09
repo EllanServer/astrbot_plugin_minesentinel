@@ -796,6 +796,27 @@ CHAT_HIGH_LABELS = {
     "透视/Xray",
     "自动挖矿",
 }
+FLIGHT_REPORT_INTENT_MARKERS = (
+    "举报",
+    "疑似",
+    "怀疑",
+    "开挂",
+    "外挂",
+    "作弊",
+    "违规",
+    "警告",
+    "停止",
+    "别开",
+    "抓到",
+    "处理",
+    "处罚",
+    "封禁",
+    "管理",
+    "report",
+    "cheat",
+    "hack",
+    "ban",
+)
 CHAT_MEDIUM_CATEGORIES = {"管理请求", "性能与连接异常", "数据与插件异常", "经济与物品", "违规与安全风险"}
 CHAT_CHAT_REVIEW_LABELS = {"辱骂", "人身攻击", "引战", "刷屏", "广告", "诈骗", "恶意拉人"}
 CHAT_COMMUNITY_LABELS = {
@@ -1620,6 +1641,10 @@ class HeuristicReportBuilder:
 
         for category, label, markers in CHAT_LABEL_RULES:
             if _keys_match(text, markers):
+                if label == "飞行举报" and not any(
+                    marker in text for marker in FLIGHT_REPORT_INTENT_MARKERS
+                ):
+                    continue
                 self._append_unique(labels, label)
                 self._append_unique(categories, category)
 
@@ -2296,8 +2321,6 @@ class HeuristicReportBuilder:
             for partition in self._partition_issue_evidence(issue_evidence, category):
                 for segment in self._split_issue_group(
                     partition,
-                    window_minutes,
-                    force_split=category == "player_feedback",
                     cluster_gap_ms=(
                         PLAYER_FEEDBACK_CLUSTER_GAP_MS
                         if category == "player_feedback"
@@ -2480,17 +2503,28 @@ class HeuristicReportBuilder:
         window_timestamps = [record.timestamp for record in log_records if record.timestamp]
         window_start_ts = min(window_timestamps) if window_timestamps else 0
         window_end_ts = max(window_timestamps) if window_timestamps else 0
+        actual_span_ms = max(0, window_end_ts - window_start_ts)
+        requested_span_ms = max(1, int(window_minutes)) * 60 * 1000
+        if actual_span_ms > requested_span_ms:
+            effective_window_minutes = max(1, (actual_span_ms + 59_999) // 60_000)
+            window_label = (
+                f"实际覆盖约 {effective_window_minutes} 分钟"
+                f"（请求窗口 {window_minutes} 分钟）"
+            )
+        else:
+            effective_window_minutes = window_minutes
+            window_label = f"最近 {window_minutes} 分钟"
 
         # PR10: 聊天热点总结 + Vulcan 反作弊结构化告警
         report = {
             "summary": (
-                f"最近 {window_minutes} 分钟收到 {len(log_records)} 条 "
+                f"{window_label}，收到 {len(log_records)} 条 "
                 "Minecraft 运行日志观察。"
             ),
-            "time_window": f"最近 {window_minutes} 分钟",
+            "time_window": window_label,
             "window_start_ts": window_start_ts,
             "window_end_ts": window_end_ts,
-            "_window_minutes": window_minutes,
+            "_window_minutes": effective_window_minutes,
             "servers": servers if not server_id else [server_id],
             "server_names": server_names,
             "proxy_ids": proxy_ids,
@@ -2898,22 +2932,14 @@ class HeuristicReportBuilder:
     @staticmethod
     def _split_issue_group(
         group: list[ObservationRecord],
-        window_minutes: int,
         *,
-        force_split: bool = False,
         cluster_gap_ms: int = ISSUE_CLUSTER_GAP_MS,
     ) -> list[list[ObservationRecord]]:
-        """Split short-window tag buckets when evidence goes quiet for five minutes."""
+        """Split tag buckets whenever evidence is quiet beyond the category gap."""
         if not group:
             return []
         timestamps = sorted(record.timestamp for record in group if record.timestamp)
         if len(timestamps) < 2:
-            return [group]
-        max_segmentable_span_ms = max(120, max(1, int(window_minutes)) * 2) * 60 * 1000
-        if (
-            not force_split
-            and timestamps[-1] - timestamps[0] > max_segmentable_span_ms
-        ):
             return [group]
 
         ordered = sorted(
@@ -4197,31 +4223,40 @@ class HeuristicReportBuilder:
         vulcan_records.sort(key=lambda r: r.timestamp)
 
         # 按玩家聚合
-        player_alerts: dict[str, list[tuple[str, ObservationRecord]]] = defaultdict(list)
-        check_alerts: dict[str, list[tuple[str, ObservationRecord]]] = defaultdict(list)
+        player_alerts: dict[str, list[tuple[str, ObservationRecord, int]]] = defaultdict(list)
+        check_alerts: dict[str, list[tuple[str, ObservationRecord, int]]] = defaultdict(list)
+        total_alerts = 0
         for record in vulcan_records:
             ctx = record.context or {}
             player = str(ctx.get("vulcanPlayer") or "").strip() or "(unknown)"
             check = str(ctx.get("vulcanCheck") or "").strip() or "(unknown)"
-            ts_text = _format_timestamp(int(record.timestamp or 0))
-            player_alerts[player].append((check, record))
-            check_alerts[check].append((player, record))
+            try:
+                weight = max(1, int(ctx.get("loopSuppressed") or 1))
+            except (TypeError, ValueError):
+                weight = 1
+            total_alerts += weight
+            player_alerts[player].append((check, record, weight))
+            check_alerts[check].append((player, record, weight))
 
         # by_player 排序
         by_player = []
         for player, items in sorted(
-            player_alerts.items(), key=lambda kv: len(kv[1]), reverse=True
+            player_alerts.items(),
+            key=lambda kv: sum(item[2] for item in kv[1]),
+            reverse=True,
         ):
             check_counter: dict[str, int] = defaultdict(int)
-            for check, _ in items:
-                check_counter[check] += 1
+            player_total = 0
+            for check, _, weight in items:
+                check_counter[check] += weight
+                player_total += weight
             top_checks = sorted(
                 check_counter.items(), key=lambda kv: kv[1], reverse=True
             )[:3]
             by_player.append(
                 {
                     "player": player,
-                    "count": len(items),
+                    "count": player_total,
                     "top_checks": [
                         {"check": c, "count": n} for c, n in top_checks
                     ],
@@ -4231,13 +4266,15 @@ class HeuristicReportBuilder:
         # by_check 排序
         by_check = []
         for check, items in sorted(
-            check_alerts.items(), key=lambda kv: len(kv[1]), reverse=True
+            check_alerts.items(),
+            key=lambda kv: sum(item[2] for item in kv[1]),
+            reverse=True,
         ):
-            players = sorted({p for p, _ in items})
+            players = sorted({p for p, _, _ in items})
             by_check.append(
                 {
                     "check": check,
-                    "count": len(items),
+                    "count": sum(item[2] for item in items),
                     "players": players,
                 }
             )
@@ -4269,7 +4306,7 @@ class HeuristicReportBuilder:
             )
 
         return {
-            "total": len(vulcan_records),
+            "total": total_alerts,
             "unique_players": len(player_alerts),
             "unique_checks": len(check_alerts),
             "by_player": by_player,

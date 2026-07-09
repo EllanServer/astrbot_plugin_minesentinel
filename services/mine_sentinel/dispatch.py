@@ -46,7 +46,7 @@ class MineSentinelReportDispatcher:
         include_report_targets: bool = True,
         image: BytesIO | None = None,
         file_path: Path | None = None,
-    ):
+    ) -> bool:
         current_resolved = self._resolve_session(current_session)
         seen: set[str] = set()
         targets: list[str] = []
@@ -64,22 +64,24 @@ class MineSentinelReportDispatcher:
             seen.add(resolved or umo)
             targets.append(umo)
         if not targets:
-            return
+            return False
         # 并发投递到各 session，Semaphore 限流避免瞬时压力过大；
         # 单个 session 失败不影响其他 session 的投递。
         semaphore = asyncio.Semaphore(4)
 
-        async def _send_one(target_umo: str):
+        async def _send_one(target_umo: str) -> bool:
             async with semaphore:
                 try:
-                    await self.send_report(
+                    return await self.send_report(
                         target_umo, text, image=image, file_path=file_path
                     )
                 except Exception as exc:
                     if self.error_sink:
                         self.error_sink(f"投递到 {target_umo} 失败: {exc}")
+                    return False
 
-        await asyncio.gather(*(_send_one(umo) for umo in targets))
+        results = await asyncio.gather(*(_send_one(umo) for umo in targets))
+        return any(results)
 
     async def send_report(
         self,

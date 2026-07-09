@@ -163,11 +163,9 @@ def _overall_lines(
             f"待人工复核 {manual_review_count} 个；一般观察 {observation_count} 个。"
         ),
     ]
-    main_time = _main_incident_time(incident_groups)
-    if main_time:
-        lines.append(
-            f"主要异常集中在 {main_time} 左右，其他时间段未发现明显持续性冲突或大规模异常。"
-        )
+    time_summary = _incident_time_distribution(incident_groups)
+    if time_summary:
+        lines.append(time_summary)
     return lines
 
 
@@ -241,6 +239,8 @@ def _is_observation_group(group: IncidentGroup) -> bool:
     if group.family == "community_ops":
         return not _community_ops_has_accident_signal(group)
     if group.family == "chat_review":
+        if str(group.max_severity or "").lower() in {"high", "critical"}:
+            return False
         labels = set(_unique_issue_values(list(group.issues), "chat_labels"))
         if labels and labels <= {"刷屏", "玩笑"}:
             return True
@@ -317,9 +317,22 @@ def _group_text(group: IncidentGroup) -> str:
     return " ".join(parts).lower()
 
 
-def _main_incident_time(groups: list[IncidentGroup]) -> str:
+def _incident_time_distribution(groups: list[IncidentGroup]) -> str:
     if not groups:
         return ""
+    starts = [group.start_ts for group in groups if group.start_ts]
+    ends = [group.end_ts for group in groups if group.end_ts]
+    if len(groups) > 1 and starts and ends and max(ends) - min(starts) > 30 * 60 * 1000:
+        first = _format_time_window(
+            {"time_window": {"start": min(starts), "end": min(starts)}}
+        ).split(" - ", 1)[0]
+        last = _format_time_window(
+            {"time_window": {"start": max(ends), "end": max(ends)}}
+        ).split(" - ", 1)[0]
+        return (
+            f"重点事件分布在 {first} 至 {last} 的多个时间段，"
+            "应按风险等级和证据时间逐段复核。"
+        )
     group = sorted(
         groups,
         key=lambda item: (
@@ -327,7 +340,8 @@ def _main_incident_time(groups: list[IncidentGroup]) -> str:
             item.start_ts if item.start_ts else 2**63 - 1,
         ),
     )[0]
-    return _incident_time_text(group).replace(" 左右", "")
+    main_time = _incident_time_text(group).replace(" 左右", "")
+    return f"主要异常集中在 {main_time} 左右，其他时间段未发现明显持续性冲突或大规模异常。"
 
 
 def _player_problem_lines(
@@ -408,6 +422,8 @@ def _player_problem_action(group: IncidentGroup) -> str:
     if group.family == "community" and labels & {"外挂举报", "飞行举报", "透视/Xray", "自动挖矿"}:
         return "人工复核视频、反作弊日志、移动轨迹和上下文，不建议仅凭聊天处罚。"
     if group.family == "chat_review":
+        if str(group.max_severity or "").lower() in {"high", "critical"}:
+            return "核对消息原文、频率、持续时间和上下文，确认违规后再由管理员处理。"
         return "先观察是否持续；只有影响聊天秩序或伴随辱骂、广告时再升级处理。"
     if "权限异常" in labels:
         return "复核聊天上下文，确认是否已有处理；只有出现明确权限丢失或命令失败证据时再查权限插件日志。"
@@ -417,10 +433,13 @@ def _player_problem_action(group: IncidentGroup) -> str:
 def _problem_status(issues: list[dict[str, Any]]) -> str:
     if any(str(issue.get("category") or "") == "community" for issue in issues):
         return "待人工复核"
+    if any(
+        str(issue.get("severity") or "").lower() in {"high", "critical"}
+        for issue in issues
+    ):
+        return "需要管理员确认"
     if any(str(issue.get("category") or "") == "chat_review" for issue in issues):
         return "低风险观察"
-    if any(str(issue.get("severity") or "").lower() in {"high", "critical"} for issue in issues):
-        return "需要管理员确认"
     if any(str(issue.get("category") or "") in {"complaint", "player_feedback"} for issue in issues):
         return "未看到明确处理结果"
     return "需要管理员确认"
@@ -511,6 +530,12 @@ def _event_summaries(
         _append_unique(items, seen, _incident_event_summary(index, group))
 
     if groups:
+        hidden_count = len(groups) - MAX_EVENT_SUMMARIES
+        if hidden_count > 0:
+            items.append(
+                f"另有 {hidden_count} 个重点事件未在正文展开；正文已优先展示风险最高的 "
+                f"{MAX_EVENT_SUMMARIES} 个，完整证据见附件。"
+            )
         return items or ["本窗口未发现需要特别记录的运行日志或事件。"]
 
     if not items:
@@ -647,6 +672,12 @@ def _incident_summary_sentence(group: IncidentGroup, labels: list[str]) -> str:
             "建议结合反作弊记录、移动轨迹、玩家位置和上下文复核，不建议仅凭聊天直接处罚。"
         )
     if group.family == "chat_review" and ("刷屏" in chat_labels or "重复" in _group_text(group)):
+        if str(group.max_severity or "").lower() in {"high", "critical"}:
+            labels_text = "、".join(sorted(chat_labels)) or "重复聊天"
+            return (
+                f"短时间内集中出现 {labels_text}，证据量和风险等级已超过一般聊天观察；"
+                "需要管理员核对原文、频率和上下文后决定是否处理。"
+            )
         return (
             "短时间内出现重复或无意义聊天内容，可能影响聊天可读性；当前未见持续辱骂、广告或明确恶意证据，"
             "建议先观察。"
@@ -685,6 +716,8 @@ def _group_status(group: IncidentGroup) -> str:
     if group.family in {"player_feedback", "moderation"}:
         return "未看到明确处理结果"
     if group.family == "chat_review":
+        if str(group.max_severity or "").lower() in {"high", "critical"}:
+            return "需要管理员复核集中聊天行为"
         return "低风险观察，暂不处罚"
     if group.family == "community_ops":
         return "社区观察，无需立即处理"
@@ -727,6 +760,8 @@ def _incident_judgement_line(group: IncidentGroup) -> str:
     if group.family == "community" and labels & {"外挂举报", "飞行举报", "透视/Xray", "自动挖矿"}:
         return "当前只能说明存在玩家举报或外挂/飞行相关讨论，不能直接判定违规；需要结合外部证据复核。"
     if group.family == "chat_review":
+        if str(group.max_severity or "").lower() in {"high", "critical"}:
+            return "证据显示集中重复聊天并伴随高风险标签；仍需人工核对原文与上下文，不能仅凭标签自动处罚。"
         return "仅作为聊天观察；未达到明确恶意刷屏、广告或辱骂程度。"
     if group.family in {"player_feedback", "moderation"}:
         return "这是玩家侧反馈，不等同于已确认权限异常或管理事故。"
@@ -749,6 +784,8 @@ def _incident_recommended_action(group: IncidentGroup) -> str:
     if group.family in {"player_feedback", "moderation"}:
         return "复核聊天上下文，确认是否已有管理员线下处理。"
     if group.family == "chat_review":
+        if str(group.max_severity or "").lower() in {"high", "critical"}:
+            return "核对证据中的消息原文、发送频率、持续时间和上下文；确认确有广告、辱骂或恶意刷屏后再按规则人工处理。"
         return "仅观察；若后续持续刷屏、影响聊天可读性或伴随辱骂广告，再升级处理。"
     if group.family == "community_ops":
         return "作为社区观察记录，无需立即处理。"
@@ -1038,6 +1075,13 @@ def _risk_lines(
         review.append("聊天中出现疑似外挂/飞行举报，当前缺少反作弊日志、视频或管理员确认，不建议仅凭聊天处罚。")
 
     if any(
+        group.family == "chat_review"
+        and str(group.max_severity or "").lower() in {"high", "critical"}
+        for group in groups
+    ):
+        high.append("出现集中刷屏、广告、辱骂或其他高风险聊天行为，需要管理员核对原文、频率与上下文。")
+
+    if any(
         group.family in {"player_feedback", "moderation"}
         and not _is_auth_security_group(group)
         for group in groups
@@ -1151,6 +1195,12 @@ def _action_lines(
             actions,
             seen,
             "对短时间重复聊天先观察，只有在持续刷屏、广告、辱骂或影响聊天秩序时再升级处理。",
+        )
+    if any(group.family == "chat_review" for group in incidents):
+        _append_unique(
+            actions,
+            seen,
+            "核对集中聊天行为的原文、频率、持续时间和上下文，确认违反规则后再由管理员处理。",
         )
 
     ordered_issues = sorted(

@@ -29,8 +29,8 @@ from .reporting.report_result import MineSentinelRenderedReport
 from .routing import MineSentinelTargetRouter
 from .runtime_log import MineSentinelRuntimeLogTailer, build_hour_observations
 from .storage import DiskObservationStore, RecentObservationWindow
-from .template_miner import get_template_miner
-from .anomaly_detector import get_anomaly_detector
+from .template_miner import get_template_miner, reset_template_miner
+from .anomaly_detector import get_anomaly_detector, reset_anomaly_detector
 from .io_executor import build_io_executor, executor_runner, shutdown_io_executor
 
 
@@ -51,11 +51,13 @@ class MineSentinelService:
         # 委托 build_io_executor（io_workers<=0 时返回 None 回退默认池），
         # 创建独立线程池隔离 MineSentinel 的 IO 任务。
         self._io_executor: ThreadPoolExecutor | None = None
-        if io_runner is None:
+        if io_runner is None and self.config.enabled:
             self._io_executor = build_io_executor(
                 self.config.runtime_log.io_workers
             )
             self.io_runner = executor_runner(self._io_executor)
+        elif io_runner is None:
+            self.io_runner = executor_runner(None)
         else:
             self.io_runner = io_runner
         self.last_report_time = 0.0
@@ -89,13 +91,16 @@ class MineSentinelService:
         self.alerts = MineSentinelAlertEngine(self.config)
         # 初始化模板矿工和异常检测器单例（首次调用传入 config 参数），
         # 后续 runtime_log / ai_prompt 无参获取已创建的实例。
-        rt_cfg = self.config.runtime_log
-        get_template_miner(max_namespaces=rt_cfg.template_max_namespaces)
-        get_anomaly_detector(
-            max_templates_per_server=rt_cfg.anomaly_max_templates_per_server,
-            inactive_template_ttl_hours=rt_cfg.anomaly_inactive_template_ttl_hours,
-            cleanup_interval=rt_cfg.anomaly_cleanup_interval,
-        )
+        self._analysis_state_initialized = False
+        if self.config.enabled:
+            rt_cfg = self.config.runtime_log
+            get_template_miner(max_namespaces=rt_cfg.template_max_namespaces)
+            get_anomaly_detector(
+                max_templates_per_server=rt_cfg.anomaly_max_templates_per_server,
+                inactive_template_ttl_hours=rt_cfg.anomaly_inactive_template_ttl_hours,
+                cleanup_interval=rt_cfg.anomaly_cleanup_interval,
+            )
+            self._analysis_state_initialized = True
         self.runtime_log_tailer = MineSentinelRuntimeLogTailer(
             self.config.runtime_log,
             self.handle_batch,
@@ -183,6 +188,10 @@ class MineSentinelService:
         except Exception as exc:
             logger.warning(f"[MineSentinel] cleanup step failed: {exc}")
         self._io_executor = None
+        if self._analysis_state_initialized:
+            reset_template_miner()
+            reset_anomaly_detector()
+            self._analysis_state_initialized = False
 
     async def handle_batch(self, server_id: str, payload: dict):
         if not self.config.enabled:

@@ -1,8 +1,8 @@
 """Observation JSONL serialization and normalization.
 
-Rust 加速是可选的：当 ``mine_sentinel_rs`` 平台 wheel 可导入时，热路径
-(``normalize_record`` / ``record_to_json`` / ``json_line`` / ``dedupe_key``)
-全部委托给原生扩展；缺失时自动降级为纯 Python 实现，插件仍可正常加载。
+Rust 扩展仍保留 codec ABI 供兼容/等价测试，但生产路径使用 CPython 的
+``json`` 与容器操作。逐条跨 PyO3 边界并转换 Python 对象比这些 C 热路径慢；
+真正有收益的批量 Rust 加速位于 runtime hints、报告分类与 AI 采样。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from .offset_index import JsonlOffsetIndex
 _JSON_DUMPS = json.dumps
 _JSON_LOADS = json.loads
 _WS_RE = re.compile(r"\s+")
+_NATIVE_PER_RECORD_CODEC_ENABLED = False
 
 
 class ObservationRecordCodec:
@@ -44,7 +45,7 @@ class ObservationRecordCodec:
         self.include_raw = config.storage.include_raw
         self.dedupe_window_seconds = max(1, config.dedupe_window_seconds)
 
-        if _HAS_RUST:
+        if _HAS_RUST and _NATIVE_PER_RECORD_CODEC_ENABLED:
             self._rs = _RsObservationRecordCodec(
                 self.max_content_length,
                 self.max_tags_per_record,
