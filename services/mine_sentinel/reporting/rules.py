@@ -345,6 +345,14 @@ COMMUNITY_MARKERS = CATEGORY_KEYS["community"]
 CHAT_REVIEW_MARKERS = CATEGORY_KEYS["chat_review"]
 PLAYER_FEEDBACK_MARKERS = CATEGORY_KEYS["player_feedback"]
 COMMUNITY_OPS_MARKERS = CATEGORY_KEYS["community_ops"]
+COUNTER_KEY_BY_CATEGORY = {
+    "complaint": "performance",
+    "network": "network",
+    "plugin": "plugin",
+    "chat_review": "chat_review",
+    "player_feedback": "player_feedback",
+    "community_ops": "community_ops",
+}
 # URL/外链信号仅在 chat_message 标签的记录上触发 chat_review。
 # 真实日志验证：QuickShop-Hikari 等插件的更新检查日志
 # （[QuickShop-Hikari] Update here: https://modrinth.com/...）
@@ -1981,9 +1989,6 @@ class HeuristicReportBuilder:
         list[dict[str, Any]],
     ]:
         log_records = [record for record in records if record.kind == "SERVER_LOG"]
-        for record in log_records:
-            self._annotate_chat_classification(record)
-            self._annotate_ops_classification(record)
 
         # Aggregate chat-review behavior is a category-specific detector. Run it
         # only while that category is admitted, then gate records before any
@@ -2017,6 +2022,7 @@ class HeuristicReportBuilder:
             self._gate_classification_cache[cache_key] = "daily"
             return "daily"
         if "chat_flood" in record.tags or "chat_abuse" in record.tags:
+            self._annotate_chat_classification(record)
             self._gate_classification_cache[cache_key] = "chat_review"
             return "chat_review"
 
@@ -2024,6 +2030,7 @@ class HeuristicReportBuilder:
         raw_content = self._record_raw_content(record)
         level = str((record.context or {}).get("level") or "").lower()
         if self._is_benign_mechanical_record(record, raw_content, text, level):
+            self._annotate_ops_classification(record)
             self._gate_classification_cache[cache_key] = "daily"
             return "daily"
 
@@ -2088,11 +2095,47 @@ class HeuristicReportBuilder:
         proxy_ids = sorted({record.proxy_id for record in log_records if record.proxy_id})
         categories: dict[str, list[str]] = {key: [] for key in CATEGORY_KEYS}
         buckets: dict[tuple[str, str], list[ObservationRecord]] = defaultdict(list)
+        counters: dict[str, int] = {
+            "error": 0,
+            "warn": 0,
+            "performance": 0,
+            "network": 0,
+            "plugin": 0,
+            "chat_review": 0,
+            "player_feedback": 0,
+            "community_ops": 0,
+            "loop_suppressed": 0,
+            "affected_servers": 0,
+            "affected_backends": 0,
+        }
 
         for record in log_records:
             category = self.classify(record)
             tag = self.tag(record)
             buckets[(category, tag)].append(record)
+            level = self._normalized_level(
+                str((record.context or {}).get("level") or "")
+            )
+            record_tags = record.tags or ()
+            if level in {"error", "fatal", "severe"} or (
+                not level and "error" in record_tags
+            ):
+                counters["error"] += 1
+            elif (
+                level == "warn"
+                or (
+                    not level
+                    and ("warn" in record_tags or "warning" in record_tags)
+                )
+            ):
+                counters["warn"] += 1
+            counter_key = COUNTER_KEY_BY_CATEGORY.get(category)
+            if counter_key:
+                counters[counter_key] += 1
+            if "loop_suppressed" in record_tags:
+                counters["loop_suppressed"] += int(
+                    (record.context or {}).get("loopSuppressed") or 0
+                )
 
         for (category, tag), group in buckets.items():
             categories.setdefault(category, [])
@@ -2269,7 +2312,7 @@ class HeuristicReportBuilder:
             "low",
         ) if max_severity_rank else "low"
         any_alert = any(issue["should_alert"] for issue in issues)
-        ops_notes, counters = self._ops_notes(log_records, issues, max_severity, any_alert)
+        ops_notes, counters = self._ops_notes(counters, issues, max_severity, any_alert)
         window_timestamps = [record.timestamp for record in log_records if record.timestamp]
         window_start_ts = min(window_timestamps) if window_timestamps else 0
         window_end_ts = max(window_timestamps) if window_timestamps else 0
@@ -2319,12 +2362,14 @@ class HeuristicReportBuilder:
         # 才能判定为"行为"。
         if "chat_review" in self._active_priority:
             if "chat_flood" in record.tags or "chat_abuse" in record.tags:
+                self._annotate_chat_classification(record)
                 self._classification_cache[cache_key] = "chat_review"
                 return "chat_review"
         text = self._record_text(record)
         raw_content = self._record_raw_content(record)
         level = str((record.context or {}).get("level") or "").lower()
         if self._is_benign_mechanical_record(record, raw_content, text, level):
+            self._annotate_ops_classification(record)
             self._classification_cache[cache_key] = "daily"
             return "daily"
 
@@ -2972,61 +3017,17 @@ class HeuristicReportBuilder:
     # --- 运维备注（增强版）------------------------------------------------
     def _ops_notes(
         self,
-        records: list[ObservationRecord],
+        counters: dict[str, int],
         issues: list[dict[str, Any]],
         max_severity: str,
         any_alert: bool,
     ) -> tuple[list[str], dict[str, int]]:
         notes: list[str] = []
-        counters: dict[str, int] = {
-            "error": 0,
-            "warn": 0,
-            "performance": 0,
-            "network": 0,
-            "plugin": 0,
-            "chat_review": 0,
-            "player_feedback": 0,
-            "community_ops": 0,
-            "loop_suppressed": 0,
-            "affected_servers": 0,
-            "affected_backends": 0,
-        }
-
-        loop_summaries = [
-            record for record in records if "loop_suppressed" in record.tags
-        ]
-        suppressed = sum(
-            int((record.context or {}).get("loopSuppressed") or 0)
-            for record in loop_summaries
-        )
-        counters["loop_suppressed"] = suppressed
+        suppressed = counters["loop_suppressed"]
         if suppressed:
             notes.append(
                 f"已过滤 {suppressed} 条重复服务器报错循环日志，建议优先查看首条原始样本。"
             )
-
-        for record in records:
-            text = self._record_text(record)
-            if any(marker in text for marker in ERROR_MARKERS):
-                counters["error"] += 1
-            if any(marker in text for marker in WARN_MARKERS):
-                counters["warn"] += 1
-            if any(marker in text for marker in PERFORMANCE_MARKERS):
-                counters["performance"] += 1
-            if self._record_keys_match(record, text, NETWORK_MARKERS):
-                counters["network"] += 1
-            if self._record_keys_match(record, text, PLUGIN_MARKERS):
-                counters["plugin"] += 1
-            if self._category_active("chat_review") and self._record_keys_match(
-                record,
-                text,
-                CHAT_REVIEW_MARKERS,
-            ):
-                counters["chat_review"] += 1
-            if self._category_active("player_feedback") and self._category_matches(record, "player_feedback", text):
-                counters["player_feedback"] += 1
-            if self._category_active("community_ops") and self._category_matches(record, "community_ops", text):
-                counters["community_ops"] += 1
 
         affected_servers_set: set[str] = set()
         affected_backends_set: set[str] = set()

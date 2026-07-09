@@ -1585,14 +1585,34 @@ class MineSentinelRulesTests(unittest.TestCase):
         ]
         report = builder.build(records, 60)
         counters = report["counters"]
-        self.assertGreaterEqual(counters["performance"], 1)
-        self.assertGreaterEqual(counters["network"], 1)
-        self.assertGreaterEqual(counters["plugin"], 1)
-        self.assertGreaterEqual(counters["error"], 1)
+        self.assertEqual(counters["performance"], 1)
+        self.assertEqual(counters["network"], 1)
+        self.assertEqual(counters["plugin"], 1)
+        self.assertEqual(counters["error"], 1)
+        self.assertEqual(counters["warn"], 2)
         joined = " ".join(report["ops_notes"])
         self.assertIn("PERFORMANCE", joined)
         self.assertIn("NETWORK", joined)
         self.assertIn("PLUGIN", joined)
+
+    def test_ops_level_counters_ignore_keywords_in_message_body(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record(
+                "[Server thread/INFO]: Previous ERROR budget snapshot loaded",
+                level="INFO",
+            ),
+            self._make_record(
+                "[Server thread/WARN]: Previous error count was cleared",
+                level="WARN",
+                tags=["server_log", "runtime_log", "error"],
+            ),
+        ]
+
+        counters = builder.build(records, 60)["counters"]
+
+        self.assertEqual(counters["error"], 0)
+        self.assertEqual(counters["warn"], 1)
 
     def test_suggest_action_per_category(self):
         """不同分类应当给出有针对性的推荐动作。"""
@@ -2022,9 +2042,18 @@ class MineSentinelRulesTests(unittest.TestCase):
         builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
         records = [
             self._make_record(
-                "[Async Chat Thread]: <A> 辱骂玩家",
+                "[Async Chat Thread]: <A> discord.gg/spam",
                 level="INFO",
                 server_id="survival",
+                tags=["server_log", "runtime_log", "chat_message"],
+                context={"chatPlayer": "A", "chatMessage": "discord.gg/spam"},
+            ),
+            self._make_record(
+                "[Async Chat Thread]: <A> discord.gg/spam-again",
+                level="INFO",
+                server_id="survival",
+                tags=["server_log", "runtime_log", "chat_message"],
+                context={"chatPlayer": "A", "chatMessage": "discord.gg/spam-again"},
             ),
             self._make_record(
                 "[Async Chat Thread]: <B> 建议加个新功能",
@@ -2039,9 +2068,9 @@ class MineSentinelRulesTests(unittest.TestCase):
         ]
         report = builder.build(records, 60)
         counters = report["counters"]
-        self.assertGreaterEqual(counters["chat_review"], 1)
-        self.assertGreaterEqual(counters["player_feedback"], 1)
-        self.assertGreaterEqual(counters["community_ops"], 1)
+        self.assertEqual(counters["chat_review"], 2)
+        self.assertEqual(counters["player_feedback"], 1)
+        self.assertEqual(counters["community_ops"], 1)
         joined = " ".join(report["ops_notes"])
         self.assertIn("聊天审查", joined)
         self.assertIn("玩家建议", joined)
@@ -3478,6 +3507,23 @@ class MineSentinelRulesTests(unittest.TestCase):
         )
         report = builder.build([record], 60, "survival")
         self.assertTrue(report["issues"])
+
+    def test_daily_noise_skips_ops_classification(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+
+        def unexpected_ops_classification(_record):
+            self.fail("daily noise should return before ops classification")
+
+        builder._classify_ops_log = unexpected_ops_classification
+        record = self._make_record(
+            "[Server thread/INFO]: Steve joined the game",
+            tags=["server_log", "runtime_log", "daily_noise"],
+        )
+
+        report = builder.build([record], 60, "survival")
+
+        self.assertEqual(report["log_count"], 1)
+        self.assertEqual(report["issues"], [])
 
     # --- PR10: daily_noise 过滤 / Vulcan 检测 / 聊天热点 ---
     def test_daily_noise_record_classified_as_daily(self):
