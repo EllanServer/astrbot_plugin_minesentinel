@@ -1552,21 +1552,18 @@ def _detect_player_floods(
 ) -> list[dict[str, Any]]:
     """检测单个玩家的刷屏事件。"""
     floods: list[dict[str, Any]] = []
-    seen_windows: set[tuple[str, int, int]] = set()  # 避免重复事件
+    timestamps = [record.timestamp or 0 for record in records]
 
     # 1. 高频刷屏：30 秒滑窗内 >=8 条消息（轰炸级别，避免误判活跃玩家）
+    window_stop = 0
     for i, start_record in enumerate(records):
         window_start = start_record.timestamp or 0
         window_end = window_start + _CHAT_FLOOD_HIGH_FREQ_WINDOW_MS
-        window_records = [
-            r for r in records[i:]
-            if (r.timestamp or 0) >= window_start and (r.timestamp or 0) <= window_end
-        ]
+        window_stop = max(window_stop, i)
+        while window_stop < len(records) and timestamps[window_stop] <= window_end:
+            window_stop += 1
+        window_records = records[i:window_stop]
         if len(window_records) >= _CHAT_FLOOD_HIGH_FREQ_COUNT:
-            key = ("high_frequency", window_start, window_end)
-            if key in seen_windows:
-                continue
-            seen_windows.add(key)
             floods.append(_make_flood_event(
                 player, "high_frequency", window_start,
                 window_records[-1].timestamp or window_end,
@@ -1580,23 +1577,21 @@ def _detect_player_floods(
         (r, _normalize_message(str((r.context or {}).get("chatMessage") or "")))
         for r in records
     ]
+    window_stop = 0
     for i, (start_record, start_norm) in enumerate(normalized_list):
         if not start_norm:
             continue
         window_start = start_record.timestamp or 0
         window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
+        window_stop = max(window_stop, i)
+        while window_stop < len(records) and timestamps[window_stop] <= window_end:
+            window_stop += 1
         similar = [
-            r for r, norm in normalized_list[i:]
-            if (r.timestamp or 0) >= window_start
-            and (r.timestamp or 0) <= window_end
-            and norm
+            r for r, norm in normalized_list[i:window_stop]
+            if norm
             and (norm == start_norm or _is_similar(norm, start_norm))
         ]
         if len(similar) >= _CHAT_FLOOD_REPEAT_COUNT:
-            key = ("repeat_content", window_start, window_end)
-            if key in seen_windows:
-                continue
-            seen_windows.add(key)
             floods.append(_make_flood_event(
                 player, "repeat_content", window_start,
                 similar[-1].timestamp or window_end,
@@ -1609,18 +1604,19 @@ def _detect_player_floods(
         r for r in records
         if _detect_meaningless_message(str((r.context or {}).get("chatMessage") or ""))
     ]
+    meaningless_timestamps = [record.timestamp or 0 for record in meaningless_records]
+    window_stop = 0
     for i, start_record in enumerate(meaningless_records):
         window_start = start_record.timestamp or 0
         window_end = window_start + _CHAT_FLOOD_REPEAT_WINDOW_MS
-        window_records = [
-            r for r in meaningless_records[i:]
-            if (r.timestamp or 0) >= window_start and (r.timestamp or 0) <= window_end
-        ]
+        window_stop = max(window_stop, i)
+        while (
+            window_stop < len(meaningless_records)
+            and meaningless_timestamps[window_stop] <= window_end
+        ):
+            window_stop += 1
+        window_records = meaningless_records[i:window_stop]
         if len(window_records) >= _CHAT_FLOOD_MEANINGLESS_COUNT:
-            key = ("meaningless", window_start, window_end)
-            if key in seen_windows:
-                continue
-            seen_windows.add(key)
             floods.append(_make_flood_event(
                 player, "meaningless", window_start,
                 window_records[-1].timestamp or window_end,
@@ -1662,25 +1658,32 @@ def _is_similar(norm_a: str, norm_b: str) -> bool:
             return True
     # 4. 仅对中等长度消息（3-8 字符）用编辑距离，处理个别字符差异
     max_len = max(len(norm_a), len(norm_b))
-    if 3 <= max_len <= 8 and _edit_distance(norm_a, norm_b) <= 1:
+    if 3 <= max_len <= 8 and _edit_distance_at_most_one(norm_a, norm_b):
         return True
     return False
 
 
-def _edit_distance(a: str, b: str) -> int:
-    """计算两个字符串的编辑距离（Levenshtein）。"""
-    if len(a) < len(b):
-        a, b = b, a
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            cost = 0 if ca == cb else 1
-            curr.append(min(curr[-1] + 1, prev[j + 1] + 1, prev[j] + cost))
-        prev = curr
-    return prev[-1]
+def _edit_distance_at_most_one(a: str, b: str) -> bool:
+    """Return whether two strings are at most one edit apart."""
+    length_delta = len(a) - len(b)
+    if abs(length_delta) > 1:
+        return False
+    if length_delta == 0:
+        return sum(left != right for left, right in zip(a, b)) <= 1
+    longer, shorter = (a, b) if length_delta > 0 else (b, a)
+    longer_index = 0
+    shorter_index = 0
+    skipped = False
+    while shorter_index < len(shorter):
+        if longer[longer_index] == shorter[shorter_index]:
+            longer_index += 1
+            shorter_index += 1
+            continue
+        if skipped:
+            return False
+        skipped = True
+        longer_index += 1
+    return True
 
 
 def _make_flood_event(

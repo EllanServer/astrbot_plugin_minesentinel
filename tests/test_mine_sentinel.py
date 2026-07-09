@@ -2604,6 +2604,64 @@ class MineSentinelRulesTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(section["bullets"] for section in sections))
+        self.assertNotIn(
+            "server_log_",
+            " ".join(
+                bullet
+                for section in sections
+                for bullet in section["bullets"]
+            ),
+        )
+
+    def test_five_sections_aggregate_incidents_and_humanize_category_lines(self):
+        from services.mine_sentinel.reporting.sections import build_report_sections
+
+        report = {
+            "summary": "最近 60 分钟收到 20 条 Minecraft 运行日志观察。",
+            "servers": ["survival"],
+            "max_severity": "high",
+            "issues": [
+                {
+                    "category": "plugin",
+                    "tag": "server_log_plugin",
+                    "severity": "medium",
+                    "evidence_count": 2,
+                    "affected_servers": ["survival"],
+                    "ops_subtypes": ["插件依赖缺失"],
+                    "suggested_action": "检查依赖插件和加载顺序。",
+                },
+                {
+                    "category": "plugin",
+                    "tag": "server_log_plugin",
+                    "severity": "high",
+                    "evidence_count": 3,
+                    "affected_servers": ["survival"],
+                    "ops_subtypes": ["插件依赖缺失"],
+                    "suggested_action": "检查依赖插件和加载顺序。",
+                },
+            ],
+            "categories": {
+                "complaint": [
+                    "server_log_performance_observation: 2 条运行日志，级别 INFO, WARN，服务器 survival。"
+                ]
+            },
+            "ops_notes": [],
+        }
+
+        sections = build_report_sections(report)
+        overall = sections[0]["bullets"]
+        incidents = sections[1]["bullets"]
+        player_problems = sections[3]["bullets"]
+
+        self.assertEqual(len(overall), 2)
+        self.assertIn("监控范围：survival", overall[1])
+        self.assertEqual(len(incidents), 1)
+        self.assertIn("高风险·插件依赖缺失", incidents[0])
+        self.assertIn("5 条证据", incidents[0])
+        self.assertNotIn("。。", incidents[0])
+        self.assertIn("服务器性能异常观察", player_problems[0])
+        self.assertIn("级别 信息、警告", player_problems[0])
+        self.assertNotIn("server_log_", " ".join(incidents + player_problems))
 
     def test_ai_normalizer_sanitizes_and_completes_report_sections(self):
         from services.mine_sentinel.reporting.ai_normalizer import AIReportNormalizer
@@ -4119,6 +4177,61 @@ class MineSentinelRulesTests(unittest.TestCase):
         spammer = next((p for p in flood_players if p["player"] == "Spammer"), None)
         self.assertIsNotNone(spammer, "Spammer 应在刷屏玩家列表中")
         self.assertIn("repeat_content", spammer["flood_types"])
+
+    def test_chat_similarity_fast_path_matches_levenshtein_threshold(self):
+        from itertools import product
+        from services.mine_sentinel.runtime_log import _edit_distance_at_most_one
+
+        def reference_distance(left, right):
+            previous = list(range(len(right) + 1))
+            for left_index, left_char in enumerate(left, start=1):
+                current = [left_index]
+                for right_index, right_char in enumerate(right, start=1):
+                    current.append(
+                        min(
+                            current[-1] + 1,
+                            previous[right_index] + 1,
+                            previous[right_index - 1] + (left_char != right_char),
+                        )
+                    )
+                previous = current
+            return previous[-1]
+
+        values = [
+            "".join(chars)
+            for length in range(5)
+            for chars in product("ab", repeat=length)
+        ]
+        for left in values:
+            for right in values:
+                self.assertEqual(
+                    _edit_distance_at_most_one(left, right),
+                    reference_distance(left, right) <= 1,
+                    (left, right),
+                )
+
+    def test_issue_evidence_dedupes_single_digit_counter_changes(self):
+        builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+        records = [
+            self._make_record(
+                "[Vulcan] dxe_explode failed Ground Spoof (Type B) (4/5)",
+                timestamp=1,
+            ),
+            self._make_record(
+                "[Vulcan] dxe_explode failed Ground Spoof (Type B) (5/5)",
+                timestamp=2,
+            ),
+            self._make_record(
+                "[Vulcan] dxe_explode failed Ground Spoof (Type A) (1/15)",
+                timestamp=3,
+            ),
+        ]
+
+        samples = builder._issue_evidence_samples(records, "community", 3)
+
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(sum("Type B" in sample for sample in samples), 1)
+        self.assertEqual(sum("Type A" in sample for sample in samples), 1)
 
     def test_chat_flood_not_triggered_for_normal_chat(self):
         """正常聊天（低频、内容不重复）不应被误判为刷屏。"""
@@ -7681,6 +7794,16 @@ class MineSentinelRealLogPbfhCaITests(unittest.TestCase):
             ["overall", "incidents", "community", "player_problems", "risk_actions"],
         )
         self.assertTrue(all(section["bullets"] for section in sections))
+        all_bullets = [
+            bullet
+            for section in sections
+            for bullet in section["bullets"]
+        ]
+        self.assertNotIn("server_log_", " ".join(all_bullets))
+        self.assertEqual(
+            len(sections[1]["bullets"]),
+            len(set(sections[1]["bullets"])),
+        )
 
         prompt = AIReportPromptBuilder(self.config).build(
             self.records,

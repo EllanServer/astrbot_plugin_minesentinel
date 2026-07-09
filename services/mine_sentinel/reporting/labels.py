@@ -29,6 +29,7 @@ GENERIC_TAG_TITLES = {
     "server_log_fatal": "服务器严重错误日志",
     "server_log_severe": "服务器严重错误日志",
     "server_log_performance": "服务器性能异常日志",
+    "server_log_anticheat_vulcan": "Vulcan 反作弊告警",
     "server_log_loop_warn": "重复警告日志",
     "server_log_loop_error": "重复错误日志",
     "server_log_loop_fatal": "重复严重错误日志",
@@ -88,7 +89,17 @@ class LabelCatalog:
         tag = value.strip().lower()
         if not tag:
             return ""
-        return self.tag_titles.get(tag) or self.generic_tag_titles.get(tag) or ""
+        title = self.tag_titles.get(tag) or self.generic_tag_titles.get(tag)
+        if title:
+            return title
+        if tag.endswith("_observation"):
+            base_tag = tag.removesuffix("_observation")
+            base_title = self.tag_titles.get(base_tag) or self.generic_tag_titles.get(
+                base_tag
+            )
+            if base_title:
+                return f"{base_title.removesuffix('日志')}观察"
+        return ""
 
     def looks_like_raw_tag(self, value: str) -> bool:
         text = value.strip()

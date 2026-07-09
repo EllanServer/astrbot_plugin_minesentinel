@@ -3117,9 +3117,9 @@ class HeuristicReportBuilder:
         - 连续 10 条以上 = 恶意刷屏
 
         三类刷屏：
-        1. high_frequency: 60 秒内同一玩家发送 >=5 条消息
+        1. high_frequency: 30 秒内同一玩家发送 >=8 条消息
         2. repeat_content: 5 分钟内同一玩家发送 >=5 条相同/高度相似消息
-        3. meaningless: 5 分钟内同一玩家发送 >=5 条无意义符号消息
+        3. meaningless: 5 分钟内同一玩家发送 >=3 条无意义符号消息
 
         返回 flood_events 列表（用于 chat_topics.flood_players 呈现给 LLM）。
         """
@@ -3133,8 +3133,6 @@ class HeuristicReportBuilder:
         if not floods_by_player:
             return []
 
-        # 收集所有参与刷屏的记录 eventId，给它们打 chat_flood 标签
-        flood_event_ids: set[str] = set()
         flood_events: list[dict[str, Any]] = []
         for player, events in floods_by_player.items():
             for event in events:
@@ -4110,7 +4108,7 @@ class HeuristicReportBuilder:
         text = self._record_text(record) or sample
         text = re.sub(r"@[0-9a-f]{4,}\b", "@<id>", text)
         text = re.sub(r"\(conn=\d+\)", "(conn=<n>)", text)
-        text = re.sub(r"\b\d{2,}\b", "<n>", text)
+        text = re.sub(r"\b\d+\b", "<n>", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:260]
 
