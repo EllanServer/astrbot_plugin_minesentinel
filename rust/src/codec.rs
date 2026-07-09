@@ -230,7 +230,9 @@ impl ObservationRecordCodec {
         let mut hasher = Blake2bVar::new(16).expect("blake2b 16 bytes");
         hasher.update(raw.as_bytes());
         let mut out = [0u8; 16];
-        hasher.finalize_variable(&mut out);
+        hasher
+            .finalize_variable(&mut out)
+            .expect("blake2b output buffer matches configured length");
         Ok(format!("h:{}", hex_encode(&out)))
     }
 }

@@ -1787,6 +1787,7 @@ class MineSentinelRulesTests(unittest.TestCase):
         from tests.mine_sentinel_rs_stub import report_category_features_batch_stub
 
         original = rules_module._rs_report_category_features_batch
+        original_min_records = rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS
         calls = []
 
         def native_features(records, groups):
@@ -1795,6 +1796,7 @@ class MineSentinelRulesTests(unittest.TestCase):
 
         try:
             rules_module._rs_report_category_features_batch = native_features
+            rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS = 1
             builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
             record = self._make_record("socket closed by remote peer", level="INFO")
             builder._prepare_native_category_features([record])
@@ -1813,6 +1815,7 @@ class MineSentinelRulesTests(unittest.TestCase):
             )
         finally:
             rules_module._rs_report_category_features_batch = original
+            rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS = original_min_records
 
         self.assertTrue(matched)
         self.assertEqual(calls, [1])
@@ -1821,12 +1824,14 @@ class MineSentinelRulesTests(unittest.TestCase):
         from services.mine_sentinel.reporting import rules as rules_module
 
         original = rules_module._rs_report_category_features_batch
+        original_min_records = rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS
 
         def broken_native_features(_records, _groups):
             raise RuntimeError("incompatible native wheel")
 
         try:
             rules_module._rs_report_category_features_batch = broken_native_features
+            rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS = 1
             builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
             record = self._make_record(
                 "io.netty connection reset by peer",
@@ -1835,10 +1840,29 @@ class MineSentinelRulesTests(unittest.TestCase):
             report = builder.build([record], 60, "survival")
         finally:
             rules_module._rs_report_category_features_batch = original
+            rules_module.NATIVE_CATEGORY_BATCH_MIN_RECORDS = original_min_records
 
         self.assertEqual(builder.classify(record), "network")
         self.assertEqual(report["categories"]["network"][0].split(":", 1)[0], "server_log_network")
         self.assertEqual(builder._native_category_feature_cache, {})
+
+    def test_small_report_skips_native_category_batch(self):
+        from services.mine_sentinel.reporting import rules as rules_module
+
+        original = rules_module._rs_report_category_features_batch
+
+        def unexpected_native_features(_records, _groups):
+            self.fail("small windows should keep lazy Python classification")
+
+        try:
+            rules_module._rs_report_category_features_batch = unexpected_native_features
+            builder = HeuristicReportBuilder(MineSentinelConfig.from_dict({}))
+            record = self._make_record("socket closed by remote peer", level="INFO")
+            report = builder.build([record], 60, "survival")
+        finally:
+            rules_module._rs_report_category_features_batch = original
+
+        self.assertEqual(report["log_count"], 1)
 
     def test_chat_review_ad_keyword_removed_no_false_positive(self):
         """'ad' 关键词已移除，独立 'ad' 不再触发 chat_review（避免误判）。

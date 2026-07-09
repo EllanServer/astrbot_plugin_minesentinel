@@ -375,6 +375,7 @@ CATEGORY_FEATURE_GROUPS = tuple(
     for category, keys in CATEGORY_KEYS.items()
     if keys
 )
+NATIVE_CATEGORY_BATCH_MIN_RECORDS = 8000
 # URL/外链信号仅在 chat_message 标签的记录上触发 chat_review。
 # 真实日志验证：QuickShop-Hikari 等插件的更新检查日志
 # （[QuickShop-Hikari] Update here: https://modrinth.com/...）
@@ -2041,7 +2042,10 @@ class HeuristicReportBuilder:
         self,
         records: list[ObservationRecord],
     ) -> None:
-        if not records or _rs_report_category_features_batch is None:
+        if (
+            len(records) < NATIVE_CATEGORY_BATCH_MIN_RECORDS
+            or _rs_report_category_features_batch is None
+        ):
             return
         try:
             masks = _rs_report_category_features_batch(

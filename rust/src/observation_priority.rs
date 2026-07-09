@@ -3,9 +3,11 @@
 //! The `observation_priority_score` runs once per SERVER_LOG record inside
 //! `RecentWindowBuilder.add`, so keep it small and allocation-light.
 
+use aho_corasick::{AhoCorasick, BuildError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt as _;
+use std::collections::HashMap;
 
 /// Score records that should survive bounded-memory report sampling.
 /// `record` is the Python `ObservationRecord` object. The second argument is
@@ -54,6 +56,8 @@ pub fn report_category_features_batch(
     records: &Bound<PyAny>,
     groups: Vec<(u64, Vec<String>)>,
 ) -> PyResult<Vec<u64>> {
+    let matcher = CategoryMatcher::new(&groups)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
     let mut masks = Vec::new();
     for item in records.try_iter()? {
         let record = item?;
@@ -68,42 +72,73 @@ pub fn report_category_features_batch(
             text.push_str(&tag.to_lowercase());
             text.push(' ');
         }
-        let mut mask = 0_u64;
-        for (bit, keys) in &groups {
-            if category_keys_match(&text, keys) {
-                mask |= bit;
-            }
-        }
-        masks.push(mask);
+        masks.push(matcher.mask(&text));
     }
     Ok(masks)
 }
 
-fn category_keys_match(text: &str, keys: &[String]) -> bool {
-    keys.iter().any(|key| {
-        if is_short_ascii_word(key) {
-            contains_ascii_word(text, key)
-        } else {
-            text.contains(key)
+struct CategoryMatcher {
+    word_bits: HashMap<String, u64>,
+    substring_matcher: Option<AhoCorasick>,
+    substring_bits: Vec<u64>,
+}
+
+impl CategoryMatcher {
+    fn new(groups: &[(u64, Vec<String>)]) -> Result<Self, BuildError> {
+        let mut word_bits = HashMap::new();
+        let mut substring_masks: HashMap<String, u64> = HashMap::new();
+        for (bit, keys) in groups {
+            for key in keys {
+                if is_short_ascii_word(key) {
+                    *word_bits.entry(key.clone()).or_insert(0) |= bit;
+                } else {
+                    *substring_masks.entry(key.clone()).or_insert(0) |= bit;
+                }
+            }
         }
-    })
+        let (substring_patterns, substring_bits): (Vec<String>, Vec<u64>) =
+            substring_masks.into_iter().unzip();
+        let substring_matcher = if substring_patterns.is_empty() {
+            None
+        } else {
+            Some(AhoCorasick::new(&substring_patterns)?)
+        };
+        Ok(Self {
+            word_bits,
+            substring_matcher,
+            substring_bits,
+        })
+    }
+
+    fn mask(&self, text: &str) -> u64 {
+        let mut mask = 0_u64;
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            while index < bytes.len() && !is_ascii_token_byte(bytes[index]) {
+                index += 1;
+            }
+            let start = index;
+            while index < bytes.len() && is_ascii_token_byte(bytes[index]) {
+                index += 1;
+            }
+            if start < index {
+                if let Some(bits) = self.word_bits.get(&text[start..index]) {
+                    mask |= bits;
+                }
+            }
+        }
+        if let Some(matcher) = &self.substring_matcher {
+            for matched in matcher.find_overlapping_iter(text) {
+                mask |= self.substring_bits[matched.pattern().as_usize()];
+            }
+        }
+        mask
+    }
 }
 
 fn is_short_ascii_word(value: &str) -> bool {
     !value.is_empty() && value.len() <= 6 && value.bytes().all(|byte| byte.is_ascii_alphabetic())
-}
-
-fn contains_ascii_word(text: &str, word: &str) -> bool {
-    let bytes = text.as_bytes();
-    for (start, _) in text.match_indices(word) {
-        let end = start + word.len();
-        let left_boundary = start == 0 || !is_ascii_token_byte(bytes[start - 1]);
-        let right_boundary = end == bytes.len() || !is_ascii_token_byte(bytes[end]);
-        if left_boundary && right_boundary {
-            return true;
-        }
-    }
-    false
 }
 
 fn is_ascii_token_byte(value: u8) -> bool {
@@ -343,27 +378,32 @@ pub fn register(parent: &Bound<PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{category_keys_match, contains_ascii_word};
+    use super::CategoryMatcher;
 
     #[test]
     fn short_words_require_ascii_token_boundaries() {
-        assert!(contains_ascii_word("player can fly now", "fly"));
-        assert!(!contains_ascii_word("butterfly effect", "fly"));
-        assert!(contains_ascii_word("玩家fly玩家", "fly"));
-        assert!(contains_ascii_word("vl=12", "vl"));
-        assert!(!contains_ascii_word("level=12", "vl"));
+        let matcher =
+            CategoryMatcher::new(&[(1, vec!["fly".to_string(), "vl".to_string()])]).unwrap();
+        assert_eq!(matcher.mask("player can fly now"), 1);
+        assert_eq!(matcher.mask("butterfly effect"), 0);
+        assert_eq!(matcher.mask("玩家fly玩家"), 1);
+        assert_eq!(matcher.mask("vl=12"), 1);
+        assert_eq!(matcher.mask("level=12"), 0);
     }
 
     #[test]
     fn category_groups_mix_words_phrases_and_unicode() {
-        let keys = vec![
-            "lag".to_string(),
-            "connection timed out".to_string(),
-            "连接超时".to_string(),
-        ];
-        assert!(category_keys_match("server lag detected", &keys));
-        assert!(!category_keys_match("flag plugin enabled", &keys));
-        assert!(category_keys_match("proxy connection timed out", &keys));
-        assert!(category_keys_match("后端连接超时", &keys));
+        let matcher = CategoryMatcher::new(&[
+            (
+                1,
+                vec!["lag".to_string(), "connection timed out".to_string()],
+            ),
+            (2, vec!["连接超时".to_string(), "timed out".to_string()]),
+        ])
+        .unwrap();
+        assert_eq!(matcher.mask("server lag detected"), 1);
+        assert_eq!(matcher.mask("flag plugin enabled"), 0);
+        assert_eq!(matcher.mask("proxy connection timed out"), 3);
+        assert_eq!(matcher.mask("后端连接超时"), 2);
     }
 }

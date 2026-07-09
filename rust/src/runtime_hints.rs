@@ -136,6 +136,7 @@ fn sanitize_transport_text(text: &str) -> String {
     redacted.trim().to_string()
 }
 
+#[cfg(test)]
 fn sanitize_line(line: &str) -> String {
     let transport = strip_transport_text(line);
     sanitize_transport_text(&transport.text)
@@ -164,6 +165,7 @@ struct CleanedLog {
     flags: Vec<&'static str>,
 }
 
+#[cfg(test)]
 fn clean_for_llm(line: &str) -> CleanedLog {
     let transport = strip_transport_text(line);
     clean_transport_for_llm(&transport.text, transport.control_stripped)
@@ -278,6 +280,7 @@ fn detect_log_line_kind(content: &str) -> Option<&'static str> {
         .then_some("stacktrace_frame")
 }
 
+#[cfg(test)]
 fn fingerprint(line: &str) -> String {
     fingerprint_sanitized(&sanitize_line(line))
 }

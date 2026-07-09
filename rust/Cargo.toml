@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # PyO3 0.29 原生支持 CPython 3.14。extension-module 模式产出 .so/.pyd。
 pyo3 = { version = "0.29", features = ["extension-module"] }
+aho-corasick = "1"
 blake2 = "0.10"
 # In-Rust JSON serialization: removes the per-record PyO3 → json.dumps callback
 # (was the dominant cost in json_line / compact_value's fallback path).
