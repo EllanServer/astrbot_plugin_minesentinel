@@ -104,6 +104,16 @@ class MineSentinelReportConfig:
     max_records_in_memory: int = 50000
     max_ai_prompt_chars: int = 100000
     max_ai_content_length: int = 240
+    ai_diagnosis_enabled: bool = True
+    ai_context_radius: int = 40
+    ai_context_line_chars: int = 1000
+    ai_context_expansion_rounds: int = 2
+    ai_max_context_radius: int = 160
+    ai_max_diagnosed_issues: int = 8
+    ai_tools_enabled: bool = True
+    ai_web_search_enabled: bool = True
+    ai_max_web_search_queries: int = 2
+    ai_tool_timeout_seconds: int = 45
     send_full_log_file: bool = True
     send_as_image: bool = True
     # PR9: 导出附件优化——压缩格式 + 同窗口复用
@@ -253,6 +263,17 @@ class MineSentinelConfig:
         default_window_minutes = _positive_int(
             report_data.get("default_window_minutes"),
             interval_minutes,
+        )
+        ai_context_radius = min(
+            200,
+            _positive_int(report_data.get("ai_context_radius"), 40),
+        )
+        ai_max_context_radius = max(
+            ai_context_radius,
+            min(
+                400,
+                _positive_int(report_data.get("ai_max_context_radius"), 160),
+            ),
         )
         retention_minutes = _positive_int(
             data.get("retention_minutes"),
@@ -422,6 +443,52 @@ class MineSentinelConfig:
                 max_ai_content_length=_positive_int(
                     report_data.get("max_ai_content_length"),
                     240,
+                ),
+                ai_diagnosis_enabled=_as_bool(
+                    report_data.get("ai_diagnosis_enabled"),
+                    True,
+                ),
+                ai_context_radius=ai_context_radius,
+                ai_context_line_chars=min(
+                    4000,
+                    max(
+                        240,
+                        _as_int(report_data.get("ai_context_line_chars"), 1000),
+                    ),
+                ),
+                ai_context_expansion_rounds=min(
+                    4,
+                    max(
+                        0,
+                        _as_int(
+                            report_data.get("ai_context_expansion_rounds"),
+                            2,
+                        ),
+                    ),
+                ),
+                ai_max_context_radius=ai_max_context_radius,
+                ai_max_diagnosed_issues=min(
+                    24,
+                    _positive_int(report_data.get("ai_max_diagnosed_issues"), 8),
+                ),
+                ai_tools_enabled=_as_bool(
+                    report_data.get("ai_tools_enabled"),
+                    True,
+                ),
+                ai_web_search_enabled=_as_bool(
+                    report_data.get("ai_web_search_enabled"),
+                    True,
+                ),
+                ai_max_web_search_queries=min(
+                    5,
+                    max(
+                        0,
+                        _as_int(report_data.get("ai_max_web_search_queries"), 2),
+                    ),
+                ),
+                ai_tool_timeout_seconds=min(
+                    120,
+                    _positive_int(report_data.get("ai_tool_timeout_seconds"), 45),
                 ),
                 send_full_log_file=_as_bool(report_data.get("send_full_log_file"), True),
                 send_as_image=_as_bool(report_data.get("send_as_image"), True),

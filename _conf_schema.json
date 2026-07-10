@@ -322,6 +322,56 @@
             "type": "int",
             "description": "提交给 AI 的单条 observation 内容最大长度",
             "default": 240
+          },
+          "ai_diagnosis_enabled": {
+            "type": "bool",
+            "description": "启用事件级 AI 诊断：基于命中原文上下文生成初步判断和建议",
+            "default": true
+          },
+          "ai_context_radius": {
+            "type": "int",
+            "description": "事件级 AI 初次诊断读取命中行前后各多少条原文；默认各 40 条",
+            "default": 40
+          },
+          "ai_context_line_chars": {
+            "type": "int",
+            "description": "事件上下文每条原文提交给 AI 的最大字符数；隐私字段仍会脱敏",
+            "default": 1000
+          },
+          "ai_context_expansion_rounds": {
+            "type": "int",
+            "description": "证据不足时允许 AI 请求 expand_context 的追加轮数，范围 0-4",
+            "default": 2
+          },
+          "ai_max_context_radius": {
+            "type": "int",
+            "description": "AI 单次扩展上下文请求允许读取中心记录前后各多少条的上限",
+            "default": 160
+          },
+          "ai_max_diagnosed_issues": {
+            "type": "int",
+            "description": "单份报告最多进行事件级 AI 深度诊断的重点 issue 数",
+            "default": 8
+          },
+          "ai_tools_enabled": {
+            "type": "bool",
+            "description": "允许事件诊断 AI 请求受限工具；当前提供上下文扩展和可选网页搜索",
+            "default": true
+          },
+          "ai_web_search_enabled": {
+            "type": "bool",
+            "description": "允许 AI 通过 AstrBot 已配置并启用的内置网页搜索工具核对插件官方资料；不会自行配置搜索密钥",
+            "default": true
+          },
+          "ai_max_web_search_queries": {
+            "type": "int",
+            "description": "每个重点 issue 最多允许的网页搜索次数，范围 0-5",
+            "default": 2
+          },
+          "ai_tool_timeout_seconds": {
+            "type": "int",
+            "description": "单次 AstrBot 网页搜索工具调用超时秒数，最大 120 秒",
+            "default": 45
           }
         }
       },

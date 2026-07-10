@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from .incidents import IncidentGroup, IncidentGrouper, IssuePolicy, issue_sort_key
 from .incident_format import (
@@ -602,6 +603,9 @@ def _incident_event_summary(index: int, group: IncidentGroup) -> str:
             f"建议处理：{_incident_recommended_action(group)}",
         ]
     )
+    research_sources = _incident_research_sources(group)
+    if research_sources:
+        lines.append(f"参考来源：{research_sources}")
     return "\n".join(lines)
 
 
@@ -728,9 +732,24 @@ def _group_status(group: IncidentGroup) -> str:
 
 def _evidence_strength_line(group: IncidentGroup) -> str:
     labels = set(_unique_issue_values(list(group.issues), "chat_labels"))
+    details: list[str] = []
     if group.family == "community" and labels & {"外挂举报", "飞行举报", "透视/Xray", "自动挖矿"}:
-        return "聊天证据为主，暂缺反作弊日志、视频或管理员确认"
-    return ""
+        details.append("聊天证据为主，暂缺反作弊日志、视频或管理员确认")
+    diagnoses = [
+        issue.get("ai_diagnosis")
+        for issue in group.issues
+        if isinstance(issue.get("ai_diagnosis"), dict)
+    ]
+    if diagnoses:
+        radius = max(int(item.get("context_radius") or 0) for item in diagnoses)
+        context_count = max(int(item.get("context_records") or 0) for item in diagnoses)
+        ai_detail = f"AI 已复核命中行前后各 {radius} 条原文"
+        if any(item.get("expanded") for item in diagnoses):
+            ai_detail += f"，并智能扩展至 {context_count} 条上下文记录"
+        if any(item.get("web_researched") for item in diagnoses):
+            ai_detail += "，已辅助检索外部资料"
+        details.append(ai_detail)
+    return "；".join(details)
 
 
 def _impact_scope(group: IncidentGroup) -> str:
@@ -754,6 +773,9 @@ def _impact_scope(group: IncidentGroup) -> str:
 
 
 def _incident_judgement_line(group: IncidentGroup) -> str:
+    ai_assessment = _incident_ai_assessment(group)
+    if ai_assessment:
+        return ai_assessment
     labels = set(_unique_issue_values(list(group.issues), "chat_labels"))
     if _is_auth_security_group(group):
         return "这是服务端明确输出的认证配置风险，不是玩家聊天反馈；是否可接受取决于后端是否只能由受控代理访问。"
@@ -768,8 +790,63 @@ def _incident_judgement_line(group: IncidentGroup) -> str:
     return _judgement(group)
 
 
+def _incident_ai_assessment(group: IncidentGroup) -> str:
+    assessments: list[str] = []
+    seen: set[str] = set()
+    for issue in sorted(group.issues, key=issue_sort_key):
+        if not isinstance(issue.get("ai_diagnosis"), dict):
+            continue
+        assessment = _clean_sentence(str(issue.get("ai_assessment") or "").strip())
+        key = _dedupe_key(assessment)
+        if not assessment or key in seen:
+            continue
+        seen.add(key)
+        assessments.append(assessment.rstrip("。"))
+        if len(assessments) >= 2:
+            break
+    return "；".join(assessments) + ("。" if assessments else "")
+
+
+def _ai_incident_action(issues: list[dict[str, Any]]) -> str:
+    ai_issues = [
+        issue
+        for issue in issues
+        if issue.get("ai_diagnosis") or issue.get("ai_suggested_action")
+    ]
+    return _incident_action(ai_issues)
+
+
+def _incident_research_sources(group: IncidentGroup) -> str:
+    sources: list[str] = []
+    seen: set[str] = set()
+    for issue in sorted(group.issues, key=issue_sort_key):
+        diagnosis = issue.get("ai_diagnosis")
+        if not isinstance(diagnosis, dict):
+            continue
+        for source in diagnosis.get("research_sources") or []:
+            if not isinstance(source, dict):
+                continue
+            url = str(source.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = str(source.get("title") or "").strip()
+            try:
+                host = urlparse(url).netloc
+            except ValueError:
+                host = ""
+            label = title or host or "外部资料"
+            sources.append(f"{label}：{url}")
+            if len(sources) >= 2:
+                return "；".join(sources)
+    return "；".join(sources)
+
+
 def _incident_recommended_action(group: IncidentGroup) -> str:
     issues = list(group.issues)
+    ai_action = _ai_incident_action(issues)
+    if ai_action:
+        return ai_action
     ops_subtypes = set(_unique_issue_values(issues, "ops_subtypes"))
     labels = set(_unique_issue_values(issues, "chat_labels"))
     if _is_auth_security_group(group):

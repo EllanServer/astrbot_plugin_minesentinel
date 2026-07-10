@@ -30,24 +30,26 @@ class MineSentinelReportImageRenderer:
     """Render an incident-level MineSentinel report as a QQ-friendly PNG."""
 
     WIDTH = 1200
-    OUTER_PAD = 34
-    CARD_PAD = 28
+    OUTER_PAD = 38
+    CARD_PAD = 30
     CONTENT_W = WIDTH - OUTER_PAD * 2
-    BG = "#eef2f7"
+    BG = "#f3f6fa"
     CARD = "#ffffff"
-    TEXT = "#111827"
-    MUTED = "#6b7280"
-    BORDER = "#e5e7eb"
-    BLUE = "#2563eb"
-    CYAN = "#0891b2"
-    GREEN = "#059669"
-    AMBER = "#d97706"
-    RED = "#dc2626"
+    TEXT = "#172033"
+    MUTED = "#667085"
+    BORDER = "#dce3ec"
+    BLUE = "#3157d5"
+    CYAN = "#0e7490"
+    GREEN = "#15803d"
+    AMBER = "#b45309"
+    RED = "#c2413b"
+    HEADER = "#18243a"
+    HEADER_MUTED = "#b8c4d6"
 
     def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir
         self.font_provider = FontProvider(cache_dir / "fonts")
-        self._font_cache: dict[int, object] = {}
+        self._font_cache: dict[tuple[int, str], object] = {}
         self._assets_ready = False
         self._labels = DEFAULT_LABELS
         self._presentation_builder = ReportPresentationBuilder(
@@ -87,21 +89,29 @@ class MineSentinelReportImageRenderer:
             dedupe_count,
             unique_players,
         )
+        incident_groups, observation_groups = text_report._split_incident_groups(
+            presentation.incidents
+        )
+        category_observations = text_report._category_observation_lines(report)
+        high_risk_count = text_report._high_risk_count(incident_groups)
+        manual_review_count = text_report._manual_review_count(incident_groups)
+        player_count = text_report._player_count(report, presentation.unique_players)
+        status_label, status_color = _report_status(
+            len(incident_groups), high_risk_count
+        )
 
         canvas = _ReportCanvas(self)
         canvas.header(
             "MineSentinel 巡检报告",
             f"{_format_servers(report)} · {_format_time_window(report)}",
+            status_label,
+            status_color,
         )
-        incident_groups, observation_groups = text_report._split_incident_groups(
-            presentation.incidents
-        )
-        category_observations = text_report._category_observation_lines(report)
         canvas.stats(
             [
                 ("重点事件", str(len(incident_groups)), "#fff7ed", self.AMBER),
-                ("高风险事件", str(text_report._high_risk_count(incident_groups)), "#fef2f2", self.RED),
-                ("待人工复核", str(text_report._manual_review_count(incident_groups)), "#eff6ff", self.BLUE),
+                ("高风险事件", str(high_risk_count), "#fef2f2", self.RED),
+                ("待人工复核", str(manual_review_count), "#eff6ff", self.BLUE),
                 (
                     "一般观察",
                     str(len(observation_groups) + len(category_observations)),
@@ -110,19 +120,20 @@ class MineSentinelReportImageRenderer:
                 ),
             ]
         )
-        player_count = text_report._player_count(report, presentation.unique_players)
         canvas.section_title("整体情况")
-        for line in text_report._overall_lines(
-            report,
-            player_count,
-            len(incident_groups),
-            len(observation_groups) + len(category_observations),
-            text_report._high_risk_count(incident_groups),
-            text_report._manual_review_count(incident_groups),
-            _format_duration(report),
-            incident_groups,
-        ):
-            canvas.paragraph(line, size=26, color=self.TEXT)
+        canvas.summary_panel(
+            text_report._overall_lines(
+                report,
+                player_count,
+                len(incident_groups),
+                len(observation_groups) + len(category_observations),
+                high_risk_count,
+                manual_review_count,
+                _format_duration(report),
+                incident_groups,
+            ),
+            status_color,
+        )
 
         canvas.section_title("重点事件总结")
         if incident_groups:
@@ -147,7 +158,12 @@ class MineSentinelReportImageRenderer:
             canvas.bullet_list(text_report._observation_lines(report, []))
 
         canvas.section_title("玩家问题/投诉识别")
-        canvas.bullet_list(text_report._player_problem_lines(presentation.issues, incident_groups + observation_groups))
+        canvas.bullet_list(
+            text_report._player_problem_lines(
+                presentation.issues,
+                incident_groups + observation_groups,
+            )
+        )
 
         canvas.section_title("风险提醒与建议处理")
         canvas.bullet_list(
@@ -160,14 +176,16 @@ class MineSentinelReportImageRenderer:
                 observation_groups,
             )
         )
-        canvas.paragraph("处置顺序", size=26, color=self.TEXT)
+        canvas.subsection_title("处置顺序")
         canvas.numbered_list(text_report._action_lines(presentation.issues))
 
-        canvas.footer(f"证据：共 {presentation.total_count} 条观察，涉及玩家 {player_count} 人。")
         duration = _format_duration(report)
-        canvas.footer(
-            f"本报告基于{text_report._duration_with_prefix('完整', duration)}"
-            "运行日志、玩家事件和结构化分类生成。"
+        canvas.report_footer(
+            [
+                f"证据：共 {presentation.total_count} 条观察，涉及玩家 {player_count} 人。",
+                f"本报告基于{text_report._duration_with_prefix('完整', duration)}"
+                "运行日志、玩家事件和结构化分类生成。",
+            ]
         )
         return canvas.output()
 
@@ -178,10 +196,11 @@ class MineSentinelReportImageRenderer:
         await self.font_provider.ensure_cached()
         self._assets_ready = True
 
-    def font(self, size: int):
-        if size not in self._font_cache:
-            self._font_cache[size] = self.font_provider.font(size)
-        return self._font_cache[size]
+    def font(self, size: int, weight: str = "regular"):
+        key = (size, weight)
+        if key not in self._font_cache:
+            self._font_cache[key] = self.font_provider.font(size, weight)
+        return self._font_cache[key]
 
     def issue_title(self, issue: dict[str, Any]) -> str:
         chat_labels = [
@@ -207,6 +226,7 @@ class _ReportCanvas:
         self.image = Image.new("RGB", (renderer.WIDTH, 1800), renderer.BG)
         self.draw = ImageDraw.Draw(self.image)
         self.y = renderer.OUTER_PAD
+        self.section_index = 0
 
     def output(self) -> BytesIO:
         bottom = min(self.image.height, self.y + self.r.OUTER_PAD)
@@ -218,34 +238,208 @@ class _ReportCanvas:
             cropped.close()
             self.image.close()
 
-    def header(self, title: str, subtitle: str):
+    def header(
+        self,
+        title: str,
+        subtitle: str,
+        status_label: str,
+        status_color: str,
+    ):
         x = self.r.OUTER_PAD
         w = self.r.CONTENT_W
-        h = 150
+        h = 182
         self._ensure(h + 20)
-        self.draw.rounded_rectangle((x, self.y, x + w, self.y + h), radius=24, fill="#dbeafe")
-        self.draw.rectangle((x + 30, self.y + 28, x + 44, self.y + h - 28), fill=self.r.BLUE)
-        self.draw.text((x + 66, self.y + 28), title, font=self.r.font(48), fill=self.r.TEXT)
-        self.draw.text((x + 68, self.y + 94), subtitle, font=self.r.font(24), fill=self.r.MUTED)
-        self.y += h + 18
-
-    def stats(self, items: list[tuple[str, str, str, str]]):
-        gap = 14
-        x = self.r.OUTER_PAD
-        w = (self.r.CONTENT_W - gap * (len(items) - 1)) // len(items)
-        h = 112
-        self._ensure(h + 18)
-        for title, value, bg, color in items:
-            self.draw.rounded_rectangle((x, self.y, x + w, self.y + h), radius=18, fill=bg)
-            self.draw.text((x + 22, self.y + 18), title, font=self.r.font(22), fill=self.r.MUTED)
-            self._fit_text(value, x + 22, self.y + 52, w - 44, self.r.font(34), color)
-            x += w + gap
+        self.draw.rounded_rectangle(
+            (x, self.y, x + w, self.y + h),
+            radius=8,
+            fill=self.r.HEADER,
+        )
+        self.draw.rectangle((x, self.y, x + w, self.y + 7), fill=self.r.BLUE)
+        self.draw.text(
+            (x + 34, self.y + 28),
+            "MINECRAFT OPERATIONS · AI MONITORING",
+            font=self.r.font(19, "medium"),
+            fill="#80d4e8",
+        )
+        status_w = max(
+            188,
+            int(
+                self.draw.textlength(
+                    status_label,
+                    font=self.r.font(23, "semibold"),
+                )
+            )
+            + 48,
+        )
+        status_x = x + w - status_w - 32
+        self.draw.rounded_rectangle(
+            (status_x, self.y + 27, status_x + status_w, self.y + 73),
+            radius=6,
+            fill=status_color,
+        )
+        self.draw.text(
+            (status_x + 22, self.y + 37),
+            status_label,
+            font=self.r.font(23, "semibold"),
+            fill="#ffffff",
+        )
+        self._fit_text(
+            title,
+            x + 34,
+            self.y + 66,
+            w - 68,
+            self.r.font(50, "semibold"),
+            "#ffffff",
+        )
+        self._fit_text(
+            subtitle,
+            x + 36,
+            self.y + 132,
+            w - 72,
+            self.r.font(23),
+            self.r.HEADER_MUTED,
+        )
         self.y += h + 20
 
+    def stats(self, items: list[tuple[str, str, str, str]]):
+        gap = 16
+        x = self.r.OUTER_PAD
+        w = (self.r.CONTENT_W - gap * (len(items) - 1)) // len(items)
+        h = 122
+        self._ensure(h + 18)
+        for title, value, bg, color in items:
+            self.draw.rounded_rectangle(
+                (x + 2, self.y + 4, x + w + 2, self.y + h + 4),
+                radius=8,
+                fill="#e4e9f0",
+            )
+            self.draw.rounded_rectangle(
+                (x, self.y, x + w, self.y + h),
+                radius=8,
+                fill=self.r.CARD,
+                outline=self.r.BORDER,
+                width=1,
+            )
+            self.draw.rectangle((x, self.y, x + w, self.y + 5), fill=color)
+            self.draw.text(
+                (x + 22, self.y + 21),
+                title,
+                font=self.r.font(21, "medium"),
+                fill=self.r.MUTED,
+            )
+            self.draw.rounded_rectangle(
+                (x + w - 42, self.y + 22, x + w - 22, self.y + 29),
+                radius=3,
+                fill=bg,
+                outline=color,
+                width=1,
+            )
+            self._fit_text(
+                value,
+                x + 22,
+                self.y + 58,
+                w - 44,
+                self.r.font(38, "semibold"),
+                color,
+            )
+            x += w + gap
+        self.y += h + 30
+
     def section_title(self, title: str):
-        self._ensure(64)
-        self.draw.text((self.r.OUTER_PAD + 2, self.y), title, font=self.r.font(34), fill=self.r.TEXT)
-        self.y += 54
+        self.section_index += 1
+        self._ensure(72)
+        x = self.r.OUTER_PAD
+        box = 42
+        self.draw.rounded_rectangle(
+            (x, self.y, x + box, self.y + box),
+            radius=6,
+            fill="#e8edff",
+        )
+        number = f"{self.section_index:02d}"
+        number_w = self.draw.textlength(
+            number,
+            font=self.r.font(19, "semibold"),
+        )
+        self.draw.text(
+            (x + (box - number_w) / 2, self.y + 10),
+            number,
+            font=self.r.font(19, "semibold"),
+            fill=self.r.BLUE,
+        )
+        title_x = x + box + 16
+        self.draw.text(
+            (title_x, self.y + 2),
+            title,
+            font=self.r.font(34, "semibold"),
+            fill=self.r.TEXT,
+        )
+        title_w = self.draw.textlength(
+            title,
+            font=self.r.font(34, "semibold"),
+        )
+        line_x = min(x + self.r.CONTENT_W, title_x + title_w + 22)
+        if line_x < x + self.r.CONTENT_W:
+            self.draw.line(
+                (line_x, self.y + 23, x + self.r.CONTENT_W, self.y + 23),
+                fill=self.r.BORDER,
+                width=2,
+            )
+        self.y += 62
+
+    def subsection_title(self, title: str):
+        self._ensure(58)
+        x = self.r.OUTER_PAD
+        self.draw.rectangle((x, self.y + 8, x + 5, self.y + 38), fill=self.r.BLUE)
+        self.draw.text(
+            (x + 18, self.y + 3),
+            title,
+            font=self.r.font(27, "semibold"),
+            fill=self.r.TEXT,
+        )
+        self.y += 52
+
+    def summary_panel(self, items: list[str], accent: str):
+        if not items:
+            return
+        x = self.r.OUTER_PAD
+        inner_w = self.r.CONTENT_W - 64
+        rows: list[tuple[list[str], int, str, int, str]] = []
+        total_h = 52
+        for index, item in enumerate(items):
+            size = 27 if index == 0 else 24
+            weight = "medium" if index == 0 else "regular"
+            color = self.r.TEXT if index == 0 else "#344054"
+            font = self.r.font(size, weight)
+            lines = self._wrap(item, inner_w, font)
+            line_h = self._line_height(font, extra=8)
+            rows.append((lines, line_h, color, size, weight))
+            total_h += len(lines) * line_h + (10 if index < len(items) - 1 else 0)
+        self._ensure(total_h + 24)
+        self.draw.rounded_rectangle(
+            (x + 3, self.y + 5, x + self.r.CONTENT_W + 3, self.y + total_h + 5),
+            radius=8,
+            fill="#e4e9f0",
+        )
+        self.draw.rounded_rectangle(
+            (x, self.y, x + self.r.CONTENT_W, self.y + total_h),
+            radius=8,
+            fill=self.r.CARD,
+            outline=self.r.BORDER,
+            width=1,
+        )
+        self.draw.rectangle((x, self.y, x + 7, self.y + total_h), fill=accent)
+        yy = self.y + 25
+        for lines, line_h, color, size, weight in rows:
+            for line in lines:
+                self.draw.text(
+                    (x + 32, yy),
+                    line,
+                    font=self.r.font(size, weight),
+                    fill=color,
+                )
+                yy += line_h
+            yy += 10
+        self.y += total_h + 28
 
     def paragraph(self, text: str, size: int = 24, color: str | None = None, indent: int = 0):
         lines = self._wrap(text, self.r.CONTENT_W - indent, self.r.font(size))
@@ -291,17 +485,65 @@ class _ReportCanvas:
         self._ensure(placeholder_height)
         self.draw.rounded_rectangle(
             (x, top, x + w, placeholder_bottom),
-            radius=20,
+            radius=8,
             fill=self.r.CARD,
         )
         self.y += self.r.CARD_PAD
 
-        badge_fill, accent = _incident_colors(group.family)
-        self.draw.rectangle((x, top + 22, x + 8, top + 58), fill=accent)
-        self._badge(f"{label} #{index}", x + 24, self.y + 2, "#f3f4f6", self.r.TEXT)
-        self._fit_text(title, x + 140, self.y, w - 178, self.r.font(30), self.r.TEXT)
-        self.draw.text((x + 140, self.y + 40), time_text, font=self.r.font(20), fill=self.r.MUTED)
-        self.y += 76
+        if observation:
+            badge_fill, accent = "#ecfeff", self.r.CYAN
+        else:
+            badge_fill, accent = _severity_colors(group.max_severity)
+        self.draw.rectangle((x, top, x + w, top + 6), fill=accent)
+        badge_x = x + self.r.CARD_PAD
+        badge_w = self._badge(
+            f"{label} {index:02d}",
+            badge_x,
+            self.y + 2,
+            badge_fill,
+            accent,
+        )
+        severity_text = (
+            "一般观察"
+            if observation
+            else f"风险 {text_report._severity_label(group)}"
+        )
+        severity_w = self._badge_width(severity_text)
+        severity_x = x + w - self.r.CARD_PAD - severity_w
+        self._badge(
+            severity_text,
+            severity_x,
+            self.y + 2,
+            badge_fill,
+            accent,
+        )
+        title_x = badge_x + badge_w + 18
+        self._fit_text(
+            title,
+            title_x,
+            self.y,
+            max(80, severity_x - title_x - 16),
+            self.r.font(30, "medium"),
+            self.r.TEXT,
+        )
+        self.draw.text(
+            (title_x, self.y + 42),
+            time_text,
+            font=self.r.font(20),
+            fill=self.r.MUTED,
+        )
+        self.y += 82
+        self.draw.line(
+            (
+                x + self.r.CARD_PAD,
+                self.y,
+                x + w - self.r.CARD_PAD,
+                self.y,
+            ),
+            fill=self.r.BORDER,
+            width=1,
+        )
+        self.y += 20
 
         self._detail_row("等级", text_report._severity_label(group))
         self._detail_row("状态", text_report._group_status(group))
@@ -315,7 +557,7 @@ class _ReportCanvas:
                 self.draw.rectangle((x, bottom, x + w, placeholder_bottom), fill=self.r.BG)
             self.draw.rounded_rectangle(
                 (x, top, x + w, bottom),
-                radius=20,
+                radius=8,
                 outline=self.r.BORDER,
                 width=1,
             )
@@ -339,13 +581,17 @@ class _ReportCanvas:
             "建议处理",
             text_report._incident_recommended_action(group),
         )
+        self._detail_row(
+            "参考来源",
+            text_report._incident_research_sources(group),
+        )
 
         bottom = self.y + self.r.CARD_PAD
         if bottom < placeholder_bottom:
             self.draw.rectangle((x, bottom, x + w, placeholder_bottom), fill=self.r.BG)
         self.draw.rounded_rectangle(
             (x, top, x + w, bottom),
-            radius=20,
+            radius=8,
             outline=self.r.BORDER,
             width=1,
         )
@@ -358,10 +604,17 @@ class _ReportCanvas:
         lines = self._wrap(text, self.r.CONTENT_W - 44, self.r.font(22))
         h = 30 + len(lines) * self._line_height(self.r.font(22), extra=5)
         self._ensure(h + 12)
-        self.draw.rounded_rectangle((x, self.y, x + self.r.CONTENT_W, self.y + h), radius=16, fill="#f8fafc")
+        self.draw.rounded_rectangle(
+            (x, self.y, x + self.r.CONTENT_W, self.y + h),
+            radius=8,
+            fill="#ffffff",
+            outline=self.r.BORDER,
+            width=1,
+        )
+        self.draw.rectangle((x, self.y, x + 5, self.y + h), fill=self.r.CYAN)
         y = self.y + 15
         for line in lines:
-            self.draw.text((x + 22, y), line, font=self.r.font(22), fill=self.r.MUTED)
+            self.draw.text((x + 24, y), line, font=self.r.font(22), fill=self.r.MUTED)
             y += self._line_height(self.r.font(22), extra=5)
         self.y += h + 18
 
@@ -375,9 +628,31 @@ class _ReportCanvas:
             self._bullet(item, f"{index}.")
         self.y += 4
 
-    def footer(self, text: str):
-        self.y += 8
-        self.info_note(text)
+    def report_footer(self, items: list[str]):
+        items = [item for item in items if item]
+        if not items:
+            return
+        self.y += 18
+        x = self.r.OUTER_PAD
+        self.draw.line(
+            (x, self.y, x + self.r.CONTENT_W, self.y),
+            fill="#cbd5e1",
+            width=2,
+        )
+        self.y += 24
+        for item in items:
+            lines = self._wrap(item, self.r.CONTENT_W, self.r.font(20))
+            line_h = self._line_height(self.r.font(20), extra=6)
+            self._ensure(line_h * len(lines) + 10)
+            for line in lines:
+                self.draw.text(
+                    (x, self.y),
+                    line,
+                    font=self.r.font(20),
+                    fill=self.r.MUTED,
+                )
+                self.y += line_h
+            self.y += 6
 
     def _detail_row(self, label: str, value: str):
         if not value or value == "未知":
@@ -387,7 +662,12 @@ class _ReportCanvas:
         lines = self._wrap(value, self.r.CONTENT_W - self.r.CARD_PAD * 2 - label_w, self.r.font(22))
         line_h = self._line_height(self.r.font(22), extra=5)
         self._ensure(max(34, len(lines) * line_h) + 10)
-        self.draw.text((x, self.y), label, font=self.r.font(21), fill=self.r.MUTED)
+        self.draw.text(
+            (x, self.y),
+            label,
+            font=self.r.font(21, "medium"),
+            fill=self.r.MUTED,
+        )
         yy = self.y
         for line in lines:
             self.draw.text((x + label_w, yy), line, font=self.r.font(22), fill=self.r.TEXT)
@@ -396,10 +676,12 @@ class _ReportCanvas:
 
     def _subhead(self, text: str):
         self._ensure(42)
+        x = self.r.OUTER_PAD + self.r.CARD_PAD
+        self.draw.rectangle((x, self.y + 8, x + 4, self.y + 31), fill=self.r.BLUE)
         self.draw.text(
-            (self.r.OUTER_PAD + self.r.CARD_PAD, self.y + 4),
+            (x + 14, self.y + 4),
             text,
-            font=self.r.font(22),
+            font=self.r.font(22, "medium"),
             fill=self.r.TEXT,
         )
         self.y += 38
@@ -412,11 +694,25 @@ class _ReportCanvas:
             line_h = self._line_height(self.r.font(20), extra=5)
             h = 20 + line_h * len(lines)
             self._ensure(h + 8)
-            self.draw.rounded_rectangle((x, self.y, x + w, self.y + h), radius=12, fill="#f9fafb")
+            self.draw.rounded_rectangle(
+                (x, self.y, x + w, self.y + h),
+                radius=6,
+                fill="#f6f8fb",
+                outline="#e4e9f0",
+                width=1,
+            )
             yy = self.y + 10
-            self.draw.rectangle((x + 14, yy, x + 18, self.y + h - 10), fill="#cbd5e1")
+            self.draw.rectangle(
+                (x + 14, yy, x + 18, self.y + h - 10),
+                fill="#aab6c8",
+            )
             for line in lines:
-                self.draw.text((x + 30, yy), line, font=self.r.font(20), fill="#374151")
+                self.draw.text(
+                    (x + 30, yy),
+                    line,
+                    font=self.r.font(20),
+                    fill="#344054",
+                )
                 yy += line_h
             self.y += h + 8
 
@@ -426,23 +722,55 @@ class _ReportCanvas:
 
     def _bullet(self, item: str, marker: str, x_offset: int = 0, size: int = 24):
         x = self.r.OUTER_PAD + x_offset
-        marker_w = 42 if marker.endswith(".") else 28
+        numbered = marker.endswith(".")
+        marker_w = 46 if numbered else 28
         lines = self._wrap(item, self.r.CONTENT_W - x_offset - marker_w, self.r.font(size))
         line_h = self._line_height(self.r.font(size), extra=7)
         self._ensure(line_h * len(lines) + 8)
-        self.draw.text((x, self.y), marker, font=self.r.font(size), fill=self.r.BLUE)
+        if numbered:
+            marker_text = marker[:-1]
+            box_size = 32
+            self.draw.rounded_rectangle(
+                (x, self.y + 1, x + box_size, self.y + box_size + 1),
+                radius=5,
+                fill="#e8edff",
+            )
+            marker_text_w = self.draw.textlength(
+                marker_text,
+                font=self.r.font(size - 4, "medium"),
+            )
+            self.draw.text(
+                (x + (box_size - marker_text_w) / 2, self.y + 5),
+                marker_text,
+                font=self.r.font(size - 4, "medium"),
+                fill=self.r.BLUE,
+            )
+        else:
+            self.draw.ellipse(
+                (x + 5, self.y + 11, x + 15, self.y + 21),
+                fill=self.r.BLUE,
+            )
         yy = self.y
         for line in lines:
             self.draw.text((x + marker_w, yy), line, font=self.r.font(size), fill=self.r.TEXT)
             yy += line_h
         self.y = yy + 8
 
-    def _badge(self, text: str, x: int, y: int, fill: str, text_color: str):
-        font = self.r.font(19)
-        w = int(self.draw.textlength(text, font=font)) + 24
+    def _badge_width(self, text: str) -> int:
+        font = self.r.font(19, "medium")
+        return int(self.draw.textlength(text, font=font)) + 24
+
+    def _badge(self, text: str, x: int, y: int, fill: str, text_color: str) -> int:
+        font = self.r.font(19, "medium")
+        w = self._badge_width(text)
         self._ensure(34)
-        self.draw.rounded_rectangle((x, y, x + w, y + 30), radius=15, fill=fill)
+        self.draw.rounded_rectangle(
+            (x, y, x + w, y + 32),
+            radius=5,
+            fill=fill,
+        )
         self.draw.text((x + 12, y + 4), text, font=font, fill=text_color)
+        return w
 
     def _fit_text(self, text: str, x: int, y: int, max_w: int, font, color: str):
         value = text
@@ -554,11 +882,20 @@ def _incident_labels(
     return labels
 
 
-def _incident_colors(family: str) -> tuple[str, str]:
-    if family == "community":
-        return "#fefce8", "#ca8a04"
-    if family == "moderation":
-        return "#fef2f2", "#dc2626"
-    if family == "suggestion":
-        return "#f0fdf4", "#059669"
-    return "#eff6ff", "#2563eb"
+def _report_status(incident_count: int, high_risk_count: int) -> tuple[str, str]:
+    if high_risk_count:
+        return "需要优先处置", "#b42318"
+    if incident_count:
+        return "需要关注", "#b45309"
+    return "运行稳定", "#15803d"
+
+
+def _severity_colors(severity: str) -> tuple[str, str]:
+    value = str(severity or "low").lower()
+    if value in {"critical", "high"}:
+        return "#fef2f2", "#c2413b"
+    if value == "medium":
+        return "#fff7ed", "#b45309"
+    if value in {"low", "info"}:
+        return "#ecfdf5", "#15803d"
+    return "#eff6ff", "#3157d5"

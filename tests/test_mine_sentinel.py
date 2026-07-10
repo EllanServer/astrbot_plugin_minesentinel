@@ -5354,6 +5354,100 @@ class MineSentinelRulesTests(unittest.TestCase):
         self.assertIn("多个时间段", text)
         self.assertNotIn("其他时间段未发现明显持续性", text)
 
+    def test_structured_time_window_is_rendered_for_humans(self):
+        from services.mine_sentinel.reporting.incident_format import (
+            format_time_window,
+        )
+
+        start = 1783515125000
+        end = 1783517386000
+        expected_start = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(start / 1000)
+        )
+        expected_end = time.strftime("%H:%M", time.localtime(end / 1000))
+
+        rendered = format_time_window(
+            {"time_window": {"start": start, "end": end}}
+        )
+
+        self.assertEqual(rendered, f"{expected_start} - {expected_end}")
+        self.assertNotIn("{'start'", rendered)
+        self.assertNotIn(str(start), rendered)
+
+    def test_incident_distribution_uses_readable_time_range(self):
+        from services.mine_sentinel.reporting.incidents import IncidentGroup
+        from services.mine_sentinel.reporting.text_renderer import (
+            _incident_time_distribution,
+        )
+
+        start = 1783515125000
+        end = 1783517386000
+        groups = [
+            IncidentGroup(family="operations", start_ts=start, end_ts=start),
+            IncidentGroup(family="operations", start_ts=end, end_ts=end),
+        ]
+        expected_start = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(start / 1000)
+        )
+        expected_end = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(end / 1000)
+        )
+
+        rendered = _incident_time_distribution(groups)
+
+        self.assertIn(
+            f"重点事件分布在 {expected_start} 至 {expected_end} 的多个时间段",
+            rendered,
+        )
+        self.assertNotIn("{'start'", rendered)
+        self.assertNotIn(str(start), rendered)
+
+    def test_modern_image_report_renderer_smoke(self):
+        from PIL import Image, ImageFont
+
+        from services.mine_sentinel.reporting.image_renderer import (
+            MineSentinelReportImageRenderer,
+        )
+
+        report = {
+            "time_window": {"start": 1783515125000, "end": 1783517386000},
+            "servers": ["survival"],
+            "issues": [
+                {
+                    "category": "plugin",
+                    "tag": "server_log_plugin",
+                    "severity": "high",
+                    "should_alert": True,
+                    "evidence_count": 2,
+                    "signal_count": 2,
+                    "first_seen_ts": 1783515125000,
+                    "last_seen_ts": 1783515185000,
+                    "affected_servers": ["survival"],
+                    "ops_subtypes": ["配置解析异常"],
+                    "evidence_samples": ["Failed to parse plugin config"],
+                    "suggested_action": "核对插件配置并查看完整附件。",
+                }
+            ],
+            "categories": {},
+            "chat_topics": {},
+            "vulcan_alerts": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            renderer = MineSentinelReportImageRenderer(Path(tmp))
+            renderer.font_provider.font = lambda size, weight="regular": (
+                ImageFont.load_default(size=size)
+            )
+            output = renderer._draw_report(report, 2, 0, 0)
+            with Image.open(output) as image:
+                self.assertEqual(image.width, 1200)
+                self.assertGreater(image.height, 1200)
+                self.assertEqual(image.mode, "RGB")
+                self.assertEqual(
+                    image.getpixel((renderer.OUTER_PAD + 8, renderer.OUTER_PAD + 100)),
+                    (24, 36, 58),
+                )
+                self.assertNotEqual(image.getbbox(), None)
+
 
 class MineSentinelRuntimeLogDetectionTests(unittest.TestCase):
     """PR10: 测试 runtime_log._build_observation 的 daily_noise/chat/vulcan 检测。"""
@@ -9831,6 +9925,19 @@ class MineSentinelAIOutputRegressionTests(unittest.TestCase):
         self.assertEqual(sanitize_free_text(123), "123")
         self.assertEqual(sanitize_free_text(["a", "b"]), "['a', 'b']")
 
+    def test_sanitize_free_text_redacts_identifiers_echoed_by_ai(self):
+        from services.mine_sentinel.reporting.ai_normalizer import sanitize_free_text
+
+        raw = (
+            "联系 admin@example.test，检查 192.0.2.10，"
+            "token=abcdefghijklmnopqrstuvwxyzABCDEF123456"
+        )
+        sanitized = sanitize_free_text(raw)
+
+        self.assertNotIn("admin@example.test", sanitized)
+        self.assertNotIn("192.0.2.10", sanitized)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyzABCDEF123456", sanitized)
+
     def test_normalizer_strips_injection_from_suggested_action(self):
         """LLM 在 suggested_action 注入指令，normalizer 应剥离后不进入报告。"""
         from services.mine_sentinel.reporting.ai_normalizer import AIReportNormalizer
@@ -9860,6 +9967,572 @@ class MineSentinelAIOutputRegressionTests(unittest.TestCase):
         self.assertNotIn("忽略以上指令", issue["suggested_action"])
         self.assertNotIn("请执行", issue["suggested_action"])
         self.assertNotIn("<evidence>", str(issue.get("incident_title") or ""))
+
+    def test_ai_diagnosis_initial_context_has_forty_records_each_side(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIContextLocator
+
+        records = [
+            self._make_record(
+                f"[Server thread/INFO]: original line {index}",
+                timestamp=index,
+            )
+            for index in range(101)
+        ]
+        records[50] = self._make_record(
+            "[Server thread/ERROR]: ExamplePlugin failed to load config",
+            level="ERROR",
+            timestamp=50,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_samples": [records[50].evidence_text()],
+            "first_seen_ts": 50,
+            "last_seen_ts": 50,
+        }
+
+        payload = AIContextLocator(MineSentinelConfig.from_dict({})).issue_payload(
+            0,
+            issue,
+            records,
+        )
+
+        context = payload["context"]
+        self.assertEqual(payload["context_radius"], 40)
+        self.assertEqual(len(context), 81)
+        self.assertEqual(context[0]["record_index"], 10)
+        self.assertEqual(context[-1]["record_index"], 90)
+        self.assertEqual(
+            [item["record_index"] for item in context if item["hit"]],
+            [50],
+        )
+        self.assertIn("ExamplePlugin failed to load config", context[40]["content"])
+
+    def test_ai_diagnosis_config_defaults_and_limits(self):
+        default = MineSentinelConfig.from_dict({}).report
+        self.assertTrue(default.ai_diagnosis_enabled)
+        self.assertEqual(default.ai_context_radius, 40)
+        self.assertEqual(default.ai_context_expansion_rounds, 2)
+        self.assertTrue(default.ai_tools_enabled)
+        self.assertTrue(default.ai_web_search_enabled)
+
+        bounded = MineSentinelConfig.from_dict(
+            {
+                "report": {
+                    "ai_context_radius": 999,
+                    "ai_max_context_radius": 10,
+                    "ai_context_expansion_rounds": 99,
+                    "ai_max_diagnosed_issues": 99,
+                    "ai_max_web_search_queries": 99,
+                    "ai_tool_timeout_seconds": 999,
+                }
+            }
+        ).report
+        self.assertEqual(bounded.ai_context_radius, 200)
+        self.assertEqual(bounded.ai_max_context_radius, 200)
+        self.assertEqual(bounded.ai_context_expansion_rounds, 4)
+        self.assertEqual(bounded.ai_max_diagnosed_issues, 24)
+        self.assertEqual(bounded.ai_max_web_search_queries, 5)
+        self.assertEqual(bounded.ai_tool_timeout_seconds, 120)
+
+    def test_ai_diagnosis_context_stays_with_same_log_source(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIContextLocator
+
+        records = []
+        for index in range(101):
+            records.append(
+                self._make_record(
+                    f"[Server thread/INFO]: survival line {index}",
+                    server_id="survival",
+                    context={"logFile": "/srv/survival/logs/latest.log"},
+                    timestamp=index,
+                )
+            )
+            records.append(
+                self._make_record(
+                    f"[Proxy thread/INFO]: proxy line {index}",
+                    server_id="velocity",
+                    context={"logFile": "/srv/velocity/logs/latest.log"},
+                    timestamp=index,
+                )
+            )
+        hit_index = 100
+        records[hit_index] = self._make_record(
+            "[Server thread/ERROR]: ExamplePlugin failed",
+            level="ERROR",
+            server_id="survival",
+            context={"logFile": "/srv/survival/logs/latest.log"},
+            timestamp=50,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_samples": [records[hit_index].evidence_text()],
+            "first_seen_ts": 50,
+            "last_seen_ts": 50,
+        }
+
+        payload = AIContextLocator(MineSentinelConfig.from_dict({})).issue_payload(
+            0,
+            issue,
+            records,
+        )
+
+        context = payload["context"]
+        self.assertEqual(len(context), 81)
+        self.assertEqual(context[0]["offset"], -40)
+        self.assertEqual(context[-1]["offset"], 40)
+        self.assertEqual({item["server"] for item in context}, {"Survival"})
+        self.assertNotIn("proxy line", json.dumps(context, ensure_ascii=False))
+
+    def test_ai_diagnosis_duplicate_evidence_uses_nearest_issue_time(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIContextLocator
+
+        records = [
+            self._make_record("duplicate failure", timestamp=index)
+            for index in range(101)
+        ]
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_samples": [records[90].evidence_text()],
+            "first_seen_ts": 90,
+            "last_seen_ts": 90,
+        }
+
+        payload = AIContextLocator(MineSentinelConfig.from_dict({})).issue_payload(
+            0,
+            issue,
+            records,
+        )
+
+        self.assertEqual(payload["hit_record_indexes"], [90])
+
+    def test_ai_diagnosis_assessment_and_action_reach_final_report(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIIssueDiagnoser
+        from services.mine_sentinel.reporting.incidents import IncidentGrouper
+        from services.mine_sentinel.reporting.text_renderer import (
+            _evidence_strength_line,
+            _incident_judgement_line,
+            _incident_recommended_action,
+        )
+
+        records = [
+            self._make_record(
+                f"[Server thread/INFO]: line {index}",
+                timestamp=index,
+            )
+            for index in range(100)
+        ]
+        records[50] = self._make_record(
+            "[Server thread/ERROR]: ExamplePlugin failed to parse config.yml",
+            level="ERROR",
+            timestamp=50,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_count": 1,
+            "evidence_samples": [records[50].evidence_text()],
+            "first_seen_ts": 50,
+            "last_seen_ts": 50,
+            "affected_servers": ["survival"],
+            "ops_categories": ["插件与模组"],
+            "ops_subtypes": ["配置解析异常"],
+        }
+
+        class Provider:
+            async def text_chat(self, prompt, **kwargs):
+                self.prompt = prompt
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(
+                        {
+                            "issues": [
+                                {
+                                    "index": 0,
+                                    "category": "plugin",
+                                    "tag": "server_log_plugin",
+                                    "initial_assessment": (
+                                        "配置文件解析在插件加载阶段失败；当前证据未显示服务器崩溃，"
+                                        "影响范围仍需通过插件启用结果确认。"
+                                    ),
+                                    "suggested_action": (
+                                        "核对 ExamplePlugin 的 config.yml 语法、插件版本与当前服务端兼容性，"
+                                        "再检查后续是否出现成功启用日志。"
+                                    ),
+                                    "confidence": 0.91,
+                                    "evidence_sufficient": True,
+                                    "evidence_record_indexes": [50],
+                                    "tool_requests": [],
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        provider = Provider()
+        diagnosed, changed = asyncio.run(
+            AIIssueDiagnoser(MineSentinelConfig.from_dict({})).enrich(
+                provider,
+                records,
+                {"issues": [issue]},
+                None,
+            )
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("前后各 40 条", provider.prompt)
+        diagnosed_issue = diagnosed["issues"][0]
+        self.assertIn("配置文件解析", diagnosed_issue["ai_assessment"])
+        self.assertTrue(diagnosed_issue["ai_diagnosis"])
+        group = IncidentGrouper().group(diagnosed["issues"])[0]
+        self.assertIn("配置文件解析", _incident_judgement_line(group))
+        self.assertIn("config.yml", _incident_recommended_action(group))
+        self.assertIn("前后各 40 条原文", _evidence_strength_line(group))
+
+    def test_ai_diagnosis_rejects_unprovided_evidence_index(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIIssueDiagnoser
+
+        records = [
+            self._make_record(f"line {index}", timestamp=index)
+            for index in range(81)
+        ]
+        records[40] = self._make_record(
+            "[Server thread/ERROR]: ExamplePlugin failed",
+            level="ERROR",
+            timestamp=40,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_samples": [records[40].evidence_text()],
+            "first_seen_ts": 40,
+            "last_seen_ts": 40,
+        }
+
+        class Provider:
+            async def text_chat(self, prompt, **kwargs):
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(
+                        {
+                            "issues": [
+                                {
+                                    "index": 0,
+                                    "category": "plugin",
+                                    "tag": "server_log_plugin",
+                                    "initial_assessment": "伪造证据判断。",
+                                    "suggested_action": "伪造建议。",
+                                    "confidence": 0.99,
+                                    "evidence_record_indexes": [9999],
+                                    "tool_requests": [],
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        diagnosed, changed = asyncio.run(
+            AIIssueDiagnoser(MineSentinelConfig.from_dict({})).enrich(
+                Provider(),
+                records,
+                {"issues": [issue]},
+                None,
+            )
+        )
+
+        self.assertFalse(changed)
+        self.assertNotIn("ai_assessment", diagnosed["issues"][0])
+
+    def test_ai_diagnosis_can_expand_context_from_visible_boundary(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIIssueDiagnoser
+
+        records = [
+            self._make_record(
+                f"[Server thread/INFO]: expansion line {index}",
+                timestamp=index,
+            )
+            for index in range(160)
+        ]
+        records[50] = self._make_record(
+            "[Server thread/ERROR]: ExamplePlugin dependency unavailable",
+            level="ERROR",
+            timestamp=50,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_count": 1,
+            "evidence_samples": [records[50].evidence_text()],
+            "first_seen_ts": 50,
+            "last_seen_ts": 50,
+            "affected_servers": ["survival"],
+            "ops_categories": ["插件与模组"],
+            "ops_subtypes": ["依赖缺失/功能降级"],
+        }
+
+        class Provider:
+            def __init__(self):
+                self.prompts = []
+
+            async def text_chat(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    payload = {
+                        "issues": [
+                            {
+                                "index": 0,
+                                "category": "plugin",
+                                "tag": "server_log_plugin",
+                                "initial_assessment": "需要查看后续恢复日志。",
+                                "suggested_action": "继续核对 ExamplePlugin 后续加载状态。",
+                                "confidence": 0.45,
+                                "evidence_sufficient": False,
+                                "evidence_record_indexes": [50],
+                                "tool_requests": [
+                                    {
+                                        "tool": "expand_context",
+                                        "center_record_index": 90,
+                                        "before": 0,
+                                        "after": 40,
+                                        "reason": "检查窗口后方是否恢复",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                else:
+                    payload = {
+                        "issues": [
+                            {
+                                "index": 0,
+                                "category": "plugin",
+                                "tag": "server_log_plugin",
+                                "initial_assessment": "后续日志仍未出现依赖恢复，插件功能可能保持降级。",
+                                "suggested_action": "核对 ExamplePlugin 依赖插件是否安装并成功启用。",
+                                "confidence": 0.83,
+                                "evidence_sufficient": True,
+                                "evidence_record_indexes": [100],
+                                "tool_requests": [],
+                            }
+                        ]
+                    }
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(payload, ensure_ascii=False)
+                )
+
+        provider = Provider()
+        diagnosed, changed = asyncio.run(
+            AIIssueDiagnoser(MineSentinelConfig.from_dict({})).enrich(
+                provider,
+                records,
+                {"issues": [issue]},
+                None,
+            )
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(provider.prompts), 2)
+        self.assertIn("expansion line 100", provider.prompts[1])
+        metadata = diagnosed["issues"][0]["ai_diagnosis"]
+        self.assertTrue(metadata["expanded"])
+        self.assertGreater(metadata["context_records"], 81)
+        self.assertEqual(metadata["evidence_record_indexes"], [100])
+
+    def test_ai_diagnosis_can_call_astrbot_web_search_tool(self):
+        from services.mine_sentinel.reporting.ai_diagnosis import AIIssueDiagnoser
+
+        records = [
+            self._make_record(
+                f"[Server thread/INFO]: web line {index}",
+                timestamp=index,
+            )
+            for index in range(100)
+        ]
+        records[50] = self._make_record(
+            "[Server thread/ERROR]: ExamplePlugin incompatible server version",
+            level="ERROR",
+            timestamp=50,
+        )
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "evidence_count": 1,
+            "evidence_samples": [records[50].evidence_text()],
+            "first_seen_ts": 50,
+            "last_seen_ts": 50,
+            "affected_servers": ["survival"],
+            "ops_categories": ["插件与模组"],
+            "ops_subtypes": ["兼容性/弃用提示"],
+        }
+
+        class WebTool:
+            active = True
+
+            def __init__(self):
+                self.queries = []
+                self.origins = []
+
+            async def call(self, context, **kwargs):
+                self.queries.append(kwargs["query"])
+                self.origins.append(context.context.event.unified_msg_origin)
+                return json.dumps(
+                    {
+                        "results": [
+                            {
+                                "title": "ExamplePlugin compatibility guide",
+                                "url": "https://docs.example.test/compatibility",
+                                "snippet": "Version 5 requires Paper 1.21 or newer.",
+                            }
+                        ]
+                    }
+                )
+
+        tool = WebTool()
+
+        class ToolManager:
+            def get_func(self, name):
+                return tool if name == "web_search_tavily" else None
+
+        class Context:
+            def get_config(self, umo=None):
+                return {
+                    "provider_settings": {
+                        "web_search": True,
+                        "websearch_provider": "tavily",
+                    }
+                }
+
+            def get_llm_tool_manager(self):
+                return ToolManager()
+
+        class Provider:
+            def __init__(self):
+                self.prompts = []
+
+            async def text_chat(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    payload = {
+                        "issues": [
+                            {
+                                "index": 0,
+                                "category": "plugin",
+                                "tag": "server_log_plugin",
+                                "initial_assessment": "需要核对官方兼容范围。",
+                                "suggested_action": "先核对 ExamplePlugin 官方兼容信息。",
+                                "confidence": 0.5,
+                                "evidence_sufficient": False,
+                                "evidence_record_indexes": [50],
+                                "tool_requests": [
+                                    {
+                                        "tool": "web_search",
+                                        "query": (
+                                            "ExamplePlugin compatibility admin@example.test "
+                                            "192.0.2.10"
+                                        ),
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                else:
+                    payload = {
+                        "issues": [
+                            {
+                                "index": 0,
+                                "category": "plugin",
+                                "tag": "server_log_plugin",
+                                "initial_assessment": (
+                                    "本地日志确认版本不兼容；外部资料仅用于核对支持范围。"
+                                ),
+                                "suggested_action": (
+                                    "先核对当前 Paper 与 ExamplePlugin 的版本矩阵，"
+                                    "再选择兼容版本并验证插件成功启用。"
+                                ),
+                                "confidence": 0.88,
+                                "evidence_sufficient": True,
+                                "evidence_record_indexes": [50],
+                                "tool_requests": [],
+                            }
+                        ]
+                    }
+                return types.SimpleNamespace(
+                    completion_text=json.dumps(payload, ensure_ascii=False)
+                )
+
+        provider = Provider()
+        diagnosed, changed = asyncio.run(
+            AIIssueDiagnoser(
+                MineSentinelConfig.from_dict({}),
+                Context(),
+            ).enrich(
+                provider,
+                records,
+                {"issues": [issue]},
+                "napcat:GroupMessage:123",
+            )
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(tool.queries), 1)
+        self.assertNotIn("admin@example.test", tool.queries[0])
+        self.assertNotIn("192.0.2.10", tool.queries[0])
+        self.assertEqual(tool.origins, ["napcat:GroupMessage:123"])
+        self.assertIn("ExamplePlugin compatibility guide", provider.prompts[1])
+        metadata = diagnosed["issues"][0]["ai_diagnosis"]
+        self.assertTrue(metadata["web_researched"])
+        self.assertEqual(
+            metadata["research_sources"][0]["url"],
+            "https://docs.example.test/compatibility",
+        )
+        from services.mine_sentinel.reporting.incidents import IncidentGrouper
+        from services.mine_sentinel.reporting.text_renderer import (
+            _incident_research_sources,
+        )
+
+        group = IncidentGrouper().group(diagnosed["issues"])[0]
+        self.assertIn(
+            "https://docs.example.test/compatibility",
+            _incident_research_sources(group),
+        )
+
+    def test_generic_ai_polish_cannot_override_deep_diagnosis(self):
+        from services.mine_sentinel.reporting.ai_normalizer import AIReportNormalizer
+
+        issue = {
+            "category": "plugin",
+            "tag": "server_log_plugin",
+            "severity": "high",
+            "suggested_action": "保留深度诊断建议。",
+            "ai_assessment": "深度诊断判断。",
+            "ai_diagnosis": {"context_radius": 40},
+        }
+        normalized = AIReportNormalizer().normalize_report(
+            {
+                "issues": [
+                    {
+                        "category": "plugin",
+                        "tag": "server_log_plugin",
+                        "suggested_action": "覆盖成通用建议。",
+                    }
+                ]
+            },
+            {"issues": [issue]},
+        )
+
+        self.assertEqual(
+            normalized["issues"][0]["suggested_action"],
+            "保留深度诊断建议。",
+        )
 
     # ------------------------------------------------------------------
     # 3. 端到端主报告：text_chat → normalizer → text_renderer
@@ -9953,6 +10626,79 @@ class MineSentinelAIOutputRegressionTests(unittest.TestCase):
         self.assertFalse(
             any(i.get("incident_title") == "AI自定义事件标题" for i in report["issues"])
         )
+
+    def test_end_to_end_report_uses_deep_diagnosis_when_polish_is_empty(self):
+        from services.mine_sentinel.reporting.reporter import MineSentinelReporter
+        from services.mine_sentinel.reporting.text_renderer import format_report
+
+        config = MineSentinelConfig.from_dict({})
+        records = [
+            self._make_record(
+                f"[Server thread/INFO]: surrounding line {index}",
+                timestamp=1700000000000 + index,
+            )
+            for index in range(81)
+        ]
+        records[40] = self._make_record(
+            "[Server thread/ERROR]: NullPointerException in ExamplePlugin",
+            level="ERROR",
+            timestamp=1700000000040,
+        )
+        fallback = HeuristicReportBuilder(config).build(records, 60, "survival")
+        identity = fallback["issues"][0]
+
+        class Provider:
+            async def text_chat(self, prompt, **kwargs):
+                session = kwargs.get("session_id")
+                if session == "minesentinel-issue-review":
+                    return types.SimpleNamespace(completion_text="")
+                if session == "minesentinel-issue-diagnosis":
+                    return types.SimpleNamespace(
+                        completion_text=json.dumps(
+                            {
+                                "issues": [
+                                    {
+                                        "index": 0,
+                                        "category": identity["category"],
+                                        "tag": identity["tag"],
+                                        "incident_index": identity.get("incident_index"),
+                                        "initial_assessment": (
+                                            "异常来自 ExamplePlugin 的空指针堆栈；"
+                                            "当前上下文未显示整个服务端停止。"
+                                        ),
+                                        "suggested_action": (
+                                            "核对 ExamplePlugin 触发路径、插件版本与完整堆栈，"
+                                            "并在测试环境复现。"
+                                        ),
+                                        "confidence": 0.86,
+                                        "evidence_sufficient": True,
+                                        "evidence_record_indexes": [40],
+                                        "tool_requests": [],
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                return types.SimpleNamespace(completion_text="")
+
+        class Context:
+            def get_using_provider(self, *args):
+                return Provider()
+
+        report = asyncio.run(
+            MineSentinelReporter(config, Context()).build_report(
+                records,
+                60,
+                "survival",
+            )
+        )
+        text = format_report(report, len(records), 0, 0)
+
+        self.assertEqual(report["ai_diagnosis"]["diagnosed"], 1)
+        self.assertIn("ExamplePlugin 的空指针堆栈", text)
+        self.assertIn("测试环境复现", text)
+        self.assertIn("前后各 40 条原文", text)
 
     def test_end_to_end_ai_report_preserves_fallback_locations(self):
         """AI cannot replace deterministic locations or issue identity."""

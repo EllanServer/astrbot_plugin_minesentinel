@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover - minimal test environments may omit aioht
     aiohttp = None
 
 
-DEFAULT_FONT_FILENAME = "LXGWWenKaiGB-Regular.ttf"
+DEFAULT_FONT_FILENAME = "NotoSansSC-Variable.ttf"
 # 可选的字体 SHA-256 校验值。留空表示不校验哈希（仍会校验字体头部魔数与
 # 体积上限）。若运维通过环境变量 MINESENTINEL_FONT_SHA256 设置了正确哈希，
 # 下载内容必须匹配才落盘，防止第三方 CDN 被劫持投递恶意字体经 freetype
@@ -23,12 +23,11 @@ import os as _os
 
 DEFAULT_FONT_SHA256 = (_os.environ.get("MINESENTINEL_FONT_SHA256") or "").lower()
 DEFAULT_FONT_URLS = [
-    "https://raw.githubusercontent.com/lxgw/LxgwWenkaiGB/main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
-    "https://cdn.jsdelivr.net/gh/lxgw/LxgwWenkaiGB@main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
-    "https://ghproxy.net/https://raw.githubusercontent.com/lxgw/LxgwWenkaiGB/main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
-    "https://jsd.cdn.zzko.cn/gh/lxgw/LxgwWenkaiGB@main/fonts/TTF/LXGWWenKaiGB-Regular.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
+    "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
+    "https://ghproxy.net/https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
 ]
-# 字体下载体积上限（字节）。LXGW WenKai GB Regular TTF 约 8-12MB，设 32MB
+# 字体下载体积上限（字节）。Noto Sans SC Variable TTF 约 18MB，设 32MB
 # 余量。超过即拒绝并中止下载，防止恶意服务器返回超大响应耗尽内存。
 MAX_FONT_DOWNLOAD_BYTES = 32 * 1024 * 1024
 # 小于此值视为无效字体文件。
@@ -73,12 +72,15 @@ class FontProvider:
         self.font_dir = font_dir
         self.font_path = font_dir / filename
         self.urls = urls or DEFAULT_FONT_URLS
-        # Cache of loaded ImageFont objects keyed by (resolved_source, size).
+        # Cache of loaded ImageFont objects keyed by (resolved_source, size, weight).
         # ImageFont.truetype parses the font file every call; for a multi-MB
         # CJK font and repeated renders this is a major cost. Resolution of the
         # underlying file is stable for the provider lifetime, so we cache by
         # (source_label, size) once a font loads successfully.
-        self._font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
+        self._font_cache: dict[
+            tuple[str, int, str],
+            ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        ] = {}
         self._resolved_source: str | None = None
 
     async def ensure_cached(self):
@@ -146,13 +148,18 @@ class FontProvider:
                     logger.debug(f"[Renderer] 字体下载失败: {url} -> {exc}")
         logger.warning("[Renderer] 字体下载失败，将回退到系统字体")
 
-    def font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    def font(
+        self,
+        size: int,
+        weight: str = "regular",
+    ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         source = self._resolve_source()
-        cache_key = (source, size)
+        normalized_weight = str(weight or "regular").lower()
+        cache_key = (source, size, normalized_weight)
         cached = self._font_cache.get(cache_key)
         if cached is not None:
             return cached
-        loaded = self._load_font(source, size)
+        loaded = self._load_font(source, size, normalized_weight)
         self._font_cache[cache_key] = loaded
         return loaded
 
@@ -197,11 +204,28 @@ class FontProvider:
         return self._resolved_source
 
     def _load_font(
-        self, source: str, size: int
+        self,
+        source: str,
+        size: int,
+        weight: str = "regular",
     ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         if source != "__default__":
             try:
-                return ImageFont.truetype(source, size=size)
+                loaded = ImageFont.truetype(source, size=size)
+                variation = {
+                    "thin": b"Thin",
+                    "light": b"Light",
+                    "regular": b"Regular",
+                    "medium": b"Medium",
+                    "semibold": b"SemiBold",
+                    "bold": b"Bold",
+                }.get(weight, b"Regular")
+                try:
+                    if variation in loaded.get_variation_names():
+                        loaded.set_variation_by_name(variation)
+                except (AttributeError, OSError):
+                    pass
+                return loaded
             except Exception as exc:
                 logger.debug(f"[Renderer] 加载已缓存字体失败: {exc}")
                 # Invalidate the resolved source so a later call can re-resolve.

@@ -15,6 +15,7 @@ from .ai_normalizer import (
     repair_json_object_text,
 )
 from .ai_issue_review import AIIssueReviewer
+from .ai_diagnosis import AIIssueDiagnoser
 from .ai_prompt import AIReportPromptBuilder
 
 
@@ -38,6 +39,7 @@ class AIReportSummarizer:
         self.prompt_builder = AIReportPromptBuilder(config)
         self.normalizer = AIReportNormalizer()
         self.issue_reviewer = AIIssueReviewer(config)
+        self.issue_diagnoser = AIIssueDiagnoser(config, context)
 
     async def build(
         self,
@@ -59,8 +61,14 @@ class AIReportSummarizer:
             review_records if review_records is not None else records,
             fallback,
         )
+        diagnosed_fallback, diagnosis_changed = await self.issue_diagnoser.enrich(
+            provider,
+            review_records if review_records is not None else records,
+            reviewed_fallback,
+            umo,
+        )
 
-        prompt = self._build_prompt(records, window_minutes, reviewed_fallback)
+        prompt = self._build_prompt(records, window_minutes, diagnosed_fallback)
         try:
             result = await provider.text_chat(
                 prompt=prompt,
@@ -71,19 +79,19 @@ class AIReportSummarizer:
             raw = getattr(result, "completion_text", None) or ""
         except Exception as exc:
             logger.debug(f"[MineSentinel] AstrBot provider.text_chat failed: {exc}")
-            return reviewed_fallback if review_changed else None
+            return diagnosed_fallback if review_changed or diagnosis_changed else None
 
         if not raw:
-            return reviewed_fallback if review_changed else None
+            return diagnosed_fallback if review_changed or diagnosis_changed else None
 
         parsed = self._parse_json(raw)
         if parsed:
-            return self._normalize_report(parsed, reviewed_fallback)
+            return self._normalize_report(parsed, diagnosed_fallback)
         repaired = self._repair_json_text(raw)
         parsed = self._parse_json(repaired) if repaired else None
         if parsed:
-            return self._normalize_report(parsed, reviewed_fallback)
-        return reviewed_fallback if review_changed else None
+            return self._normalize_report(parsed, diagnosed_fallback)
+        return diagnosed_fallback if review_changed or diagnosis_changed else None
 
     async def _review_candidate_issues(
         self,

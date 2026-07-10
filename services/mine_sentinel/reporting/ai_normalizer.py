@@ -8,6 +8,7 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from ..runtime_log import clean_text_for_prompt
 from .sections import build_report_sections
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ def sanitize_free_text(value: Any, max_chars: int = MAX_FREE_TEXT_CHARS) -> str:
     text = _CONTROL_RE.sub("", text)
     for pattern in _INJECTION_PATTERNS:
         text = pattern.sub("", text)
+    text = clean_text_for_prompt(text, preserve_lines=True)
     if len(text) > max_chars:
         text = text[:max_chars]
     return text.strip()
@@ -138,13 +140,13 @@ class AIReportNormalizer:
                 continue
             used_fallback_indexes.add(fallback_index)
             normalized = normalized_issues[fallback_index]
-            action = sanitize_free_text(issue.get("suggested_action"))
-            if (
-                action
-                and not _UNSAFE_ACTION_RE.search(action)
-                and _action_is_grounded(action, fallback_issue)
-            ):
+            action = validate_suggested_action(
+                issue.get("suggested_action"),
+                fallback_issue,
+            )
+            if action and not fallback_issue.get("ai_diagnosis"):
                 normalized["suggested_action"] = action
+                normalized["ai_suggested_action"] = True
 
         # Keep every reviewed deterministic issue in its original order. The
         # dedicated issue-review stage is the only component allowed to drop
@@ -179,7 +181,14 @@ class AIReportNormalizer:
         return -1, {}
 
 
-def _action_is_grounded(action: str, issue: dict[str, Any]) -> bool:
+def validate_suggested_action(value: Any, issue: dict[str, Any]) -> str:
+    action = sanitize_free_text(value)
+    if not action or _UNSAFE_ACTION_RE.search(action):
+        return ""
+    return action if action_is_grounded(action, issue) else ""
+
+
+def action_is_grounded(action: str, issue: dict[str, Any]) -> bool:
     action_text = str(action or "").lower()
     issue_text = json.dumps(issue, ensure_ascii=False, default=str).lower()
     for action_markers, evidence_markers in _ACTION_DOMAIN_RULES:

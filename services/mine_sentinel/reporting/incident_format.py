@@ -49,8 +49,7 @@ def incident_time_text(group: IncidentGroup) -> str:
 
 
 def format_time_window(report: dict) -> str:
-    start = as_millis(report.get("window_start_ts"))
-    end = as_millis(report.get("window_end_ts"))
+    start, end = _report_time_bounds(report)
     if start and end:
         start_day = time.strftime("%Y-%m-%d", time.localtime(start / 1000))
         end_day = time.strftime("%Y-%m-%d", time.localtime(end / 1000))
@@ -63,8 +62,7 @@ def format_time_window(report: dict) -> str:
 
 
 def format_duration(report: dict) -> str:
-    start = as_millis(report.get("window_start_ts"))
-    end = as_millis(report.get("window_end_ts"))
+    start, end = _report_time_bounds(report)
     minutes = 0
     if start and end and end > start:
         minutes = max(1, round((end - start) / 60000))
@@ -117,6 +115,16 @@ def as_millis(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return number if number > 0 else 0
+
+
+def _report_time_bounds(report: dict) -> tuple[int, int]:
+    start = as_millis(report.get("window_start_ts"))
+    end = as_millis(report.get("window_end_ts"))
+    time_window = report.get("time_window")
+    if isinstance(time_window, dict):
+        start = start or as_millis(time_window.get("start"))
+        end = end or as_millis(time_window.get("end"))
+    return start, end
 
 
 def quiet_window_text(report: dict, groups: list[IncidentGroup]) -> str:
