@@ -1,5 +1,5 @@
 aiohttp>=3.14.1
-Pillow>=12.2.0
+Pillow>=12.3.0
 # Drain3 template miner. 轻量纯 Python 包，默认随 requirements 安装。
 # 运行时若因任何原因 import 失败，loop_filter 会自动降级为 fingerprint 去重，
 # 模板统计异常检测关闭——不会导致插件加载失败。
